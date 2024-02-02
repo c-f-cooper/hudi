@@ -30,7 +30,6 @@ import org.apache.hudi.avro.model.HoodieCleanMetadata;
 import org.apache.hudi.avro.model.HoodieRollbackMetadata;
 import org.apache.hudi.avro.model.HoodieSavepointMetadata;
 import org.apache.hudi.cli.HoodieCLI;
-import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieRecord.HoodieRecordType;
@@ -44,6 +43,9 @@ import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.table.timeline.TimelineMetadataUtils;
 import org.apache.hudi.common.util.collection.ClosableIterator;
 import org.apache.hudi.exception.HoodieException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
+import org.apache.hudi.storage.HoodieLocation;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.shell.standard.ShellComponent;
@@ -52,6 +54,7 @@ import org.springframework.shell.standard.ShellOption;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -96,7 +99,7 @@ public class ExportCommand {
     List<HoodieInstant> nonArchivedInstants = timeline.getInstants();
 
     // Archived instants are in the commit archive files
-    FileStatus[] statuses = FSUtils.getFs(basePath, HoodieCLI.conf).globStatus(archivePath);
+    FileStatus[] statuses = HadoopFSUtils.getFs(basePath, HoodieCLI.conf).globStatus(archivePath);
     List<FileStatus> archivedStatuses = Arrays.stream(statuses).sorted((f1, f2) -> (int) (f1.getModificationTime() - f2.getModificationTime())).collect(Collectors.toList());
 
     if (descending) {
@@ -118,7 +121,7 @@ public class ExportCommand {
 
   private int copyArchivedInstants(List<FileStatus> statuses, Set<String> actionSet, int limit, String localFolder) throws Exception {
     int copyCount = 0;
-    FileSystem fileSystem = FSUtils.getFs(HoodieCLI.getTableMetaClient().getBasePath(), HoodieCLI.conf);
+    FileSystem fileSystem = HadoopFSUtils.getFs(HoodieCLI.getTableMetaClient().getBasePath(), HoodieCLI.conf);
 
     for (FileStatus fs : statuses) {
       // read the archived file
@@ -166,7 +169,7 @@ public class ExportCommand {
               LOG.error("Could not load metadata for action " + action + " at instant time " + instantTime);
               continue;
             }
-            final String outPath = localFolder + Path.SEPARATOR + instantTime + "." + action;
+            final String outPath = localFolder + HoodieLocation.SEPARATOR + instantTime + "." + action;
             writeToFile(outPath, HoodieAvroUtils.avroToJson(metadata, true));
           }
         }
@@ -188,7 +191,7 @@ public class ExportCommand {
     final HoodieTableMetaClient metaClient = HoodieCLI.getTableMetaClient();
     final HoodieActiveTimeline timeline = metaClient.getActiveTimeline();
     for (HoodieInstant instant : instants) {
-      String localPath = localFolder + Path.SEPARATOR + instant.getFileName();
+      String localPath = localFolder + HoodieLocation.SEPARATOR + instant.getFileName();
 
       byte[] data = null;
       switch (instant.getAction()) {
@@ -232,8 +235,10 @@ public class ExportCommand {
   }
 
   private void writeToFile(String path, byte[] data) throws Exception {
-    FileOutputStream writer = new FileOutputStream(path);
-    writer.write(data);
-    writer.close();
+    try (FileOutputStream writer = new FileOutputStream(path)) {
+      writer.write(data);
+    } catch (IOException e) {
+      throw e;
+    }
   }
 }

@@ -22,6 +22,7 @@ import org.apache.hudi.common.model.HoodieCommitMetadata
 import org.apache.hudi.common.table.HoodieTableMetaClient
 import org.apache.hudi.common.table.timeline.{HoodieActiveTimeline, HoodieTimeline}
 import org.apache.hudi.common.util.{CompactionUtils, HoodieTimer, Option => HOption}
+import org.apache.hudi.config.HoodieLockConfig
 import org.apache.hudi.exception.HoodieException
 import org.apache.hudi.{HoodieCLIUtils, SparkAdapterSupport}
 
@@ -45,7 +46,8 @@ class RunCompactionProcedure extends BaseProcedure with ProcedureBuilder with Sp
     ProcedureParameter.optional(2, "path", DataTypes.StringType),
     ProcedureParameter.optional(3, "timestamp", DataTypes.LongType),
     ProcedureParameter.optional(4, "options", DataTypes.StringType),
-    ProcedureParameter.optional(5, "instants", DataTypes.StringType)
+    ProcedureParameter.optional(5, "instants", DataTypes.StringType),
+    ProcedureParameter.optional(6, "limit", DataTypes.IntegerType)
   )
 
   private val OUTPUT_TYPE = new StructType(Array[StructField](
@@ -70,6 +72,7 @@ class RunCompactionProcedure extends BaseProcedure with ProcedureBuilder with Sp
       confs = confs ++ HoodieCLIUtils.extractOptions(getArgValueOrDefault(args, PARAMETERS(4)).get.asInstanceOf[String])
     }
     var specificInstants = getArgValueOrDefault(args, PARAMETERS(5))
+    val limit = getArgValueOrDefault(args, PARAMETERS(6))
 
     // For old version compatibility
     if (op.equals("run")) {
@@ -83,13 +86,20 @@ class RunCompactionProcedure extends BaseProcedure with ProcedureBuilder with Sp
     val basePath = getBasePath(tableName, tablePath)
     val metaClient = HoodieTableMetaClient.builder.setConf(jsc.hadoopConfiguration()).setBasePath(basePath).build
 
+    if (metaClient.getTableConfig.isMetadataTableAvailable) {
+      if (!confs.contains(HoodieLockConfig.LOCK_PROVIDER_CLASS_NAME.key)) {
+        confs = confs ++ HoodieCLIUtils.getLockOptions(basePath)
+        logInfo("Auto config filesystem lock provider for metadata table")
+      }
+    }
+
     val pendingCompactionInstants = metaClient.getActiveTimeline.getWriteTimeline.getInstants.iterator().asScala
       .filter(p => p.getAction == HoodieTimeline.COMPACTION_ACTION)
       .map(_.getTimestamp)
       .toSeq.sortBy(f => f)
 
-    var (filteredPendingCompactionInstants, operation) = HoodieProcedureUtils.fileterPendingInstantsAndGetOperation(
-      pendingCompactionInstants, specificInstants.asInstanceOf[Option[String]], Option(op))
+    var (filteredPendingCompactionInstants, operation) = HoodieProcedureUtils.filterPendingInstantsAndGetOperation(
+      pendingCompactionInstants, specificInstants.asInstanceOf[Option[String]], Option(op), limit.asInstanceOf[Option[Int]])
 
     var client: SparkRDDWriteClient[_] = null
     try {
@@ -97,7 +107,7 @@ class RunCompactionProcedure extends BaseProcedure with ProcedureBuilder with Sp
         tableName.asInstanceOf[Option[String]])
 
       if (operation.isSchedule) {
-        val instantTime = HoodieActiveTimeline.createNewInstantTime
+        val instantTime = client.createNewInstantTime()
         if (client.scheduleCompactionAtInstant(instantTime, HOption.empty[java.util.Map[String, String]])) {
           filteredPendingCompactionInstants = Seq(instantTime)
         }
@@ -136,10 +146,15 @@ class RunCompactionProcedure extends BaseProcedure with ProcedureBuilder with Sp
 
   private def handleResponse(metadata: HoodieCommitMetadata): Unit = {
     // Handle error
-    val writeStats = metadata.getPartitionToWriteStats.entrySet().flatMap(e => e.getValue).toList
-    val errorsCount = writeStats.map(state => state.getTotalWriteErrors).sum
-    if (errorsCount > 0) {
-      throw new HoodieException(s" Found $errorsCount when writing record")
+    val writeStatsHasErrors = metadata.getPartitionToWriteStats.entrySet()
+      .flatMap(e => e.getValue)
+      .filter(_.getTotalWriteErrors > 0)
+    if (writeStatsHasErrors.nonEmpty) {
+      val errorsCount = writeStatsHasErrors.map(_.getTotalWriteErrors).sum
+      log.error(s"Found $errorsCount when writing record.\n Printing out the top 100 file path with errors.")
+      writeStatsHasErrors.take(100).foreach(state =>
+        log.error(s"Error occurred while writing the file: ${state.getPath}."))
+      throw new HoodieException(s"Found $errorsCount when writing record")
     }
   }
 

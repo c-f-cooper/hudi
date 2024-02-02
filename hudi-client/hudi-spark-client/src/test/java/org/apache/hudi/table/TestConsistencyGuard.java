@@ -18,13 +18,13 @@
 
 package org.apache.hudi.table;
 
-import org.apache.hudi.common.fs.ConsistencyGuard;
 import org.apache.hudi.common.fs.ConsistencyGuardConfig;
 import org.apache.hudi.common.fs.FailSafeConsistencyGuard;
 import org.apache.hudi.common.fs.OptimisticConsistencyGuard;
 import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.testutils.FileCreateUtils;
-import org.apache.hudi.testutils.HoodieClientTestHarness;
+import org.apache.hudi.hadoop.fs.ConsistencyGuard;
+import org.apache.hudi.testutils.HoodieSparkClientTestHarness;
 
 import org.apache.hadoop.fs.Path;
 import org.junit.jupiter.api.AfterEach;
@@ -43,7 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 /**
  * Unit tests {@link ConsistencyGuard}s.
  */
-public class TestConsistencyGuard extends HoodieClientTestHarness {
+public class TestConsistencyGuard extends HoodieSparkClientTestHarness {
 
   private static final String BASE_FILE_EXTENSION = HoodieTableConfig.BASE_FILE_FORMAT.defaultValue().getFileExtension();
 

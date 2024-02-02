@@ -18,15 +18,15 @@
 
 package org.apache.hudi.sink.bucket;
 
-import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
-import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.config.HoodieClusteringConfig;
 import org.apache.hudi.config.HoodieIndexConfig;
 import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.configuration.OptionsInference;
+import org.apache.hudi.configuration.OptionsResolver;
 import org.apache.hudi.exception.HoodieException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.sink.utils.Pipelines;
 import org.apache.hudi.util.AvroSchemaConverter;
 import org.apache.hudi.util.JsonDeserializationFunction;
@@ -187,8 +187,7 @@ public class ITTestConsistentBucketStreamWrite extends TestLogger {
     OptionsInference.setupSinkTasks(conf, execEnv.getParallelism());
     DataStream<HoodieRecord> hoodieRecordDataStream = Pipelines.bootstrap(conf, rowType, dataStream);
     // bulk_insert mode
-    final String writeOperation = conf.get(FlinkOptions.OPERATION);
-    if (WriteOperationType.fromValue(writeOperation) == WriteOperationType.BULK_INSERT) {
+    if (OptionsResolver.isBulkInsertOperation(conf)) {
       Pipelines.bulkInsert(conf, rowType, dataStream);
     } else {
       DataStream<Object> pipeline = Pipelines.hoodieStreamWrite(conf, hoodieRecordDataStream);
@@ -203,7 +202,7 @@ public class ITTestConsistentBucketStreamWrite extends TestLogger {
         // ignored
       }
     }
-    FileSystem fs = FSUtils.getFs(tempFile.getAbsolutePath(), new org.apache.hadoop.conf.Configuration());
+    FileSystem fs = HadoopFSUtils.getFs(tempFile.getAbsolutePath(), new org.apache.hadoop.conf.Configuration());
     TestData.checkWrittenDataMOR(fs, tempFile, expected, 4);
   }
 }

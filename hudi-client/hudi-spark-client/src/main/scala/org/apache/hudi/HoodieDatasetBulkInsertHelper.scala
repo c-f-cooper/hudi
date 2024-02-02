@@ -26,9 +26,10 @@ import org.apache.hudi.common.model.HoodieRecord
 import org.apache.hudi.common.util.ReflectionUtils
 import org.apache.hudi.config.HoodieWriteConfig
 import org.apache.hudi.exception.HoodieException
-import org.apache.hudi.index.SparkHoodieIndexFactory
-import org.apache.hudi.keygen.{AutoRecordGenWrapperKeyGenerator, BuiltinKeyGenerator, KeyGenUtils, SparkKeyGeneratorInterface}
-import org.apache.hudi.table.action.commit.{BulkInsertDataInternalWriterHelper, ParallelismHelper}
+import org.apache.hudi.index.HoodieIndex.BucketIndexEngineType
+import org.apache.hudi.index.{HoodieIndex, SparkHoodieIndexFactory}
+import org.apache.hudi.keygen.{AutoRecordGenWrapperKeyGenerator, BuiltinKeyGenerator, KeyGenUtils}
+import org.apache.hudi.table.action.commit.{BulkInsertDataInternalWriterHelper, ConsistentBucketBulkInsertDataInternalWriterHelper, ParallelismHelper}
 import org.apache.hudi.table.{BulkInsertPartitioner, HoodieTable}
 import org.apache.hudi.util.JFunction.toJavaSerializableFunctionUnchecked
 import org.apache.spark.TaskContext
@@ -52,7 +53,7 @@ object HoodieDatasetBulkInsertHelper
    * Prepares [[DataFrame]] for bulk-insert into Hudi table, taking following steps:
    *
    * <ol>
-   *   <li>Invoking configured [[KeyGenerator]] to produce record key, alas partition-path value</li>
+   *   <li>Invoking configured [[org.apache.hudi.keygen.KeyGenerator]] to produce record key, alas partition-path value</li>
    *   <li>Prepends Hudi meta-fields to every row in the dataset</li>
    *   <li>Dedupes rows (if necessary)</li>
    *   <li>Partitions dataset using provided [[partitioner]]</li>
@@ -61,7 +62,6 @@ object HoodieDatasetBulkInsertHelper
   def prepareForBulkInsert(df: DataFrame,
                            config: HoodieWriteConfig,
                            partitioner: BulkInsertPartitioner[Dataset[Row]],
-                           shouldDropPartitionColumns: Boolean,
                            instantTime: String): Dataset[Row] = {
     val populateMetaFields = config.populateMetaFields()
     val schema = df.schema
@@ -75,6 +75,9 @@ object HoodieDatasetBulkInsertHelper
       StructField(HoodieRecord.FILENAME_METADATA_FIELD, StringType))
 
     val updatedSchema = StructType(metaFields ++ schema.fields)
+
+    val targetParallelism =
+      deduceShuffleParallelism(df, config.getBulkInsertShuffleParallelism)
 
     val updatedDF = if (populateMetaFields) {
       val keyGeneratorClassName = config.getStringOrThrow(HoodieWriteConfig.KEYGENERATOR_CLASS_NAME,
@@ -110,7 +113,7 @@ object HoodieDatasetBulkInsertHelper
         }
 
       val dedupedRdd = if (config.shouldCombineBeforeInsert) {
-        dedupeRows(prependedRdd, updatedSchema, config.getPreCombineField, SparkHoodieIndexFactory.isGlobalIndex(config))
+        dedupeRows(prependedRdd, updatedSchema, config.getPreCombineField, SparkHoodieIndexFactory.isGlobalIndex(config), targetParallelism)
       } else {
         prependedRdd
       }
@@ -127,16 +130,7 @@ object HoodieDatasetBulkInsertHelper
       HoodieUnsafeUtils.createDataFrameFrom(df.sparkSession, prependedQuery)
     }
 
-    val trimmedDF = if (shouldDropPartitionColumns) {
-      dropPartitionColumns(updatedDF, config)
-    } else {
-      updatedDF
-    }
-
-    val targetParallelism =
-      deduceShuffleParallelism(trimmedDF, config.getBulkInsertShuffleParallelism)
-
-    partitioner.repartitionRecords(trimmedDF, targetParallelism)
+    partitioner.repartitionRecords(updatedDF, targetParallelism)
   }
 
   /**
@@ -155,17 +149,34 @@ object HoodieDatasetBulkInsertHelper
       val taskPartitionId = taskContextSupplier.getPartitionIdSupplier.get
       val taskId = taskContextSupplier.getStageIdSupplier.get.toLong
       val taskEpochId = taskContextSupplier.getAttemptIdSupplier.get
-      val writer = new BulkInsertDataInternalWriterHelper(
-        table,
-        writeConfig,
-        instantTime,
-        taskPartitionId,
-        taskId,
-        taskEpochId,
-        schema,
-        writeConfig.populateMetaFields,
-        arePartitionRecordsSorted,
-        shouldPreserveHoodieMetadata)
+
+      val writer = writeConfig.getIndexType match {
+        case HoodieIndex.IndexType.BUCKET if writeConfig.getBucketIndexEngineType
+          == BucketIndexEngineType.CONSISTENT_HASHING =>
+          new ConsistentBucketBulkInsertDataInternalWriterHelper(
+            table,
+            writeConfig,
+            instantTime,
+            taskPartitionId,
+            taskId,
+            taskEpochId,
+            schema,
+            writeConfig.populateMetaFields,
+            arePartitionRecordsSorted,
+            shouldPreserveHoodieMetadata)
+        case _ =>
+          new BulkInsertDataInternalWriterHelper(
+            table,
+            writeConfig,
+            instantTime,
+            taskPartitionId,
+            taskId,
+            taskEpochId,
+            schema,
+            writeConfig.populateMetaFields,
+            arePartitionRecordsSorted,
+            shouldPreserveHoodieMetadata)
+      }
 
       try {
         iter.foreach(writer.write)
@@ -182,7 +193,7 @@ object HoodieDatasetBulkInsertHelper
     table.getContext.parallelize(writeStatuses.toList.asJava)
   }
 
-  private def dedupeRows(rdd: RDD[InternalRow], schema: StructType, preCombineFieldRef: String, isGlobalIndex: Boolean): RDD[InternalRow] = {
+  private def dedupeRows(rdd: RDD[InternalRow], schema: StructType, preCombineFieldRef: String, isGlobalIndex: Boolean, targetParallelism: Int): RDD[InternalRow] = {
     val recordKeyMetaFieldOrd = schema.fieldIndex(HoodieRecord.RECORD_KEY_METADATA_FIELD)
     val partitionPathMetaFieldOrd = schema.fieldIndex(HoodieRecord.PARTITION_PATH_METADATA_FIELD)
     // NOTE: Pre-combine field could be a nested field
@@ -201,16 +212,15 @@ object HoodieDatasetBulkInsertHelper
         //       since Spark might be providing us with a mutable copy (updated during the iteration)
         (rowKey, row.copy())
       }
-      .reduceByKey {
-        (oneRow, otherRow) =>
-          val onePreCombineVal = getNestedInternalRowValue(oneRow, preCombineFieldPath).asInstanceOf[Comparable[AnyRef]]
-          val otherPreCombineVal = getNestedInternalRowValue(otherRow, preCombineFieldPath).asInstanceOf[Comparable[AnyRef]]
-          if (onePreCombineVal.compareTo(otherPreCombineVal.asInstanceOf[AnyRef]) >= 0) {
-            oneRow
-          } else {
-            otherRow
-          }
-      }
+      .reduceByKey ((oneRow, otherRow) => {
+        val onePreCombineVal = getNestedInternalRowValue(oneRow, preCombineFieldPath).asInstanceOf[Comparable[AnyRef]]
+        val otherPreCombineVal = getNestedInternalRowValue(otherRow, preCombineFieldPath).asInstanceOf[Comparable[AnyRef]]
+        if (onePreCombineVal.compareTo(otherPreCombineVal.asInstanceOf[AnyRef]) >= 0) {
+          oneRow
+        } else {
+          otherRow
+        }
+      }, targetParallelism)
       .values
   }
 
@@ -225,21 +235,17 @@ object HoodieDatasetBulkInsertHelper
     }
   }
 
-  private def dropPartitionColumns(df: DataFrame, config: HoodieWriteConfig): DataFrame = {
-    val partitionPathFields = getPartitionPathFields(config).toSet
-    val nestedPartitionPathFields = partitionPathFields.filter(f => f.contains('.'))
-    if (nestedPartitionPathFields.nonEmpty) {
-      logWarning(s"Can not drop nested partition path fields: $nestedPartitionPathFields")
-    }
-
-    val partitionPathCols = (partitionPathFields -- nestedPartitionPathFields).toSeq
-
-    df.drop(partitionPathCols: _*)
-  }
-
   private def getPartitionPathFields(config: HoodieWriteConfig): Seq[String] = {
     val keyGeneratorClassName = config.getString(HoodieWriteConfig.KEYGENERATOR_CLASS_NAME)
     val keyGenerator = ReflectionUtils.loadClass(keyGeneratorClassName, new TypedProperties(config.getProps)).asInstanceOf[BuiltinKeyGenerator]
     keyGenerator.getPartitionPathFields.asScala
   }
+
+   def getPartitionPathCols(config: HoodieWriteConfig): Seq[String] = {
+    val partitionPathFields = getPartitionPathFields(config).toSet
+    val nestedPartitionPathFields = partitionPathFields.filter(f => f.contains('.'))
+
+    return (partitionPathFields -- nestedPartitionPathFields).toSeq
+  }
+
 }

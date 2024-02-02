@@ -26,10 +26,8 @@ import org.apache.hudi.common.fs.ConsistencyGuardConfig;
 import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieFailedWritesCleaningPolicy;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.versioning.TimelineLayoutVersion;
 import org.apache.hudi.common.table.view.FileSystemViewStorageConfig;
-import org.apache.hudi.common.table.view.FileSystemViewStorageType;
 import org.apache.hudi.common.testutils.CompactionTestUtils;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.util.ClusteringUtils;
@@ -42,7 +40,6 @@ import org.apache.hudi.config.HoodiePreCommitValidatorConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.index.HoodieIndex;
-import org.apache.hudi.testutils.HoodieClientTestUtils;
 import org.apache.hudi.testutils.MetadataMergeWriteStatus;
 
 import java.nio.file.Paths;
@@ -54,6 +51,7 @@ import java.util.Properties;
 import static org.apache.hudi.common.testutils.FileCreateUtils.baseFileName;
 import static org.apache.hudi.common.testutils.FileCreateUtils.createBaseFile;
 import static org.apache.hudi.common.testutils.HoodieTestUtils.DEFAULT_PARTITION_PATHS;
+import static org.apache.hudi.utils.HoodieWriterClientTestHarness.getPropertiesForKeyGen;
 
 public class ClusteringTestUtils {
   protected static int timelineServicePort =
@@ -80,7 +78,7 @@ public class ClusteringTestUtils {
         .withClusteringSortColumns(populateMetaFields ? "_hoodie_record_key" : "_row_key")
         .withClusteringTargetPartitions(0).withInlineClusteringNumCommits(0).withInlineClustering(false)
         .build();
-    properties.putAll(HoodieClientTestUtils.getPropertiesForKeyGen());
+    properties.putAll(getPropertiesForKeyGen());
 
     // write config builder
     return HoodieWriteConfig.newBuilder().withPath(basePath).withSchema(schemaStr)
@@ -97,7 +95,7 @@ public class ClusteringTestUtils {
         .withEmbeddedTimelineServerEnabled(true).withFileSystemViewConfig(FileSystemViewStorageConfig.newBuilder()
             .withEnableBackupForRemoteFileSystemView(false) // Fail test if problem connecting to timeline-server
             .withRemoteServerPort(timelineServicePort)
-            .withStorageType(FileSystemViewStorageType.EMBEDDED_KV_STORE).build())
+            .build())
         .withClusteringConfig(clusteringConfig)
         .withPreCommitValidatorConfig(HoodiePreCommitValidatorConfig.newBuilder()
             .withPreCommitValidator(SqlQueryEqualityPreCommitValidator.class.getName())
@@ -109,7 +107,7 @@ public class ClusteringTestUtils {
 
   public static String runClustering(SparkRDDWriteClient clusteringClient, boolean skipExecution, boolean shouldCommit) {
     // Schedule and execute clustering.
-    String clusteringCommitTime = HoodieActiveTimeline.createNewInstantTime();
+    String clusteringCommitTime = clusteringClient.createNewInstantTime();
     return runClusteringOnInstant(clusteringClient, skipExecution, shouldCommit, clusteringCommitTime);
   }
 

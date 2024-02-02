@@ -21,7 +21,6 @@ package org.apache.hudi.common.testutils;
 
 import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.avro.model.HoodieCompactionPlan;
-import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieAvroPayload;
 import org.apache.hudi.common.model.HoodieAvroRecord;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
@@ -29,7 +28,6 @@ import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodiePartitionMetadata;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieInstantTimeGenerator;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
@@ -38,6 +36,7 @@ import org.apache.hudi.common.util.AvroOrcUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 
 import org.apache.avro.Conversions;
 import org.apache.avro.LogicalTypes;
@@ -55,12 +54,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.Serializable;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -81,6 +80,8 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
+import static org.apache.hudi.common.table.timeline.TimelineMetadataUtils.serializeCommitMetadata;
+import static org.apache.hudi.common.util.StringUtils.getUTF8Bytes;
 import static org.apache.hudi.common.util.ValidationUtils.checkState;
 
 /**
@@ -104,9 +105,14 @@ public class HoodieTestDataGenerator implements AutoCloseable {
       {DEFAULT_FIRST_PARTITION_PATH, DEFAULT_SECOND_PARTITION_PATH, DEFAULT_THIRD_PARTITION_PATH};
   public static final int DEFAULT_PARTITION_DEPTH = 3;
 
+  public static final String TRIP_TYPE_ENUM_TYPE =
+      "{\"type\": \"enum\", \"name\": \"TripType\", \"symbols\": [\"UNKNOWN\", \"UBERX\", \"BLACK\"], \"default\": \"UNKNOWN\"}";
+  public static final Schema TRIP_TYPE_ENUM_SCHEMA = new Schema.Parser().parse(TRIP_TYPE_ENUM_TYPE);
+
   public static final String TRIP_SCHEMA_PREFIX = "{\"type\": \"record\"," + "\"name\": \"triprec\"," + "\"fields\": [ "
       + "{\"name\": \"timestamp\",\"type\": \"long\"}," + "{\"name\": \"_row_key\", \"type\": \"string\"},"
       + "{\"name\": \"partition_path\", \"type\": [\"null\", \"string\"], \"default\": null },"
+      + "{\"name\": \"trip_type\", \"type\": " + TRIP_TYPE_ENUM_TYPE + "},"
       + "{\"name\": \"rider\", \"type\": \"string\"}," + "{\"name\": \"driver\", \"type\": \"string\"},"
       + "{\"name\": \"begin_lat\", \"type\": \"double\"}," + "{\"name\": \"begin_lon\", \"type\": \"double\"},"
       + "{\"name\": \"end_lat\", \"type\": \"double\"}," + "{\"name\": \"end_lon\", \"type\": \"double\"},";
@@ -143,7 +149,7 @@ public class HoodieTestDataGenerator implements AutoCloseable {
       + "{\"name\":\"driver\",\"type\":\"string\"},{\"name\":\"fare\",\"type\":\"double\"},{\"name\": \"_hoodie_is_deleted\", \"type\": \"boolean\", \"default\": false}]}";
 
   public static final String NULL_SCHEMA = Schema.create(Schema.Type.NULL).toString();
-  public static final String TRIP_HIVE_COLUMN_TYPES = "bigint,string,string,string,string,double,double,double,double,int,bigint,float,binary,int,bigint,decimal(10,6),"
+  public static final String TRIP_HIVE_COLUMN_TYPES = "bigint,string,string,string,string,string,double,double,double,double,int,bigint,float,binary,int,bigint,decimal(10,6),"
       + "map<string,string>,struct<amount:double,currency:string>,array<struct<amount:double,currency:string>>,boolean";
 
 
@@ -219,7 +225,7 @@ public class HoodieTestDataGenerator implements AutoCloseable {
    */
   public static Long getNextCommitTime(long curCommitTime) {
     if ((curCommitTime + 1) % 1000000000000L >= 60) { // max seconds is 60 and hence
-      return Long.parseLong(HoodieActiveTimeline.createNewInstantTime());
+      return Long.parseLong(InProcessTimeGenerator.createNewInstantTime());
     } else {
       return curCommitTime + 1;
     }
@@ -357,6 +363,8 @@ public class HoodieTestDataGenerator implements AutoCloseable {
     rec.put("_row_key", rowKey);
     rec.put("timestamp", timestamp);
     rec.put("partition_path", partitionPath);
+    rec.put("trip_type", new GenericData.EnumSymbol(
+        TRIP_TYPE_ENUM_SCHEMA, rand.nextInt(2) == 0 ? "UBERX" : "BLACK"));
     rec.put("rider", riderName);
     rec.put("driver", driverName);
     rec.put("begin_lat", rand.nextDouble());
@@ -380,7 +388,7 @@ public class HoodieTestDataGenerator implements AutoCloseable {
     rec.put("distance_in_meters", rand.nextInt());
     rec.put("seconds_since_epoch", rand.nextLong());
     rec.put("weight", rand.nextFloat());
-    byte[] bytes = "Canada".getBytes();
+    byte[] bytes = getUTF8Bytes("Canada");
     rec.put("nation", ByteBuffer.wrap(bytes));
     long randomMillis = genRandomTimeMillis(rand);
     Instant instant = Instant.ofEpochMilli(randomMillis);
@@ -511,14 +519,26 @@ public class HoodieTestDataGenerator implements AutoCloseable {
   }
 
   private static void createCommitFile(String basePath, String instantTime, Configuration configuration, HoodieCommitMetadata commitMetadata) {
-    Arrays.asList(HoodieTimeline.makeCommitFileName(instantTime), HoodieTimeline.makeInflightCommitFileName(instantTime),
-        HoodieTimeline.makeRequestedCommitFileName(instantTime))
+    Arrays.asList(HoodieTimeline.makeCommitFileName(instantTime + "_" + InProcessTimeGenerator.createNewInstantTime()), HoodieTimeline.makeInflightCommitFileName(instantTime),
+            HoodieTimeline.makeRequestedCommitFileName(instantTime))
+        .forEach(f -> createMetadataFile(f, basePath, configuration, commitMetadata));
+  }
+
+  public static void createDeltaCommitFile(String basePath, String instantTime, Configuration configuration) {
+    HoodieCommitMetadata commitMetadata = new HoodieCommitMetadata();
+    createDeltaCommitFile(basePath, instantTime, configuration, commitMetadata);
+  }
+
+  private static void createDeltaCommitFile(String basePath, String instantTime, Configuration configuration, HoodieCommitMetadata commitMetadata) {
+    Arrays.asList(HoodieTimeline.makeDeltaFileName(instantTime + "_" + InProcessTimeGenerator.createNewInstantTime()),
+            HoodieTimeline.makeInflightDeltaFileName(instantTime),
+            HoodieTimeline.makeRequestedDeltaFileName(instantTime))
         .forEach(f -> createMetadataFile(f, basePath, configuration, commitMetadata));
   }
 
   private static void createMetadataFile(String f, String basePath, Configuration configuration, HoodieCommitMetadata commitMetadata) {
     try {
-      createMetadataFile(f, basePath, configuration, commitMetadata.toJsonString().getBytes(StandardCharsets.UTF_8));
+      createMetadataFile(f, basePath, configuration, serializeCommitMetadata(commitMetadata).get());
     } catch (IOException e) {
       throw new HoodieIOException(e.getMessage(), e);
     }
@@ -527,9 +547,9 @@ public class HoodieTestDataGenerator implements AutoCloseable {
   private static void createMetadataFile(String f, String basePath, Configuration configuration, byte[] content) {
     Path commitFile = new Path(
         basePath + "/" + HoodieTableMetaClient.METAFOLDER_NAME + "/" + f);
-    FSDataOutputStream os = null;
+    OutputStream os = null;
     try {
-      FileSystem fs = FSUtils.getFs(basePath, configuration);
+      FileSystem fs = HadoopFSUtils.getFs(basePath, configuration);
       os = fs.create(commitFile, true);
       // Write empty commit metadata
       os.write(content);
@@ -579,8 +599,8 @@ public class HoodieTestDataGenerator implements AutoCloseable {
   }
 
   private static void createEmptyFile(String basePath, Path filePath, Configuration configuration) throws IOException {
-    FileSystem fs = FSUtils.getFs(basePath, configuration);
-    FSDataOutputStream os = fs.create(filePath, true);
+    FileSystem fs = HadoopFSUtils.getFs(basePath, configuration);
+    OutputStream os = fs.create(filePath, true);
     os.close();
   }
 
@@ -595,8 +615,8 @@ public class HoodieTestDataGenerator implements AutoCloseable {
                                                        Configuration configuration) throws IOException {
     Path commitFile =
         new Path(basePath + "/" + HoodieTableMetaClient.AUXILIARYFOLDER_NAME + "/" + instant.getFileName());
-    FileSystem fs = FSUtils.getFs(basePath, configuration);
-    try (FSDataOutputStream os = fs.create(commitFile, true)) {
+    FileSystem fs = HadoopFSUtils.getFs(basePath, configuration);
+    try (OutputStream os = fs.create(commitFile, true)) {
       HoodieCompactionPlan workload = HoodieCompactionPlan.newBuilder().setVersion(1).build();
       // Write empty commit metadata
       os.write(TimelineMetadataUtils.serializeCompactionPlan(workload).get());
@@ -606,12 +626,12 @@ public class HoodieTestDataGenerator implements AutoCloseable {
   public static void createSavepointFile(String basePath, String instantTime, Configuration configuration)
       throws IOException {
     Path commitFile = new Path(basePath + "/" + HoodieTableMetaClient.METAFOLDER_NAME + "/"
-        + HoodieTimeline.makeSavePointFileName(instantTime));
-    FileSystem fs = FSUtils.getFs(basePath, configuration);
+        + HoodieTimeline.makeSavePointFileName(instantTime + "_" + InProcessTimeGenerator.createNewInstantTime()));
+    FileSystem fs = HadoopFSUtils.getFs(basePath, configuration);
     try (FSDataOutputStream os = fs.create(commitFile, true)) {
       HoodieCommitMetadata commitMetadata = new HoodieCommitMetadata();
       // Write empty commit metadata
-      os.writeBytes(new String(commitMetadata.toJsonString().getBytes(StandardCharsets.UTF_8)));
+      os.writeBytes(new String(serializeCommitMetadata(commitMetadata).get()));
     }
   }
 

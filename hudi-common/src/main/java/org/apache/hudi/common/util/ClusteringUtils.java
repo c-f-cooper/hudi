@@ -82,12 +82,12 @@ public class ClusteringUtils {
 
   /**
    * Get requested replace metadata from timeline.
-   * @param metaClient
-   * @param pendingReplaceInstant
-   * @return
+   * @param timeline used to get the bytes stored in the requested replace instant in the timeline
+   * @param pendingReplaceInstant can be in any state, because it will always be converted to requested state
+   * @return option of the replace metadata if present, else empty
    * @throws IOException
    */
-  private static Option<HoodieRequestedReplaceMetadata> getRequestedReplaceMetadata(HoodieTableMetaClient metaClient, HoodieInstant pendingReplaceInstant) throws IOException {
+  private static Option<HoodieRequestedReplaceMetadata> getRequestedReplaceMetadata(HoodieTimeline timeline, HoodieInstant pendingReplaceInstant) throws IOException {
     final HoodieInstant requestedInstant;
     if (!pendingReplaceInstant.isRequested()) {
       // inflight replacecommit files don't have clustering plan.
@@ -97,7 +97,7 @@ public class ClusteringUtils {
     } else {
       requestedInstant = pendingReplaceInstant;
     }
-    Option<byte[]> content = metaClient.getActiveTimeline().getInstantDetails(requestedInstant);
+    Option<byte[]> content = timeline.getInstantDetails(requestedInstant);
     if (!content.isPresent() || content.get().length == 0) {
       // few operations create requested file without any content. Assume these are not clustering
       return Option.empty();
@@ -107,13 +107,23 @@ public class ClusteringUtils {
 
   /**
    * Get Clustering plan from timeline.
-   * @param metaClient
+   * @param metaClient used to get the active timeline
+   * @param pendingReplaceInstant can be in any state, because it will always be converted to requested state
+   * @return option of the replace metadata if present, else empty
+   */
+  public static Option<Pair<HoodieInstant, HoodieClusteringPlan>> getClusteringPlan(HoodieTableMetaClient metaClient, HoodieInstant pendingReplaceInstant) {
+    return getClusteringPlan(metaClient.getActiveTimeline(), pendingReplaceInstant);
+  }
+
+  /**
+   * Get Clustering plan from timeline.
+   * @param timeline
    * @param pendingReplaceInstant
    * @return
    */
-  public static Option<Pair<HoodieInstant, HoodieClusteringPlan>> getClusteringPlan(HoodieTableMetaClient metaClient, HoodieInstant pendingReplaceInstant) {
+  public static Option<Pair<HoodieInstant, HoodieClusteringPlan>> getClusteringPlan(HoodieTimeline timeline, HoodieInstant pendingReplaceInstant) {
     try {
-      Option<HoodieRequestedReplaceMetadata> requestedReplaceMetadata = getRequestedReplaceMetadata(metaClient, pendingReplaceInstant);
+      Option<HoodieRequestedReplaceMetadata> requestedReplaceMetadata = getRequestedReplaceMetadata(timeline, pendingReplaceInstant);
       if (requestedReplaceMetadata.isPresent() && WriteOperationType.CLUSTER.name().equals(requestedReplaceMetadata.get().getOperationType())) {
         return Option.of(Pair.of(pendingReplaceInstant, requestedReplaceMetadata.get().getClusteringPlan()));
       }
@@ -235,15 +245,19 @@ public class ClusteringUtils {
     return getClusteringPlan(metaClient, instant).isPresent();
   }
 
+  public static boolean isPendingClusteringInstant(HoodieTimeline timeline, HoodieInstant instant) {
+    return getClusteringPlan(timeline, instant).isPresent();
+  }
+
   /**
-   * Returns the oldest instant to retain.
-   * Make sure the clustering instant won't be archived before cleaned, and the oldest inflight clustering instant has a previous commit.
+   * Returns the earliest instant to retain.
+   * Make sure the clustering instant won't be archived before cleaned, and the earliest inflight clustering instant has a previous commit.
    *
    * @param activeTimeline The active timeline
    * @param metaClient     The meta client
-   * @return the oldest instant to retain for clustering
+   * @return the earliest instant to retain for clustering
    */
-  public static Option<HoodieInstant> getOldestInstantToRetainForClustering(
+  public static Option<HoodieInstant> getEarliestInstantToRetainForClustering(
       HoodieActiveTimeline activeTimeline, HoodieTableMetaClient metaClient) throws IOException {
     Option<HoodieInstant> oldestInstantToRetain = Option.empty();
     HoodieTimeline replaceTimeline = activeTimeline.getTimelineOfActions(CollectionUtils.createSet(HoodieTimeline.REPLACE_COMMIT_ACTION));
@@ -280,19 +294,6 @@ public class ClusteringUtils {
             .firstInstant();
       } else {
         oldestInstantToRetain = replaceTimeline.firstInstant();
-      }
-
-      Option<HoodieInstant> pendingInstantOpt = replaceTimeline.filterInflights().firstInstant();
-      if (pendingInstantOpt.isPresent()) {
-        // Get the previous commit before the first inflight clustering instant.
-        Option<HoodieInstant> beforePendingInstant = activeTimeline.getCommitsTimeline()
-            .filterCompletedInstants()
-            .findInstantsBefore(pendingInstantOpt.get().getTimestamp())
-            .lastInstant();
-        if (beforePendingInstant.isPresent()
-            && oldestInstantToRetain.map(instant -> instant.compareTo(beforePendingInstant.get()) > 0).orElse(true)) {
-          oldestInstantToRetain = beforePendingInstant;
-        }
       }
     }
     return oldestInstantToRetain;

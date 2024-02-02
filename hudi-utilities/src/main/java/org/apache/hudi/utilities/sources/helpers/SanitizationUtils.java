@@ -41,6 +41,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static org.apache.hudi.common.util.ConfigUtils.getBooleanWithAltKeys;
+import static org.apache.hudi.common.util.ConfigUtils.getStringWithAltKeys;
+
 /**
  * Avro schemas have restrictions (https://avro.apache.org/docs/current/spec.html#names) on field names
  * that other schema formats do not have. This class provides utilities to help with sanitizing
@@ -62,12 +65,12 @@ public class SanitizationUtils {
 
   private static final String AVRO_FIELD_NAME_KEY = "name";
 
-  public static boolean getShouldSanitize(TypedProperties props) {
-    return props.getBoolean(HoodieStreamerConfig.SANITIZE_SCHEMA_FIELD_NAMES.key(), HoodieStreamerConfig.SANITIZE_SCHEMA_FIELD_NAMES.defaultValue());
+  public static boolean shouldSanitize(TypedProperties props) {
+    return getBooleanWithAltKeys(props, HoodieStreamerConfig.SANITIZE_SCHEMA_FIELD_NAMES);
   }
 
   public static String getInvalidCharMask(TypedProperties props) {
-    return props.getString(HoodieStreamerConfig.SCHEMA_FIELD_NAME_INVALID_CHAR_MASK.key(), HoodieStreamerConfig.SCHEMA_FIELD_NAME_INVALID_CHAR_MASK.defaultValue());
+    return getStringWithAltKeys(props, HoodieStreamerConfig.SCHEMA_FIELD_NAME_INVALID_CHAR_MASK, true);
   }
 
   private static DataType sanitizeDataTypeForAvro(DataType dataType, String invalidCharMask) {
@@ -115,6 +118,11 @@ public class SanitizationUtils {
       }
     }
     return targetDataset;
+  }
+
+  public static Dataset<Row> sanitizeColumnNamesForAvro(Dataset<Row> inputDataset, TypedProperties props) {
+    return shouldSanitize(props) ? sanitizeColumnNamesForAvro(inputDataset, getInvalidCharMask(props))
+        : inputDataset;
   }
 
   /*

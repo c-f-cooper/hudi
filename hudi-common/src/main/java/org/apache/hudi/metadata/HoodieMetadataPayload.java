@@ -18,21 +18,11 @@
 
 package org.apache.hudi.metadata;
 
-import org.apache.hudi.avro.model.BooleanWrapper;
-import org.apache.hudi.avro.model.BytesWrapper;
-import org.apache.hudi.avro.model.DateWrapper;
-import org.apache.hudi.avro.model.DecimalWrapper;
-import org.apache.hudi.avro.model.DoubleWrapper;
-import org.apache.hudi.avro.model.FloatWrapper;
 import org.apache.hudi.avro.model.HoodieMetadataBloomFilter;
 import org.apache.hudi.avro.model.HoodieMetadataColumnStats;
 import org.apache.hudi.avro.model.HoodieMetadataFileInfo;
 import org.apache.hudi.avro.model.HoodieMetadataRecord;
 import org.apache.hudi.avro.model.HoodieRecordIndexInfo;
-import org.apache.hudi.avro.model.IntWrapper;
-import org.apache.hudi.avro.model.LongWrapper;
-import org.apache.hudi.avro.model.StringWrapper;
-import org.apache.hudi.avro.model.TimestampMicrosWrapper;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.EmptyHoodieRecordPayload;
 import org.apache.hudi.common.model.HoodieAvroRecord;
@@ -47,29 +37,23 @@ import org.apache.hudi.common.util.hash.ColumnIndexID;
 import org.apache.hudi.common.util.hash.FileIndexID;
 import org.apache.hudi.common.util.hash.PartitionIndexID;
 import org.apache.hudi.exception.HoodieMetadataException;
-import org.apache.hudi.hadoop.CachingPath;
-import org.apache.hudi.io.storage.HoodieAvroHFileReader;
+import org.apache.hudi.hadoop.fs.CachingPath;
+import org.apache.hudi.io.storage.HoodieAvroHFileReaderImplBase;
+import org.apache.hudi.storage.HoodieLocation;
 import org.apache.hudi.util.Lazy;
 
-import org.apache.avro.Conversions;
-import org.apache.avro.LogicalTypes;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.IndexedRecord;
-import org.apache.avro.util.Utf8;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 
 import javax.annotation.Nullable;
+
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.nio.ByteBuffer;
-import java.sql.Date;
-import java.sql.Timestamp;
-import java.time.Instant;
-import java.time.LocalDate;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
@@ -79,19 +63,16 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.UUID;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static org.apache.hudi.common.util.DateTimeUtils.instantToMicros;
-import static org.apache.hudi.common.util.DateTimeUtils.microsToInstant;
+import static org.apache.hudi.avro.HoodieAvroUtils.unwrapAvroValueWrapper;
+import static org.apache.hudi.avro.HoodieAvroUtils.wrapValueIntoAvro;
 import static org.apache.hudi.common.util.TypeUtils.unsafeCast;
 import static org.apache.hudi.common.util.ValidationUtils.checkArgument;
 import static org.apache.hudi.common.util.ValidationUtils.checkState;
-import static org.apache.hudi.hadoop.CachingPath.createRelativePathUnsafe;
+import static org.apache.hudi.hadoop.fs.CachingPath.createRelativePathUnsafe;
 import static org.apache.hudi.metadata.HoodieTableMetadata.RECORDKEY_PARTITION_LIST;
-import static org.apache.hudi.metadata.HoodieTableMetadataUtil.getPartitionIdentifier;
-import static org.apache.hudi.metadata.HoodieTableMetadataUtil.tryUpcastDecimal;
 
 /**
  * MetadataTable records are persisted with the schema defined in HoodieMetadata.avsc.
@@ -132,7 +113,7 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
   /**
    * HoodieMetadata schema field ids
    */
-  public static final String KEY_FIELD_NAME = HoodieAvroHFileReader.KEY_FIELD_NAME;
+  public static final String KEY_FIELD_NAME = HoodieAvroHFileReaderImplBase.KEY_FIELD_NAME;
   public static final String SCHEMA_FIELD_NAME_TYPE = "type";
   public static final String SCHEMA_FIELD_NAME_METADATA = "filesystemMetadata";
   public static final String SCHEMA_FIELD_ID_COLUMN_STATS = "ColumnStatsMetadata";
@@ -161,21 +142,23 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
   public static final String COLUMN_STATS_FIELD_TOTAL_UNCOMPRESSED_SIZE = "totalUncompressedSize";
   public static final String COLUMN_STATS_FIELD_IS_DELETED = FIELD_IS_DELETED;
 
-  private static final Conversions.DecimalConversion AVRO_DECIMAL_CONVERSION = new Conversions.DecimalConversion();
-
   /**
    * HoodieMetadata record index payload field ids
    */
-  public static final String RECORD_INDEX_FIELD_PARTITION = "partition";
+  public static final String RECORD_INDEX_FIELD_PARTITION = "partitionName";
   public static final String RECORD_INDEX_FIELD_FILEID_HIGH_BITS = "fileIdHighBits";
   public static final String RECORD_INDEX_FIELD_FILEID_LOW_BITS = "fileIdLowBits";
   public static final String RECORD_INDEX_FIELD_FILE_INDEX = "fileIndex";
   public static final String RECORD_INDEX_FIELD_INSTANT_TIME = "instantTime";
+  public static final String RECORD_INDEX_FIELD_FILEID = "fileId";
+  public static final String RECORD_INDEX_FIELD_FILEID_ENCODING = "fileIdEncoding";
+  public static final int RECORD_INDEX_FIELD_FILEID_ENCODING_UUID = 0;
+  public static final int RECORD_INDEX_FIELD_FILEID_ENCODING_RAW_STRING = 1;
 
   /**
    * FileIndex value saved in record index record when the fileId has no index (old format of base filename)
    */
-  private static final int RECORD_INDEX_MISSING_FILEINDEX_FALLBACK = -1;
+  public static final int RECORD_INDEX_MISSING_FILEINDEX_FALLBACK = -1;
 
   /**
    * NOTE: PLEASE READ CAREFULLY
@@ -193,17 +176,7 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
    * You can find more details in HUDI-3834.
    */
   private static final Lazy<HoodieMetadataColumnStats.Builder> METADATA_COLUMN_STATS_BUILDER_STUB = Lazy.lazily(HoodieMetadataColumnStats::newBuilder);
-  private static final Lazy<StringWrapper.Builder> STRING_WRAPPER_BUILDER_STUB = Lazy.lazily(StringWrapper::newBuilder);
-  private static final Lazy<BytesWrapper.Builder> BYTES_WRAPPER_BUILDER_STUB = Lazy.lazily(BytesWrapper::newBuilder);
-  private static final Lazy<DoubleWrapper.Builder> DOUBLE_WRAPPER_BUILDER_STUB = Lazy.lazily(DoubleWrapper::newBuilder);
-  private static final Lazy<FloatWrapper.Builder> FLOAT_WRAPPER_BUILDER_STUB = Lazy.lazily(FloatWrapper::newBuilder);
-  private static final Lazy<LongWrapper.Builder> LONG_WRAPPER_BUILDER_STUB = Lazy.lazily(LongWrapper::newBuilder);
-  private static final Lazy<IntWrapper.Builder> INT_WRAPPER_BUILDER_STUB = Lazy.lazily(IntWrapper::newBuilder);
-  private static final Lazy<BooleanWrapper.Builder> BOOLEAN_WRAPPER_BUILDER_STUB = Lazy.lazily(BooleanWrapper::newBuilder);
-  private static final Lazy<TimestampMicrosWrapper.Builder> TIMESTAMP_MICROS_WRAPPER_BUILDER_STUB = Lazy.lazily(TimestampMicrosWrapper::newBuilder);
-  private static final Lazy<DecimalWrapper.Builder> DECIMAL_WRAPPER_BUILDER_STUB = Lazy.lazily(DecimalWrapper::newBuilder);
-  private static final Lazy<DateWrapper.Builder> DATE_WRAPPER_BUILDER_STUB = Lazy.lazily(DateWrapper::newBuilder);
-
+  private static final HoodieMetadataFileInfo DELETE_FILE_METADATA = new HoodieMetadataFileInfo(0L, true);
   private String key = null;
   private int type = 0;
   private Map<String, HoodieMetadataFileInfo> filesystemMetadata = null;
@@ -268,8 +241,8 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
               // AVRO-2377 1.9.2 Modified the type of org.apache.avro.Schema#FIELD_RESERVED to Collections.unmodifiableSet.
               // This causes Kryo to fail when deserializing a GenericRecord, See HUDI-5484.
               // We should avoid using GenericRecord and convert GenericRecord into a serializable type.
-              .setMinValue(wrapStatisticValue(unwrapStatisticValueWrapper(columnStatsRecord.get(COLUMN_STATS_FIELD_MIN_VALUE))))
-              .setMaxValue(wrapStatisticValue(unwrapStatisticValueWrapper(columnStatsRecord.get(COLUMN_STATS_FIELD_MAX_VALUE))))
+              .setMinValue(wrapValueIntoAvro(unwrapAvroValueWrapper(columnStatsRecord.get(COLUMN_STATS_FIELD_MIN_VALUE))))
+              .setMaxValue(wrapValueIntoAvro(unwrapAvroValueWrapper(columnStatsRecord.get(COLUMN_STATS_FIELD_MAX_VALUE))))
               .setValueCount((Long) columnStatsRecord.get(COLUMN_STATS_FIELD_VALUE_COUNT))
               .setNullCount((Long) columnStatsRecord.get(COLUMN_STATS_FIELD_NULL_COUNT))
               .setTotalSize((Long) columnStatsRecord.get(COLUMN_STATS_FIELD_TOTAL_SIZE))
@@ -283,7 +256,9 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
             Long.parseLong(recordIndexRecord.get(RECORD_INDEX_FIELD_FILEID_HIGH_BITS).toString()),
             Long.parseLong(recordIndexRecord.get(RECORD_INDEX_FIELD_FILEID_LOW_BITS).toString()),
             Integer.parseInt(recordIndexRecord.get(RECORD_INDEX_FIELD_FILE_INDEX).toString()),
-            Long.parseLong(recordIndexRecord.get(RECORD_INDEX_FIELD_INSTANT_TIME).toString()));
+            recordIndexRecord.get(RECORD_INDEX_FIELD_FILEID).toString(),
+            Long.parseLong(recordIndexRecord.get(RECORD_INDEX_FIELD_INSTANT_TIME).toString()),
+            Integer.parseInt(recordIndexRecord.get(RECORD_INDEX_FIELD_FILEID_ENCODING).toString()));
       }
     } else {
       this.isDeletedRecord = true;
@@ -335,7 +310,7 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
    */
   public static HoodieRecord<HoodieMetadataPayload> createPartitionListRecord(List<String> partitions, boolean isDeleted) {
     Map<String, HoodieMetadataFileInfo> fileInfo = new HashMap<>();
-    partitions.forEach(partition -> fileInfo.put(getPartitionIdentifier(partition), new HoodieMetadataFileInfo(0L, isDeleted)));
+    partitions.forEach(partition -> fileInfo.put(HoodieTableMetadataUtil.getPartitionIdentifierForFilesPartition(partition), new HoodieMetadataFileInfo(0L, isDeleted)));
 
     HoodieKey key = new HoodieKey(RECORDKEY_PARTITION_LIST, MetadataPartitionType.FILES.getPartitionPath());
     HoodieMetadataPayload payload = new HoodieMetadataPayload(key.getRecordKey(), METADATA_TYPE_PARTITION_LIST,
@@ -351,27 +326,16 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
    * @param filesDeleted List of files which have been deleted from this partition
    */
   public static HoodieRecord<HoodieMetadataPayload> createPartitionFilesRecord(String partition,
-                                                                               Option<Map<String, Long>> filesAdded,
-                                                                               Option<List<String>> filesDeleted) {
-    Map<String, HoodieMetadataFileInfo> fileInfo = new HashMap<>();
-    filesAdded.ifPresent(filesMap ->
-        fileInfo.putAll(
-            filesMap.entrySet().stream().collect(
-                Collectors.toMap(Map.Entry::getKey, (entry) -> {
-                  long fileSize = entry.getValue();
-                  // Assert that the file-size of the file being added is positive, since Hudi
-                  // should not be creating empty files
-                  checkState(fileSize > 0);
-                  return new HoodieMetadataFileInfo(fileSize, false);
-                })))
-    );
-    filesDeleted.ifPresent(filesList ->
-        fileInfo.putAll(
-            filesList.stream().collect(
-                Collectors.toMap(Function.identity(), (ignored) -> new HoodieMetadataFileInfo(0L, true))))
-    );
+                                                                               Map<String, Long> filesAdded,
+                                                                               List<String> filesDeleted) {
+    String partitionIdentifier = HoodieTableMetadataUtil.getPartitionIdentifierForFilesPartition(partition);
+    int size = filesAdded.size() + filesDeleted.size();
+    Map<String, HoodieMetadataFileInfo> fileInfo = new HashMap<>(size, 1);
+    filesAdded.forEach((fileName, fileSize) -> fileInfo.put(fileName, new HoodieMetadataFileInfo(fileSize, false)));
 
-    HoodieKey key = new HoodieKey(partition, MetadataPartitionType.FILES.getPartitionPath());
+    filesDeleted.forEach(fileName -> fileInfo.put(fileName, DELETE_FILE_METADATA));
+
+    HoodieKey key = new HoodieKey(partitionIdentifier, MetadataPartitionType.FILES.getPartitionPath());
     HoodieMetadataPayload payload = new HoodieMetadataPayload(key.getRecordKey(), METADATA_TYPE_FILE_LIST, fileInfo);
     return new HoodieAvroRecord<>(key, payload);
   }
@@ -392,11 +356,10 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
                                                                                     final String bloomFilterType,
                                                                                     final ByteBuffer bloomFilter,
                                                                                     final boolean isDeleted) {
-    checkArgument(!baseFileName.contains(Path.SEPARATOR)
+    checkArgument(!baseFileName.contains(HoodieLocation.SEPARATOR)
             && FSUtils.isBaseFile(new Path(baseFileName)),
         "Invalid base file '" + baseFileName + "' for MetaIndexBloomFilter!");
-    final String bloomFilterIndexKey = new PartitionIndexID(partitionName).asBase64EncodedString()
-        .concat(new FileIndexID(baseFileName).asBase64EncodedString());
+    final String bloomFilterIndexKey = getBloomFilterRecordKey(partitionName, baseFileName);
     HoodieKey key = new HoodieKey(bloomFilterIndexKey, MetadataPartitionType.BLOOM_FILTERS.getPartitionPath());
 
     HoodieMetadataBloomFilter metadataBloomFilter =
@@ -443,6 +406,11 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
       default:
         throw new HoodieMetadataException("Unknown type of HoodieMetadataPayload: " + type);
     }
+  }
+
+  private static String getBloomFilterRecordKey(String partitionName, String fileName) {
+    return new PartitionIndexID(HoodieTableMetadataUtil.getBloomFilterIndexPartitionIdentifier(partitionName)).asBase64EncodedString()
+        .concat(new FileIndexID(fileName).asBase64EncodedString());
   }
 
   private HoodieMetadataBloomFilter combineBloomFilterMetadata(HoodieMetadataPayload previousRecord) {
@@ -643,7 +611,8 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
    * @return Column stats index key
    */
   public static String getColumnStatsIndexKey(String partitionName, HoodieColumnRangeMetadata<Comparable> columnRangeMetadata) {
-    final PartitionIndexID partitionIndexID = new PartitionIndexID(partitionName);
+
+    final PartitionIndexID partitionIndexID = new PartitionIndexID(HoodieTableMetadataUtil.getColumnStatsIndexPartitionIdentifier(partitionName));
     final FileIndexID fileIndexID = new FileIndexID(new Path(columnRangeMetadata.getFilePath()).getName());
     final ColumnIndexID columnIndexID = new ColumnIndexID(columnRangeMetadata.getColumnName());
     return getColumnStatsIndexKey(partitionIndexID, fileIndexID, columnIndexID);
@@ -660,8 +629,8 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
           HoodieMetadataColumnStats.newBuilder()
               .setFileName(new Path(columnRangeMetadata.getFilePath()).getName())
               .setColumnName(columnRangeMetadata.getColumnName())
-              .setMinValue(wrapStatisticValue(columnRangeMetadata.getMinValue()))
-              .setMaxValue(wrapStatisticValue(columnRangeMetadata.getMaxValue()))
+              .setMinValue(wrapValueIntoAvro(columnRangeMetadata.getMinValue()))
+              .setMaxValue(wrapValueIntoAvro(columnRangeMetadata.getMaxValue()))
               .setNullCount(columnRangeMetadata.getNullCount())
               .setValueCount(columnRangeMetadata.getValueCount())
               .setTotalSize(columnRangeMetadata.getTotalSize())
@@ -689,16 +658,16 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
 
     Comparable minValue =
         (Comparable) Stream.of(
-            (Comparable) unwrapStatisticValueWrapper(prevColumnStats.getMinValue()),
-            (Comparable) unwrapStatisticValueWrapper(newColumnStats.getMinValue()))
+                (Comparable) unwrapAvroValueWrapper(prevColumnStats.getMinValue()),
+                (Comparable) unwrapAvroValueWrapper(newColumnStats.getMinValue()))
         .filter(Objects::nonNull)
         .min(Comparator.naturalOrder())
         .orElse(null);
 
     Comparable maxValue =
         (Comparable) Stream.of(
-            (Comparable) unwrapStatisticValueWrapper(prevColumnStats.getMaxValue()),
-            (Comparable) unwrapStatisticValueWrapper(newColumnStats.getMaxValue()))
+                (Comparable) unwrapAvroValueWrapper(prevColumnStats.getMaxValue()),
+                (Comparable) unwrapAvroValueWrapper(newColumnStats.getMaxValue()))
         .filter(Objects::nonNull)
         .max(Comparator.naturalOrder())
         .orElse(null);
@@ -706,8 +675,8 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     return HoodieMetadataColumnStats.newBuilder(METADATA_COLUMN_STATS_BUILDER_STUB.get())
         .setFileName(newColumnStats.getFileName())
         .setColumnName(newColumnStats.getColumnName())
-        .setMinValue(wrapStatisticValue(minValue))
-        .setMaxValue(wrapStatisticValue(maxValue))
+        .setMinValue(wrapValueIntoAvro(minValue))
+        .setMaxValue(wrapValueIntoAvro(maxValue))
         .setValueCount(prevColumnStats.getValueCount() + newColumnStats.getValueCount())
         .setNullCount(prevColumnStats.getNullCount() + newColumnStats.getNullCount())
         .setTotalSize(prevColumnStats.getTotalSize() + newColumnStats.getTotalSize())
@@ -727,38 +696,55 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
    * @param instantTime instantTime when the record was added
    */
   public static HoodieRecord<HoodieMetadataPayload> createRecordIndexUpdate(String recordKey, String partition,
-                                                                            String fileId, String instantTime) {
-    HoodieKey key = new HoodieKey(recordKey, MetadataPartitionType.RECORD_INDEX.getPartitionPath());
-    // Data file names have a -D suffix to denote the index (D = integer) of the file written
-    // In older HUID versions the file index was missing
-    final UUID uuid;
-    final int fileIndex;
-    try {
-      if (fileId.length() == 36) {
-        uuid = UUID.fromString(fileId);
-        fileIndex = RECORD_INDEX_MISSING_FILEINDEX_FALLBACK;
-      } else {
-        final int index = fileId.lastIndexOf("-");
-        uuid = UUID.fromString(fileId.substring(0, index));
-        fileIndex = Integer.parseInt(fileId.substring(index + 1));
-      }
-    } catch (Exception e) {
-      throw new HoodieMetadataException(String.format("Invalid UUID or index: fileID=%s, partition=%s, instantTIme=%s",
-          fileId, partition, instantTime), e);
-    }
+                                                                            String fileId, String instantTime, int fileIdEncoding) {
 
+    HoodieKey key = new HoodieKey(recordKey, MetadataPartitionType.RECORD_INDEX.getPartitionPath());
+    long instantTimeMillis = -1;
     try {
-      long instantTimeMillis = HoodieActiveTimeline.parseDateFromInstantTime(instantTime).getTime();
+      instantTimeMillis = HoodieActiveTimeline.parseDateFromInstantTime(instantTime).getTime();
+    } catch (Exception e) {
+      throw new HoodieMetadataException("Failed to create metadata payload for record index. Instant time parsing for " + instantTime + " failed ", e);
+    }
+    if (fileIdEncoding == 0) {
+      // Data file names have a -D suffix to denote the index (D = integer) of the file written
+      // In older HUID versions the file index was missing
+      final UUID uuid;
+      final int fileIndex;
+      try {
+        if (fileId.length() == 36) {
+          uuid = UUID.fromString(fileId);
+          fileIndex = RECORD_INDEX_MISSING_FILEINDEX_FALLBACK;
+        } else {
+          final int index = fileId.lastIndexOf("-");
+          uuid = UUID.fromString(fileId.substring(0, index));
+          fileIndex = Integer.parseInt(fileId.substring(index + 1));
+        }
+      } catch (Exception e) {
+        throw new HoodieMetadataException(String.format("Invalid UUID or index: fileID=%s, partition=%s, instantTIme=%s",
+            fileId, partition, instantTime), e);
+      }
+
       HoodieMetadataPayload payload = new HoodieMetadataPayload(recordKey,
           new HoodieRecordIndexInfo(
               partition,
               uuid.getMostSignificantBits(),
               uuid.getLeastSignificantBits(),
               fileIndex,
-              instantTimeMillis));
+              "",
+              instantTimeMillis,
+              0));
       return new HoodieAvroRecord<>(key, payload);
-    } catch (Exception e) {
-      throw new HoodieMetadataException("Failed to create metadata payload for record index.", e);
+    } else {
+      HoodieMetadataPayload payload = new HoodieMetadataPayload(recordKey,
+          new HoodieRecordIndexInfo(
+              partition,
+              -1L,
+              -1L,
+              -1,
+              fileId,
+              instantTimeMillis,
+              1));
+      return new HoodieAvroRecord<>(key, payload);
     }
   }
 
@@ -776,14 +762,7 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
    * If this is a record-level index entry, returns the file to which this is mapped.
    */
   public HoodieRecordGlobalLocation getRecordGlobalLocation() {
-    final UUID uuid = new UUID(recordIndexMetadata.getFileIdHighBits(), recordIndexMetadata.getFileIdLowBits());
-    final String partition = recordIndexMetadata.getPartition();
-    String fileId = uuid.toString();
-    if (recordIndexMetadata.getFileIndex() != RECORD_INDEX_MISSING_FILEINDEX_FALLBACK) {
-      fileId += "-" + recordIndexMetadata.getFileIndex();
-    }
-    final java.util.Date instantDate = new java.util.Date(recordIndexMetadata.getInstantTime());
-    return new HoodieRecordGlobalLocation(partition, HoodieActiveTimeline.formatDate(instantDate), fileId);
+    return HoodieTableMetadataUtil.getLocationFromRecordIndexInfo(recordIndexMetadata);
   }
 
   public boolean isDeleted() {
@@ -851,87 +830,6 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     }
     sb.append('}');
     return sb.toString();
-  }
-
-  private static Object wrapStatisticValue(Comparable<?> statValue) {
-    if (statValue == null) {
-      return null;
-    } else if (statValue instanceof Date || statValue instanceof LocalDate) {
-      // NOTE: Due to breaking changes in code-gen b/w Avro 1.8.2 and 1.10, we can't
-      //       rely on logical types to do proper encoding of the native Java types,
-      //       and hereby have to encode statistic manually
-      LocalDate localDate = statValue instanceof LocalDate
-          ? (LocalDate) statValue
-          : ((Date) statValue).toLocalDate();
-      return DateWrapper.newBuilder(DATE_WRAPPER_BUILDER_STUB.get())
-          .setValue((int) localDate.toEpochDay())
-          .build();
-    } else if (statValue instanceof BigDecimal) {
-      Schema valueSchema = DecimalWrapper.SCHEMA$.getField("value").schema();
-      BigDecimal upcastDecimal = tryUpcastDecimal((BigDecimal) statValue, (LogicalTypes.Decimal) valueSchema.getLogicalType());
-      return DecimalWrapper.newBuilder(DECIMAL_WRAPPER_BUILDER_STUB.get())
-          .setValue(AVRO_DECIMAL_CONVERSION.toBytes(upcastDecimal, valueSchema, valueSchema.getLogicalType()))
-          .build();
-    } else if (statValue instanceof Timestamp) {
-      // NOTE: Due to breaking changes in code-gen b/w Avro 1.8.2 and 1.10, we can't
-      //       rely on logical types to do proper encoding of the native Java types,
-      //       and hereby have to encode statistic manually
-      Instant instant = ((Timestamp) statValue).toInstant();
-      return TimestampMicrosWrapper.newBuilder(TIMESTAMP_MICROS_WRAPPER_BUILDER_STUB.get())
-          .setValue(instantToMicros(instant))
-          .build();
-    } else if (statValue instanceof Boolean) {
-      return BooleanWrapper.newBuilder(BOOLEAN_WRAPPER_BUILDER_STUB.get()).setValue((Boolean) statValue).build();
-    } else if (statValue instanceof Integer) {
-      return IntWrapper.newBuilder(INT_WRAPPER_BUILDER_STUB.get()).setValue((Integer) statValue).build();
-    } else if (statValue instanceof Long) {
-      return LongWrapper.newBuilder(LONG_WRAPPER_BUILDER_STUB.get()).setValue((Long) statValue).build();
-    } else if (statValue instanceof Float) {
-      return FloatWrapper.newBuilder(FLOAT_WRAPPER_BUILDER_STUB.get()).setValue((Float) statValue).build();
-    } else if (statValue instanceof Double) {
-      return DoubleWrapper.newBuilder(DOUBLE_WRAPPER_BUILDER_STUB.get()).setValue((Double) statValue).build();
-    } else if (statValue instanceof ByteBuffer) {
-      return BytesWrapper.newBuilder(BYTES_WRAPPER_BUILDER_STUB.get()).setValue((ByteBuffer) statValue).build();
-    } else if (statValue instanceof String || statValue instanceof Utf8) {
-      return StringWrapper.newBuilder(STRING_WRAPPER_BUILDER_STUB.get()).setValue(statValue.toString()).build();
-    } else {
-      throw new UnsupportedOperationException(String.format("Unsupported type of the statistic (%s)", statValue.getClass()));
-    }
-  }
-
-  public static Comparable<?> unwrapStatisticValueWrapper(Object statValueWrapper) {
-    if (statValueWrapper == null) {
-      return null;
-    } else if (statValueWrapper instanceof DateWrapper) {
-      return LocalDate.ofEpochDay(((DateWrapper) statValueWrapper).getValue());
-    } else if (statValueWrapper instanceof DecimalWrapper) {
-      Schema valueSchema = DecimalWrapper.SCHEMA$.getField("value").schema();
-      return AVRO_DECIMAL_CONVERSION.fromBytes(((DecimalWrapper) statValueWrapper).getValue(), valueSchema, valueSchema.getLogicalType());
-    } else if (statValueWrapper instanceof TimestampMicrosWrapper) {
-      return microsToInstant(((TimestampMicrosWrapper) statValueWrapper).getValue());
-    } else if (statValueWrapper instanceof BooleanWrapper) {
-      return ((BooleanWrapper) statValueWrapper).getValue();
-    } else if (statValueWrapper instanceof IntWrapper) {
-      return ((IntWrapper) statValueWrapper).getValue();
-    } else if (statValueWrapper instanceof LongWrapper) {
-      return ((LongWrapper) statValueWrapper).getValue();
-    } else if (statValueWrapper instanceof FloatWrapper) {
-      return ((FloatWrapper) statValueWrapper).getValue();
-    } else if (statValueWrapper instanceof DoubleWrapper) {
-      return ((DoubleWrapper) statValueWrapper).getValue();
-    } else if (statValueWrapper instanceof BytesWrapper) {
-      return ((BytesWrapper) statValueWrapper).getValue();
-    } else if (statValueWrapper instanceof StringWrapper) {
-      return ((StringWrapper) statValueWrapper).getValue();
-    } else if (statValueWrapper instanceof GenericRecord) {
-      // NOTE: This branch could be hit b/c Avro records could be reconstructed
-      //       as {@code GenericRecord)
-      // TODO add logical type decoding
-      GenericRecord record = (GenericRecord) statValueWrapper;
-      return (Comparable<?>) record.get("value");
-    } else {
-      throw new UnsupportedOperationException(String.format("Unsupported type of the statistic (%s)", statValueWrapper.getClass()));
-    }
   }
 
   private static void validatePayload(int type, Map<String, HoodieMetadataFileInfo> filesystemMetadata) {

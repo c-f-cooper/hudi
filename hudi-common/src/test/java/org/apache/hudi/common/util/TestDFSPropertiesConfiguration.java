@@ -20,14 +20,15 @@ package org.apache.hudi.common.util;
 
 import org.apache.hudi.common.config.DFSPropertiesConfiguration;
 import org.apache.hudi.common.config.TypedProperties;
-import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.testutils.minicluster.HdfsTestService;
 import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
+
 import org.junit.Rule;
 import org.junit.contrib.java.lang.system.EnvironmentVariables;
 import org.junit.jupiter.api.AfterAll;
@@ -39,6 +40,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
 
+import static org.apache.hudi.common.testutils.HoodieTestUtils.shouldUseExternalHdfs;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.useExternalHdfs;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -60,10 +63,15 @@ public class TestDFSPropertiesConfiguration {
 
   @BeforeAll
   public static void initClass() throws Exception {
-    hdfsTestService = new HdfsTestService();
-    dfsCluster = hdfsTestService.start(true);
+    if (shouldUseExternalHdfs()) {
+      dfs = useExternalHdfs();
+    } else {
+      hdfsTestService = new HdfsTestService();
+      dfsCluster = hdfsTestService.start(true);
+      dfs = dfsCluster.getFileSystem();
+    }
+
     // Create a temp folder as the base path
-    dfs = dfsCluster.getFileSystem();
     dfsBasePath = dfs.getWorkingDirectory().toString();
     dfs.mkdirs(new Path(dfsBasePath));
 
@@ -176,7 +184,7 @@ public class TestDFSPropertiesConfiguration {
     ENVIRONMENT_VARIABLES.clear(DFSPropertiesConfiguration.CONF_FILE_DIR_ENV_NAME);
     DFSPropertiesConfiguration.refreshGlobalProps();
     try {
-      if (!FSUtils.getFs(DFSPropertiesConfiguration.DEFAULT_PATH, new Configuration()).exists(DFSPropertiesConfiguration.DEFAULT_PATH)) {
+      if (!HadoopFSUtils.getFs(DFSPropertiesConfiguration.DEFAULT_PATH, new Configuration()).exists(DFSPropertiesConfiguration.DEFAULT_PATH)) {
         assertEquals(0, DFSPropertiesConfiguration.getGlobalProps().size());
       }
     } catch (IOException e) {

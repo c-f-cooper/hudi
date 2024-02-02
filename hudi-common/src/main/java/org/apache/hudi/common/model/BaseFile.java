@@ -18,7 +18,7 @@
 
 package org.apache.hudi.common.model;
 
-import org.apache.hudi.hadoop.CachingPath;
+import org.apache.hudi.hadoop.fs.CachingPath;
 
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
@@ -36,7 +36,7 @@ public class BaseFile implements Serializable {
 
   private transient FileStatus fileStatus;
   private final String fullPath;
-  private final String fileName;
+  protected final String fileName;
   private long fileLen;
 
   public BaseFile(BaseFile dataFile) {

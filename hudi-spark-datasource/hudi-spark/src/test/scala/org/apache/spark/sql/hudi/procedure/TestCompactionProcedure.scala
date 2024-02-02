@@ -45,6 +45,10 @@ class TestCompactionProcedure extends HoodieSparkProcedureTestBase {
            | )
        """.stripMargin)
       spark.sql("set hoodie.parquet.max.file.size = 10000")
+      // disable automatic inline compaction
+      spark.sql("set hoodie.compact.inline=false")
+      spark.sql("set hoodie.compact.schedule.inline=false")
+
       spark.sql(s"insert into $tableName values(1, 'a1', 10, 1000)")
       spark.sql(s"insert into $tableName values(2, 'a2', 10, 1000)")
       spark.sql(s"insert into $tableName values(3, 'a3', 10, 1000)")
@@ -125,6 +129,10 @@ class TestCompactionProcedure extends HoodieSparkProcedureTestBase {
            | )
        """.stripMargin)
       spark.sql("set hoodie.parquet.max.file.size = 10000")
+      // disable automatic inline compaction
+      spark.sql("set hoodie.compact.inline=false")
+      spark.sql("set hoodie.compact.schedule.inline=false")
+
       spark.sql(s"insert into $tableName values(1, 'a1', 10, 1000)")
       spark.sql(s"insert into $tableName values(2, 'a2', 10, 1000)")
       spark.sql(s"insert into $tableName values(3, 'a3', 10, 1000)")
@@ -192,12 +200,14 @@ class TestCompactionProcedure extends HoodieSparkProcedureTestBase {
            | tblproperties (
            |  type = 'mor',
            |  primaryKey = 'id',
-           |  preCombineField = 'ts',
-           |  hoodie.compact.inline ='true',
-           |  hoodie.compact.inline.max.delta.commits ='2'
+           |  preCombineField = 'ts'
            | )
            | location '${tmp.getCanonicalPath}/$tableName1'
        """.stripMargin)
+      // set inline compaction
+      spark.sql("set hoodie.compact.inline=true")
+      spark.sql("set hoodie.compact.inline.max.delta.commits=2")
+
       spark.sql(s"insert into $tableName1 values(1, 'a1', 10, 1000)")
       spark.sql(s"update $tableName1 set name = 'a2' where id = 1")
       spark.sql(s"update $tableName1 set name = 'a3' where id = 1")
@@ -320,6 +330,53 @@ class TestCompactionProcedure extends HoodieSparkProcedureTestBase {
         spark.sql(s"update $tableName set name = 'a3' where id = 1")
 
         assertResult(1)(spark.sql(s"call run_compaction(table => '$tableName', op => 'scheduleAndExecute')").collect().length)
+      }
+    }
+  }
+
+  test("Test Call run_clustering with limit parameter") {
+    withSQLConf("hoodie.compact.inline" -> "false", "hoodie.compact.inline.max.delta.commits" -> "1") {
+      withTempDir { tmp =>
+        val tableName = generateTableName
+        val basePath = s"${tmp.getCanonicalPath}/$tableName"
+        spark.sql(
+          s"""
+             |create table $tableName (
+             |  id int,
+             |  name string,
+             |  price double,
+             |  ts long
+             |) using hudi
+             | tblproperties (
+             |  type = 'mor',
+             |  primaryKey = 'id',
+             |  preCombineField = 'ts'
+             | )
+             | location '${basePath}'
+       """.stripMargin)
+
+        val conf = new Configuration
+        val metaClient = HoodieTableMetaClient.builder.setConf(conf).setBasePath(basePath).build
+
+        assert(0 == metaClient.getActiveTimeline.getCompletedReplaceTimeline.getInstants.size())
+        assert(metaClient.getActiveTimeline.filterPendingReplaceTimeline().empty())
+
+        spark.sql(s"insert into $tableName values(1, 'a1', 10, 1000)")
+        spark.sql(s"update $tableName set name = 'a2' where id = 1")
+
+        spark.sql(s"call run_compaction(table => '$tableName', op => 'schedule')")
+
+        spark.sql(s"insert into $tableName values(2, 'b1', 20, 3000)")
+        spark.sql(s"update $tableName set name = 'b3' where id = 2")
+
+        spark.sql(s"call run_compaction(table => '$tableName', op => 'schedule')")
+        metaClient.reloadActiveTimeline();
+        assert(2 == metaClient.getActiveTimeline.filterPendingCompactionTimeline().getInstants.size())
+
+        spark.sql(s"call run_compaction(table => '$tableName', op => 'execute', limit => 1)");
+
+        metaClient.reloadActiveTimeline();
+        assert(1 == metaClient.getActiveTimeline.filterPendingCompactionTimeline().getInstants.size())
       }
     }
   }

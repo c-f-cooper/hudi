@@ -23,6 +23,7 @@ import org.apache.hudi.SparkJdbcUtils;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
+import org.apache.hudi.client.transaction.lock.FileSystemBasedLockProvider;
 import org.apache.hudi.common.config.DFSPropertiesConfiguration;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.engine.EngineType;
@@ -41,6 +42,7 @@ import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.config.HoodieCompactionConfig;
 import org.apache.hudi.config.HoodieIndexConfig;
+import org.apache.hudi.config.HoodieLockConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieIOException;
@@ -107,6 +109,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.function.Function;
+import java.util.function.Supplier;
+
+import static org.apache.hudi.common.util.ConfigUtils.getBooleanWithAltKeys;
+import static org.apache.hudi.common.util.ConfigUtils.getStringWithAltKeys;
 
 /**
  * Bunch of helper methods.
@@ -201,13 +207,13 @@ public class UtilHelpers {
     return null;
   }
 
-  public static Option<Transformer> createTransformer(Option<List<String>> classNamesOpt, Option<Schema> sourceSchema,
+  public static Option<Transformer> createTransformer(Option<List<String>> classNamesOpt, Supplier<Option<Schema>> sourceSchemaSupplier,
                                                       boolean isErrorTableWriterEnabled) throws IOException {
 
     try {
       Function<List<String>, Transformer> chainedTransformerFunction = classNames ->
-          isErrorTableWriterEnabled ? new ErrorTableAwareChainedTransformer(classNames, sourceSchema)
-              : new ChainedTransformer(classNames, sourceSchema);
+          isErrorTableWriterEnabled ? new ErrorTableAwareChainedTransformer(classNames, sourceSchemaSupplier)
+              : new ChainedTransformer(classNames, sourceSchemaSupplier);
       return classNamesOpt.map(classNames -> classNames.isEmpty() ? null : chainedTransformerFunction.apply(classNames));
     } catch (Throwable e) {
       throw new IOException("Could not load transformer class(es) " + classNamesOpt.get(), e);
@@ -249,6 +255,13 @@ public class UtilHelpers {
     }
 
     return conf;
+  }
+
+  public static TypedProperties buildProperties(Configuration hadoopConf, String propsFilePath, List<String> props) {
+    return StringUtils.isNullOrEmpty(propsFilePath)
+        ? UtilHelpers.buildProperties(props)
+        : UtilHelpers.readConfig(hadoopConf, new Path(propsFilePath), props)
+        .getProps(true);
   }
 
   public static TypedProperties buildProperties(List<String> props) {
@@ -523,9 +536,10 @@ public class UtilHelpers {
       return provider;
     }
 
-    String schemaPostProcessorClass = cfg.getString(SchemaProviderPostProcessorConfig.SCHEMA_POST_PROCESSOR.key(), null);
-    boolean enableSparkAvroPostProcessor = Boolean.parseBoolean(cfg.getString(HoodieSchemaProviderConfig.SPARK_AVRO_POST_PROCESSOR_ENABLE.key(), "true"));
-
+    String schemaPostProcessorClass = getStringWithAltKeys(
+        cfg, SchemaProviderPostProcessorConfig.SCHEMA_POST_PROCESSOR, true);
+    boolean enableSparkAvroPostProcessor =
+        getBooleanWithAltKeys(cfg, HoodieSchemaProviderConfig.SPARK_AVRO_POST_PROCESSOR_ENABLE);
     if (transformerClassNames != null && !transformerClassNames.isEmpty()
         && enableSparkAvroPostProcessor && StringUtils.isNullOrEmpty(schemaPostProcessorClass)) {
       schemaPostProcessorClass = SparkAvroPostProcessor.class.getName();
@@ -551,13 +565,9 @@ public class UtilHelpers {
     return wrapSchemaProviderWithPostProcessor(rowSchemaProvider, cfg, jssc, null);
   }
 
-  public static Option<Schema> getLatestTableSchema(JavaSparkContext jssc, FileSystem fs, String basePath) {
+  public static Option<Schema> getLatestTableSchema(JavaSparkContext jssc, FileSystem fs, String basePath, HoodieTableMetaClient tableMetaClient) {
     try {
       if (FSUtils.isTableExists(basePath, fs)) {
-        HoodieTableMetaClient tableMetaClient = HoodieTableMetaClient.builder()
-            .setConf(jssc.sc().hadoopConfiguration())
-            .setBasePath(basePath)
-            .build();
         TableSchemaResolver tableSchemaResolver = new TableSchemaResolver(tableMetaClient);
 
         return tableSchemaResolver.getTableAvroSchemaFromLatestCommit(false);
@@ -576,6 +586,12 @@ public class UtilHelpers {
         .setBasePath(basePath)
         .setLoadActiveTimelineOnLoad(shouldLoadActiveTimelineOnLoad)
         .build();
+  }
+
+  public static void addLockOptions(String basePath, TypedProperties props) {
+    if (!props.containsKey(HoodieLockConfig.LOCK_PROVIDER_CLASS_NAME.key())) {
+      props.putAll(FileSystemBasedLockProvider.getLockConfig(basePath));
+    }
   }
 
   @FunctionalInterface
