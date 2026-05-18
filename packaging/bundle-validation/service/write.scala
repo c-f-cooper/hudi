@@ -17,7 +17,7 @@
  */
 
 import org.apache.hudi.QuickstartUtils._
-import scala.collection.JavaConversions._
+import scala.collection.JavaConverters._
 import org.apache.spark.sql.SaveMode._
 import org.apache.hudi.DataSourceReadOptions._
 import org.apache.hudi.DataSourceWriteOptions._
@@ -40,9 +40,7 @@ df.write.format("hudi").
   option("hoodie.database.name", database).
   option("hoodie.datasource.meta.sync.enable", "false").
   option("hoodie.datasource.hive_sync.enable", "false").
-  option("hoodie.metadata.enabled", "false").
-  option("hoodie.metaserver.enabled", "true").
-  option("hoodie.metaserver.uris", "thrift://localhost:9090").
+  option("hoodie.metadata.enable", "false").
   mode(Overwrite).
   save(basePath)
 

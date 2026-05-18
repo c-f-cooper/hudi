@@ -23,6 +23,7 @@ import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.function.SerializableFunction;
 import org.apache.hudi.common.function.SerializablePairFunction;
 import org.apache.hudi.common.util.collection.Pair;
+import org.apache.hudi.storage.StoragePath;
 
 import java.io.Serializable;
 import java.util.Iterator;
@@ -77,6 +78,13 @@ public interface HoodieData<T> extends Serializable {
   void unpersist();
 
   /**
+   * Un-persists this data and all its upstream dependencies recursively.
+   * This method traverses the dependency graph and unpersists any cached dependencies
+   * if the underlying hoodie engine has such capability.
+   */
+  void unpersistWithDependencies();
+
+  /**
    * Returns whether the collection is empty.
    */
   boolean isEmpty();
@@ -92,6 +100,11 @@ public interface HoodieData<T> extends Serializable {
    * @return the number of data partitions in the engine-specific representation.
    */
   int getNumPartitions();
+
+  /**
+   * @return the deduce number of shuffle partitions
+   */
+  int deduceNumPartitions();
 
   /**
    * Maps every element in the collection using provided mapping {@code func}.
@@ -207,6 +220,15 @@ public interface HoodieData<T> extends Serializable {
    */
   HoodieData<T> repartition(int parallelism);
 
+  /**
+   * Coalesces underlying collection (if applicable) making sure new {@link HoodieData} has
+   * exactly {@code parallelism} partitions or less.
+   *
+   * @param parallelism target number of partitions in the underlying collection
+   * @return {@link HoodieData<T>} holding coalesced collection
+   */
+  HoodieData<T> coalesce(int parallelism);
+
   default <O> HoodieData<T> distinctWithKey(SerializableFunction<T, O> keyGetter, int parallelism) {
     return mapToPair(i -> Pair.of(keyGetter.apply(i), i))
         .reduceByKey((value1, value2) -> value1, parallelism)
@@ -222,7 +244,7 @@ public interface HoodieData<T> extends Serializable {
   class HoodieDataCacheKey implements Serializable {
 
     public static HoodieDataCacheKey of(String basePath, String instantTime) {
-      return new HoodieDataCacheKey(basePath, instantTime);
+      return new HoodieDataCacheKey(new StoragePath(basePath).toString(), instantTime);
     }
 
     private final String basePath;

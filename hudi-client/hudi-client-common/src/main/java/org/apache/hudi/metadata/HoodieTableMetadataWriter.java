@@ -27,24 +27,84 @@ import org.apache.hudi.common.data.HoodieData;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.VisibleForTesting;
 
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Interface that supports updating metadata for a given table, as actions complete.
  */
-public interface HoodieTableMetadataWriter extends Serializable, AutoCloseable {
+public interface HoodieTableMetadataWriter<I,O> extends Serializable, AutoCloseable {
+
+  /**
+   * Starts a new commit in metadata table for streaming write flow.
+   *
+   * @param instantTime The instant time of interest.
+   */
+  void startCommit(String instantTime);
+
+  /**
+   * Prepare records and write to MDT table for all eligible partitions except FILES partition.
+   *
+   * <p>This will be used in streaming writes, where in data table write-statuses are maintained as HoodieData,
+   * prepares records and write to MDT table partitions (except FILES).
+   *
+   * <p>Caution: that no actions should be triggered on the incoming HoodieData&lt;WriteStatus&gt;
+   * and the writes to metadata table. Caller is expected to trigger #collect just once for both set of HoodieData&lt;WriteStatus&gt;.
+   *
+   * @param writeStatus {@link HoodieData} of {@link WriteStatus} from data table writes.
+   * @param instantTime  instant time of interest.
+   *
+   * @return {@link HoodieData} of {@link WriteStatus} for writes to metadata table.
+   */
+  HoodieData<WriteStatus> streamWriteToMetadataPartitions(HoodieData<WriteStatus> writeStatus, String instantTime);
+
+  /**
+   * Write the prepared records to MDT table for all eligible partitions except FILES partition.
+   *
+   * <p>This will be used in streaming writes, where in data table index payloads are maintained as HoodieData,
+   * prepares records and write to MDT table partitions (except FILES).
+   *
+   * @param indexRecords   {@link HoodieData} of index {@link HoodieRecord}s.
+   * @param dataPartitions partitions of data table that are updated.
+   * @param instantTime    instant time of interest.
+   *
+   * @return {@link HoodieData} of {@link WriteStatus} for writes to metadata table.
+   */
+  HoodieData<WriteStatus> streamWriteToMetadataPartitions(HoodieData<HoodieRecord> indexRecords, Set<String> dataPartitions, String instantTime);
+
+  /**
+   * Completes the multiple commits in streaming writes.
+   *
+   * <p>The streaming writes work flow:
+   *
+   * <ol>
+   *   <li>writes the inputs in data table o all data files;</li>
+   *   <li>update metadata table partitions in {@link #streamWriteToMetadataPartitions};</li>
+   *   <li>finalizes the writes for data table;</li>
+   *   <li>caller invokes this method to update metadata table for other non-streaming enabled partitions(included FILES), and finally completes the commit in metadata table.</li>
+   * </ol>
+   *
+   * @param instantTime       Instant time of interest.
+   * @param context           The engine context {@link HoodieEngineContext}.
+   * @param partialWriteStats List<HoodieWriteStat> for partial/streaming writes to metadata table completed so far.
+   * @param commitMetadata    The data table {@link HoodieCommitMetadata}.
+   */
+  void completeStreamingCommit(String instantTime, HoodieEngineContext context, List<HoodieWriteStat> partialWriteStats, HoodieCommitMetadata commitMetadata);
 
   /**
    * Builds the given metadata partitions to create index.
    *
    * @param engineContext
    * @param indexPartitionInfos - information about partitions to build such as partition type and base instant time
+   * @param instantTime The async index instant time from data table
    */
-  void buildMetadataPartitions(HoodieEngineContext engineContext, List<HoodieIndexPartitionInfo> indexPartitionInfos) throws IOException;
+  void buildMetadataPartitions(HoodieEngineContext engineContext, List<HoodieIndexPartitionInfo> indexPartitionInfos, String instantTime) throws IOException;
 
   /**
    * Drop the given metadata partitions.
@@ -52,26 +112,14 @@ public interface HoodieTableMetadataWriter extends Serializable, AutoCloseable {
    * @param metadataPartitions List of MDT partitions to drop
    * @throws IOException on failures
    */
-  void dropMetadataPartitions(List<MetadataPartitionType> metadataPartitions) throws IOException;
+  void dropMetadataPartitions(List<String> metadataPartitions) throws IOException;
 
   /**
    * Update the metadata table due to a COMMIT operation.
-   *
    * @param commitMetadata commit metadata of the operation of interest.
    * @param instantTime    instant time of the commit.
    */
-  void updateFromWriteStatuses(HoodieCommitMetadata commitMetadata, HoodieData<WriteStatus> writeStatuses, String instantTime);
-
-  /**
-   * Update the metadata table due to a COMMIT or REPLACECOMMIT operation.
-   * As compared to {@link #updateFromWriteStatuses(HoodieCommitMetadata, HoodieData, String)}, this method
-   * directly updates metadata with the given records, instead of first converting {@link WriteStatus} to {@link HoodieRecord}.
-   *
-   * @param commitMetadata commit metadata of the operation of interest.
-   * @param records        records to update metadata with.
-   * @param instantTime    instant time of the commit.
-   */
-  void update(HoodieCommitMetadata commitMetadata, HoodieData<HoodieRecord> records, String instantTime);
+  void update(HoodieCommitMetadata commitMetadata, String instantTime);
 
   /**
    * Update the metadata table due to a CLEAN operation.
@@ -115,6 +163,23 @@ public interface HoodieTableMetadataWriter extends Serializable, AutoCloseable {
    *
    * @param inFlightInstantTimestamp Timestamp of an instant which is in-progress. This instant is ignored while
    *                                 deciding if optimizations can be performed.
+   * @param requiresTimelineRefresh set to true only if timeline requires reload, mainly used for testing
    */
-  void performTableServices(Option<String> inFlightInstantTimestamp);
+  @VisibleForTesting
+  void performTableServices(Option<String> inFlightInstantTimestamp, boolean requiresTimelineRefresh);
+
+  /**
+   * Perform various table services like compaction, cleaning, archiving on the MDT if required.
+   *
+   * @param inFlightInstantTimestamp Timestamp of an instant which is in-progress. This instant is ignored while
+   *                                 deciding if optimizations can be performed.
+   */
+  default void performTableServices(Option<String> inFlightInstantTimestamp) {
+    performTableServices(inFlightInstantTimestamp, false);
+  }
+
+  /**
+   * This returns true if the metadata table's partitions state is changed.
+   */
+  boolean hasPartitionsStateChanged();
 }

@@ -53,14 +53,17 @@ public class HoodieCompactionAdminTool {
       System.exit(1);
     }
     HoodieCompactionAdminTool admin = new HoodieCompactionAdminTool(cfg);
-    admin.run(UtilHelpers.buildSparkContext("admin-compactor", cfg.sparkMaster, cfg.sparkMemory));
+    admin.run(UtilHelpers.buildSparkContext("admin-compactor",
+        cfg.sparkMaster, cfg.sparkMemory, cfg.enableHiveSupport));
   }
 
   /**
    * Executes one of compaction admin operations.
    */
   public void run(JavaSparkContext jsc) throws Exception {
-    HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder().setConf(jsc.hadoopConfiguration()).setBasePath(cfg.basePath).build();
+    HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder()
+        .setConf(HadoopFSUtils.getStorageConfWithCopy(jsc.hadoopConfiguration()))
+        .setBasePath(cfg.basePath).build();
     try (CompactionAdminClient admin = new CompactionAdminClient(new HoodieSparkEngineContext(jsc), cfg.basePath)) {
       final FileSystem fs = HadoopFSUtils.getFs(cfg.basePath, jsc.hadoopConfiguration());
       if (cfg.outputPath != null && fs.exists(new Path(cfg.outputPath))) {
@@ -107,11 +110,10 @@ public class HoodieCompactionAdminTool {
   private <T> void serializeOperationResult(FileSystem fs, T result) throws Exception {
     if ((cfg.outputPath != null) && (result != null)) {
       Path outputPath = new Path(cfg.outputPath);
-      OutputStream stream = fs.create(outputPath, true);
-      ObjectOutputStream out = new ObjectOutputStream(stream);
-      out.writeObject(result);
-      out.close();
-      stream.close();
+      try (OutputStream stream = fs.create(outputPath, true);
+           ObjectOutputStream out = new ObjectOutputStream(stream)) {
+        out.writeObject(result);
+      }
     }
   }
 
@@ -156,6 +158,8 @@ public class HoodieCompactionAdminTool {
     public String sparkMaster = null;
     @Parameter(names = {"--spark-memory", "-sm"}, description = "spark memory to use", required = true)
     public String sparkMemory = null;
+    @Parameter(names = {"--enable-hive-support", "-ehs"}, description = "Enables hive support during spark context initialization.", required = false)
+    public Boolean enableHiveSupport = false;
     @Parameter(names = {"--dry-run", "-dr"}, description = "Dry Run Mode", required = false)
     public boolean dryRun = false;
     @Parameter(names = {"--skip-validation", "-sv"}, description = "Skip Validation", required = false)

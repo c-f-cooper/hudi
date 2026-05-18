@@ -18,44 +18,29 @@
 
 package org.apache.hudi.table.action.commit;
 
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
 import java.io.Serializable;
 import java.util.Objects;
 
 /**
  * Helper class for a bucket's type (INSERT and UPDATE) and its file location.
  */
+@AllArgsConstructor
+@Getter
 public class BucketInfo implements Serializable {
 
   BucketType bucketType;
   String fileIdPrefix;
   String partitionPath;
 
-  public BucketInfo(BucketType bucketType, String fileIdPrefix, String partitionPath) {
-    this.bucketType = bucketType;
-    this.fileIdPrefix = fileIdPrefix;
-    this.partitionPath = partitionPath;
-  }
-
-  public BucketType getBucketType() {
-    return bucketType;
-  }
-
-  public String getFileIdPrefix() {
-    return fileIdPrefix;
-  }
-
-  public String getPartitionPath() {
-    return partitionPath;
-  }
-
   @Override
   public String toString() {
-    final StringBuilder sb = new StringBuilder("BucketInfo {");
-    sb.append("bucketType=").append(bucketType).append(", ");
-    sb.append("fileIdPrefix=").append(fileIdPrefix).append(", ");
-    sb.append("partitionPath=").append(partitionPath);
-    sb.append('}');
-    return sb.toString();
+    return "BucketInfo {" + "bucketType=" + bucketType + ", "
+        + "fileIdPrefix=" + fileIdPrefix + ", "
+        + "partitionPath=" + partitionPath
+        + '}';
   }
 
   @Override

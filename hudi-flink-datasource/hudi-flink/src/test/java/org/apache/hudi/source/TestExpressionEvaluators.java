@@ -29,11 +29,10 @@ import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.expressions.CallExpression;
 import org.apache.flink.table.expressions.FieldReferenceExpression;
 import org.apache.flink.table.expressions.ValueLiteralExpression;
+import org.apache.flink.table.functions.BuiltInFunctionDefinition;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
-import org.apache.flink.table.functions.FunctionDefinition;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
-
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -44,8 +43,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
-import static org.apache.hudi.source.prune.DataPruner.convertColumnStats;
 import static org.apache.hudi.source.ExpressionEvaluators.fromExpression;
+import static org.apache.hudi.source.prune.ColumnStatsProbe.convertColumnStats;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -375,7 +374,7 @@ public class TestExpressionEvaluators {
     ValueLiteralExpression nullLiteral = new ValueLiteralExpression(null, DataTypes.INT());
     RowData indexRow = intIndexRow(11, 13);
     Map<String, ColumnStats> stats = convertColumnStats(indexRow, queryFields(2));
-    FunctionDefinition[] funDefs = new FunctionDefinition[] {
+    BuiltInFunctionDefinition[] funDefs = new BuiltInFunctionDefinition[] {
         BuiltInFunctionDefinitions.EQUALS,
         BuiltInFunctionDefinitions.NOT_EQUALS,
         BuiltInFunctionDefinitions.LESS_THAN,
@@ -383,9 +382,9 @@ public class TestExpressionEvaluators {
         BuiltInFunctionDefinitions.LESS_THAN_OR_EQUAL,
         BuiltInFunctionDefinitions.GREATER_THAN_OR_EQUAL,
         BuiltInFunctionDefinitions.IN};
-    for (FunctionDefinition funDef : funDefs) {
+    for (BuiltInFunctionDefinition funDef : funDefs) {
       CallExpression expr =
-          new CallExpression(
+          CallExpression.permanent(
               funDef,
               Arrays.asList(ref, nullLiteral),
               DataTypes.BOOLEAN());

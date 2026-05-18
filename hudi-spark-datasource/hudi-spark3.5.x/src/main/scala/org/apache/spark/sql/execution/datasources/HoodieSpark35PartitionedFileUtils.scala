@@ -19,7 +19,10 @@
 
 package org.apache.spark.sql.execution.datasources
 
-import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hudi.common.util.ReflectionUtils
+import org.apache.hudi.storage.StoragePath
+
+import org.apache.hadoop.fs.FileStatus
 import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.catalyst.InternalRow
 
@@ -27,23 +30,36 @@ import org.apache.spark.sql.catalyst.InternalRow
  * Utils on Spark [[PartitionedFile]] and [[PartitionDirectory]] for Spark 3.5.
  */
 object HoodieSpark35PartitionedFileUtils extends HoodieSparkPartitionedFileUtils {
-  override def getPathFromPartitionedFile(partitionedFile: PartitionedFile): Path = {
-    partitionedFile.filePath.toPath
+  override def getPathFromPartitionedFile(partitionedFile: PartitionedFile): StoragePath = {
+    new StoragePath(partitionedFile.filePath.toUri)
   }
 
   override def getStringPathFromPartitionedFile(partitionedFile: PartitionedFile): String = {
-    partitionedFile.filePath.toString
+    partitionedFile.filePath.toPath.toString
   }
 
   override def createPartitionedFile(partitionValues: InternalRow,
-                                     filePath: Path,
+                                     filePath: StoragePath,
                                      start: Long,
                                      length: Long): PartitionedFile = {
-    PartitionedFile(partitionValues, SparkPath.fromPath(filePath), start, length)
+    PartitionedFile(partitionValues, SparkPath.fromUri(filePath.toUri), start, length, Array.empty)
   }
 
   override def toFileStatuses(partitionDirs: Seq[PartitionDirectory]): Seq[FileStatus] = {
-    partitionDirs.flatMap(_.files).map(_.fileStatus)
+    val files: Seq[FileStatusWithMetadata] = partitionDirs.flatMap(_.files)
+    try {
+      files.map(_.fileStatus)
+    } catch {
+      case _: NoSuchMethodException | _: NoSuchMethodError | _: IllegalArgumentException =>
+        val methodOpt = ReflectionUtils.getMethod(classOf[FileStatusWithMetadata], "toFileStatus")
+        if (methodOpt.isPresent) {
+          val method = methodOpt.get()
+          files.map(f => method.invoke(f).asInstanceOf[FileStatus])
+        } else {
+          throw new RuntimeException(
+            "Cannot find toFileStatus method on FileStatusWithMetadata in custom Spark Runtime")
+        }
+    }
   }
 
   override def newPartitionDirectory(internalRow: InternalRow, statuses: Seq[FileStatus]): PartitionDirectory = {

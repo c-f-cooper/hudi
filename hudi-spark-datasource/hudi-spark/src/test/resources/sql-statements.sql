@@ -63,15 +63,15 @@ select id, name, price, cast(dt as string) from h0_p;
 # CREATE TABLE
 
 create table h1 (
-  id bigint,
+  id int,
   name string,
   price double,
-  ts bigint
+  ts int
 ) using hudi
 options (
   type = '${tableType}',
   primaryKey = 'id',
-  preCombineField = 'ts'
+  orderingFields = 'ts'
 )
 location '${tmpDir}/h1';
 +----------+
@@ -79,17 +79,17 @@ location '${tmpDir}/h1';
 +----------+
 
 create table h1_p (
-  id bigint,
+  id int,
   name string,
   price double,
-  ts bigint,
+  ts int,
   dt string
 ) using hudi
 partitioned by (dt)
 options (
   type = '${tableType}',
   primaryKey = 'id',
-  preCombineField = 'ts'
+  orderingFields = 'ts'
 )
 location '${tmpDir}/h1_p';
 +----------+

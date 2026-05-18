@@ -20,45 +20,45 @@ package org.apache.hudi.table.marker;
 
 import org.apache.hudi.client.transaction.DirectMarkerTransactionManager;
 import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
+import org.apache.hudi.common.table.timeline.InstantGenerator;
+import org.apache.hudi.common.table.timeline.TimelineLayout;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieEarlyConflictDetectionException;
-import org.apache.hudi.hadoop.fs.HoodieWrapperFileSystem;
+import org.apache.hudi.storage.HoodieStorage;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * This strategy is used for direct marker writers, trying to do early conflict detection.
  * It will use fileSystem api like list and exist directly to check if there is any marker file
  * conflict, with transaction locks using {@link DirectMarkerTransactionManager}.
  */
+@Slf4j
 public class SimpleTransactionDirectMarkerBasedDetectionStrategy
     extends SimpleDirectMarkerBasedDetectionStrategy {
 
-  private static final Logger LOG = LoggerFactory.getLogger(
-      SimpleTransactionDirectMarkerBasedDetectionStrategy.class);
-
   public SimpleTransactionDirectMarkerBasedDetectionStrategy(
-      HoodieWrapperFileSystem fs, String partitionPath, String fileId, String instantTime,
+      HoodieStorage storage, String partitionPath, String fileId, String instantTime,
       HoodieActiveTimeline activeTimeline, HoodieWriteConfig config) {
-    super(fs, partitionPath, fileId, instantTime, activeTimeline, config);
+    super(storage, partitionPath, fileId, instantTime, activeTimeline, config);
   }
 
   @Override
   public void detectAndResolveConflictIfNecessary() throws HoodieEarlyConflictDetectionException {
     DirectMarkerTransactionManager txnManager =
-        new DirectMarkerTransactionManager((HoodieWriteConfig) config, fs, partitionPath, fileId);
+        new DirectMarkerTransactionManager((HoodieWriteConfig) config, storage, partitionPath, fileId);
+    InstantGenerator instantGenerator = TimelineLayout.fromVersion(activeTimeline.getTimelineLayoutVersion()).getInstantGenerator();
     try {
       // Need to do transaction before create marker file when using early conflict detection
-      txnManager.beginTransaction(instantTime);
+      txnManager.beginTransaction(instantTime, instantGenerator);
       super.detectAndResolveConflictIfNecessary();
 
     } catch (Exception e) {
-      LOG.warn("Exception occurs during create marker file in early conflict detection mode within transaction.");
+      log.error("Exception occurs during create marker file in early conflict detection mode within transaction.", e);
       throw e;
     } finally {
       // End transaction after created marker file.
-      txnManager.endTransaction(instantTime);
+      txnManager.endTransaction(instantTime, instantGenerator);
       txnManager.close();
     }
   }

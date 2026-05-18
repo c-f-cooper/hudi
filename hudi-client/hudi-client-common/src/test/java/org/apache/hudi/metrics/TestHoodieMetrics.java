@@ -19,9 +19,17 @@
 package org.apache.hudi.metrics;
 
 import org.apache.hudi.common.model.HoodieCommitMetadata;
+import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
+import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.table.timeline.versioning.v2.ActiveTimelineV2;
+import org.apache.hudi.common.testutils.HoodieTestUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.config.metrics.HoodieMetricsConfig;
+import org.apache.hudi.exception.HoodieWriteConflictException;
+import org.apache.hudi.index.HoodieIndex;
 
 import com.codahale.metrics.Timer;
 import org.junit.jupiter.api.AfterEach;
@@ -31,10 +39,15 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.Arrays;
 import java.util.Random;
 import java.util.UUID;
 import java.util.stream.Stream;
 
+import static org.apache.hudi.common.testutils.HoodieTestUtils.INSTANT_GENERATOR;
+import static org.apache.hudi.metrics.HoodieMetrics.COUNTER_METRIC_EXTENSION;
+import static org.apache.hudi.metrics.HoodieMetrics.FAILURE_COUNTER;
+import static org.apache.hudi.metrics.HoodieMetrics.SOURCE_READ_AND_INDEX_ACTION;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -44,17 +57,19 @@ import static org.mockito.Mockito.when;
 public class TestHoodieMetrics {
 
   @Mock
-  HoodieWriteConfig config;
+  HoodieWriteConfig writeConfig;
+  @Mock
+  HoodieMetricsConfig metricsConfig;
   HoodieMetrics hoodieMetrics;
   Metrics metrics;
 
   @BeforeEach
   void setUp() {
-    when(config.isMetricsOn()).thenReturn(true);
-    when(config.getTableName()).thenReturn("raw_table");
-    when(config.getMetricsReporterType()).thenReturn(MetricsReporterType.INMEMORY);
-    when(config.getBasePath()).thenReturn("s3://test" + UUID.randomUUID());
-    hoodieMetrics = new HoodieMetrics(config);
+    when(writeConfig.getMetricsConfig()).thenReturn(metricsConfig);
+    when(writeConfig.isMetricsOn()).thenReturn(true);
+    when(metricsConfig.getMetricsReporterType()).thenReturn(MetricsReporterType.INMEMORY);
+    when(metricsConfig.getBasePath()).thenReturn("s3://test" + UUID.randomUUID());
+    hoodieMetrics = new HoodieMetrics(writeConfig, HoodieTestUtils.getDefaultStorage());
     metrics = hoodieMetrics.getMetrics();
   }
 
@@ -70,7 +85,7 @@ public class TestHoodieMetrics {
   }
 
   @Test
-  public void testTimerCtx() throws InterruptedException {
+  public void testTimerCtxandGauges() throws InterruptedException {
     Random rand = new Random();
     // Index metrics
     Timer.Context timer = hoodieMetrics.getIndexCtx();
@@ -78,6 +93,50 @@ public class TestHoodieMetrics {
     hoodieMetrics.updateIndexMetrics("some_action", hoodieMetrics.getDurationInMs(timer.stop()));
     String metricName = hoodieMetrics.getMetricsName("index", "some_action.duration");
     long msec = (Long)metrics.getRegistry().getGauges().get(metricName).getValue();
+    assertTrue(msec > 0);
+
+    // Source read and index metrics
+    timer = hoodieMetrics.getSourceReadAndIndexTimerCtx();
+    Thread.sleep(5); // Ensure timer duration is > 0
+    hoodieMetrics.updateSourceReadAndIndexMetrics("some_action", hoodieMetrics.getDurationInMs(timer.stop()));
+    metricName = hoodieMetrics.getMetricsName("source_read_and_index", "some_action.duration");
+    msec = (Long)metrics.getRegistry().getGauges().get(metricName).getValue();
+    assertTrue(msec > 0);
+
+    // test index type
+    metricName = hoodieMetrics.getMetricsName("index", "type");
+    for (HoodieIndex.IndexType indexType: HoodieIndex.IndexType.values()) {
+      hoodieMetrics.emitIndexTypeMetrics(indexType.ordinal());
+      long indexTypeOrdinal = (Long)metrics.getRegistry().getGauges().get(metricName).getValue();
+      assertEquals(indexTypeOrdinal, indexType.ordinal());
+    }
+
+    // test metadata enablement metrics
+    metricName = hoodieMetrics.getMetricsName("metadata", "isEnabled");
+    String colStatsMetricName = hoodieMetrics.getMetricsName("metadata", "isColSatsEnabled");
+    String bloomFilterMetricName = hoodieMetrics.getMetricsName("metadata", "isBloomFilterEnabled");
+    String rliMetricName = hoodieMetrics.getMetricsName("metadata", "isRliEnabled");
+    Boolean[] boolValues = new Boolean[]{true, false};
+    for (Boolean mdt: boolValues) {
+      for (Boolean colStats : boolValues) {
+        for (Boolean bloomFilter : boolValues) {
+          for (Boolean rli : boolValues) {
+            hoodieMetrics.emitMetadataEnablementMetrics(mdt, colStats, bloomFilter, rli);
+            assertEquals(mdt ? 1L : 0L, metrics.getRegistry().getGauges().get(metricName).getValue());
+            assertEquals(colStats ? 1L : 0L, metrics.getRegistry().getGauges().get(colStatsMetricName).getValue());
+            assertEquals(bloomFilter ? 1L : 0L, metrics.getRegistry().getGauges().get(bloomFilterMetricName).getValue());
+            assertEquals(rli ? 1L : 0L, metrics.getRegistry().getGauges().get(rliMetricName).getValue());
+          }
+        }
+      }
+    }
+
+    // PreWrite metrics
+    timer = hoodieMetrics.getSourceReadAndIndexTimerCtx();
+    Thread.sleep(5); // Ensure timer duration is > 0
+    hoodieMetrics.updateSourceReadAndIndexMetrics("some_action", hoodieMetrics.getDurationInMs(timer.stop()));
+    metricName = hoodieMetrics.getMetricsName(SOURCE_READ_AND_INDEX_ACTION, "some_action.duration");
+    msec = (Long)metrics.getRegistry().getGauges().get(metricName).getValue();
     assertTrue(msec > 0);
 
     // Rollback metrics
@@ -143,7 +202,7 @@ public class TestHoodieMetrics {
       when(metadata.getTotalCorruptLogBlocks()).thenReturn(randomValue + 15);
       when(metadata.getTotalRollbackLogBlocks()).thenReturn(randomValue + 16);
       when(metadata.getMinAndMaxEventTime()).thenReturn(Pair.of(Option.empty(), Option.empty()));
-      when(config.isCompactionLogBlockMetricsOn()).thenReturn(true);
+      when(writeConfig.isCompactionLogBlockMetricsOn()).thenReturn(true);
 
       hoodieMetrics.updateCommitMetrics(randomValue + 17, commitTimer.stop(), metadata, action);
 
@@ -185,5 +244,149 @@ public class TestHoodieMetrics {
       metricname = hoodieMetrics.getMetricsName(action, HoodieMetrics.TOTAL_ROLLBACK_LOG_BLOCKS_STR);
       assertEquals(metrics.getRegistry().getGauges().get(metricname).getValue(), metadata.getTotalRollbackLogBlocks());
     });
+
+    // MOCK Timeline Instant Metrics for Clean & Rollback
+    HoodieInstant instant004 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.CLEAN_ACTION, "1004");
+    HoodieInstant instant007 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.CLEAN_ACTION, "1007");
+    HoodieInstant instant009 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.ROLLBACK_ACTION, "1009");
+    HoodieInstant instant0010 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.CLEAN_ACTION, "10010");
+    HoodieInstant instant0013 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.ROLLBACK_ACTION, "10013");
+    HoodieInstant instant0015 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.CLEAN_ACTION, "10015");
+    HoodieInstant instant0016 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.ROLLBACK_ACTION, "10016");
+    HoodieInstant instant0017 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.ROLLBACK_ACTION, "10017");
+
+    HoodieActiveTimeline activeTimeline1 = new MockHoodieActiveTimeline(instant004, instant007, instant009, instant0010, instant0013, instant0015, instant0016, instant0017);
+    hoodieMetrics.updateTableServiceInstantMetrics(activeTimeline1);
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.CLEAN_ACTION, HoodieMetrics.EARLIEST_PENDING_CLEAN_INSTANT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), Long.valueOf("1004"));
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.ROLLBACK_ACTION, HoodieMetrics.EARLIEST_PENDING_ROLLBACK_INSTANT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), Long.valueOf("1009"));
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.CLEAN_ACTION, HoodieMetrics.LATEST_COMPLETED_CLEAN_INSTANT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), Long.valueOf("1007"));
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.ROLLBACK_ACTION, HoodieMetrics.LATEST_COMPLETED_ROLLBACK_INSTANT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), Long.valueOf("10017"));
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.CLEAN_ACTION, HoodieMetrics.PENDING_CLEAN_INSTANT_COUNT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), 3L);
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.ROLLBACK_ACTION, HoodieMetrics.PENDING_ROLLBACK_INSTANT_COUNT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), 2L);
+
+    // MOCK Timeline Instant Metrics for Clustering
+    HoodieInstant instant001 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.CLUSTERING_ACTION, "1001");
+    HoodieInstant instant005 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.CLUSTERING_ACTION, "1005");
+    HoodieInstant instant0011 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.REPLACE_COMMIT_ACTION, "10011");
+    HoodieInstant instant0018 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.CLUSTERING_ACTION, "10018");
+
+    HoodieActiveTimeline activeTimeline2 = new MockHoodieActiveTimeline(instant001, instant005, instant0011, instant0018);
+    hoodieMetrics.updateTableServiceInstantMetrics(activeTimeline2);
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.CLUSTERING_ACTION, HoodieMetrics.EARLIEST_PENDING_CLUSTERING_INSTANT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), Long.valueOf("10018"));
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.REPLACE_COMMIT_ACTION, HoodieMetrics.LATEST_COMPLETED_CLUSTERING_INSTANT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), Long.valueOf("10011"));
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.CLUSTERING_ACTION, HoodieMetrics.PENDING_CLUSTERING_INSTANT_COUNT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), 1L);
+
+    // MOCK Timeline Instant Metrics for Compaction
+    HoodieInstant instant002 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.INFLIGHT, HoodieTimeline.COMPACTION_ACTION, "1002");
+    HoodieInstant instant003 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.COMPACTION_ACTION, "1003");
+    HoodieInstant instant006 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.COMMIT_ACTION, "1006");
+    HoodieInstant instant008 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.INFLIGHT, HoodieTimeline.COMPACTION_ACTION, "1008");
+    HoodieInstant instant0012 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.COMPACTION_ACTION, "10012");
+    HoodieInstant instant0014 = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.INFLIGHT, HoodieTimeline.COMPACTION_ACTION, "10014");
+    HoodieInstant longInstant = INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.INFLIGHT, HoodieTimeline.COMPACTION_ACTION, "20250329154030600010001");
+
+    HoodieActiveTimeline activeTimeline3 = new MockHoodieActiveTimeline(instant002, instant003, instant006, instant008, instant0012, instant0014, longInstant);
+    // verify longer instant times can also be updated in the metrics. These are required for table version six
+    // where suffix is added at the end of older instants for compaction in the metadata timeline
+    hoodieMetrics.updateTableServiceInstantMetrics(activeTimeline3);
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.COMPACTION_ACTION, HoodieMetrics.EARLIEST_PENDING_COMPACTION_INSTANT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), Long.valueOf("1002"));
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.COMMIT_ACTION, HoodieMetrics.LATEST_COMPLETED_COMPACTION_INSTANT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), Long.valueOf("1006"));
+
+    metricName = hoodieMetrics.getMetricsName(HoodieTimeline.COMPACTION_ACTION, HoodieMetrics.PENDING_COMPACTION_INSTANT_COUNT_STR);
+    assertEquals((long)metrics.getRegistry().getGauges().get(metricName).getValue(), 6L);
+  }
+
+  private static class MockHoodieActiveTimeline extends ActiveTimelineV2 {
+    public MockHoodieActiveTimeline(HoodieInstant... instants) {
+      super();
+      this.setInstants(Arrays.asList(instants));
+    }
+  }
+
+  @Test
+  public void testRollbackFailureMetric() {
+    // Test that rollback failure metric is emitted correctly
+    String exceptionType = "FileNotFoundException";
+    hoodieMetrics.emitRollbackFailure(exceptionType);
+
+    // Verify the failure counter is incremented
+    String metricName = hoodieMetrics.getMetricsName("rollback", FAILURE_COUNTER);
+    assertEquals(1, metrics.getRegistry().getCounters().get(metricName).getCount());
+
+    // Verify a specific counter is incremented for this exception type
+    String exceptionMetricName = hoodieMetrics.getMetricsName("rollback", exceptionType + COUNTER_METRIC_EXTENSION);
+    assertEquals(1, metrics.getRegistry().getCounters().get(exceptionMetricName).getCount());
+
+    // Emit another failure and verify counter increments
+    hoodieMetrics.emitRollbackFailure(exceptionType);
+    assertEquals(2, metrics.getRegistry().getCounters().get(metricName).getCount());
+    assertEquals(2, metrics.getRegistry().getCounters().get(exceptionMetricName).getCount());
+
+    // Test with a different exception type
+    String differentExceptionType = "IOException";
+    hoodieMetrics.emitRollbackFailure(differentExceptionType);
+
+    // Verify the overall failure counter is incremented
+    assertEquals(3, metrics.getRegistry().getCounters().get(metricName).getCount());
+
+    // Verify a separate counter is incremented for this new exception type
+    String differentExceptionMetricName = hoodieMetrics.getMetricsName("rollback", differentExceptionType + COUNTER_METRIC_EXTENSION);
+    assertEquals(1, metrics.getRegistry().getCounters().get(differentExceptionMetricName).getCount());
+
+    // Verify the original exception type counter is unchanged
+    assertEquals(2, metrics.getRegistry().getCounters().get(exceptionMetricName).getCount());
+  }
+
+  @Test
+  public void testConflictResolutionByCategoryMetrics() {
+    when(writeConfig.isLockingMetricsEnabled()).thenReturn(true);
+
+    String tableServiceVsIngestion = hoodieMetrics.getMetricsName(
+        HoodieMetrics.CONFLICT_RESOLUTION_STR, "table_service_vs_ingestion" + COUNTER_METRIC_EXTENSION);
+    String ingestionVsIngestion = hoodieMetrics.getMetricsName(
+        HoodieMetrics.CONFLICT_RESOLUTION_STR, "ingestion_vs_ingestion" + COUNTER_METRIC_EXTENSION);
+    String ingestionVsTableService = hoodieMetrics.getMetricsName(
+        HoodieMetrics.CONFLICT_RESOLUTION_STR, "ingestion_vs_table_service" + COUNTER_METRIC_EXTENSION);
+    String tableServiceVsTableService = hoodieMetrics.getMetricsName(
+        HoodieMetrics.CONFLICT_RESOLUTION_STR, "table_service_vs_table_service" + COUNTER_METRIC_EXTENSION);
+
+    hoodieMetrics.emitConflictResolutionByCategory(
+        HoodieWriteConflictException.ConflictCategory.TABLE_SERVICE_VS_INGESTION);
+    assertEquals(1, metrics.getRegistry().getCounters().get(tableServiceVsIngestion).getCount());
+
+    hoodieMetrics.emitConflictResolutionByCategory(
+        HoodieWriteConflictException.ConflictCategory.TABLE_SERVICE_VS_INGESTION);
+    assertEquals(2, metrics.getRegistry().getCounters().get(tableServiceVsIngestion).getCount());
+
+    hoodieMetrics.emitConflictResolutionByCategory(
+        HoodieWriteConflictException.ConflictCategory.INGESTION_VS_INGESTION);
+    assertEquals(1, metrics.getRegistry().getCounters().get(ingestionVsIngestion).getCount());
+
+    hoodieMetrics.emitConflictResolutionByCategory(
+        HoodieWriteConflictException.ConflictCategory.INGESTION_VS_TABLE_SERVICE);
+    assertEquals(1, metrics.getRegistry().getCounters().get(ingestionVsTableService).getCount());
+
+    hoodieMetrics.emitConflictResolutionByCategory(
+        HoodieWriteConflictException.ConflictCategory.TABLE_SERVICE_VS_TABLE_SERVICE);
+    assertEquals(1, metrics.getRegistry().getCounters().get(tableServiceVsTableService).getCount());
   }
 }

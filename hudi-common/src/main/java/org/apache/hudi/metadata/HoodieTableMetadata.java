@@ -20,10 +20,10 @@ package org.apache.hudi.metadata;
 
 import org.apache.hudi.avro.model.HoodieMetadataColumnStats;
 import org.apache.hudi.common.bloom.BloomFilter;
-import org.apache.hudi.common.config.HoodieMetadataConfig;
-import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.data.HoodieData;
-import org.apache.hudi.common.engine.HoodieEngineContext;
+import org.apache.hudi.common.data.HoodiePairData;
+import org.apache.hudi.common.function.SerializableFunctionUnchecked;
+import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieRecordGlobalLocation;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
@@ -32,10 +32,12 @@ import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.exception.HoodieMetadataException;
 import org.apache.hudi.expression.Expression;
 import org.apache.hudi.internal.schema.Types;
-import org.apache.hudi.storage.HoodieLocation;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathFilter;
+import org.apache.hudi.storage.StoragePathInfo;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.Path;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.Serializable;
@@ -50,6 +52,8 @@ import static org.apache.hudi.common.util.ValidationUtils.checkState;
  * Interface that supports querying various pieces of metadata about a hudi table.
  */
 public interface HoodieTableMetadata extends Serializable, AutoCloseable {
+
+  Logger LOG = LoggerFactory.getLogger(HoodieTableMetadata.class);
 
   // Table name suffix
   String METADATA_TABLE_NAME_SUFFIX = "_metadata";
@@ -69,14 +73,14 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
    * Return the base-path of the Metadata Table for the given Dataset identified by base-path
    */
   static String getMetadataTableBasePath(String dataTableBasePath) {
-    return dataTableBasePath + HoodieLocation.SEPARATOR + HoodieTableMetaClient.METADATA_TABLE_FOLDER_PATH;
+    return dataTableBasePath + StoragePath.SEPARATOR + HoodieTableMetaClient.METADATA_TABLE_FOLDER_PATH;
   }
 
   /**
    * Return the base-path of the Metadata Table for the given Dataset identified by base-path
    */
-  static Path getMetadataTableBasePath(Path dataTableBasePath) {
-    return new Path(dataTableBasePath, HoodieTableMetaClient.METADATA_TABLE_FOLDER_PATH);
+  static StoragePath getMetadataTableBasePath(StoragePath dataTableBasePath) {
+    return new StoragePath(dataTableBasePath, HoodieTableMetaClient.METADATA_TABLE_FOLDER_PATH);
   }
 
   /**
@@ -94,7 +98,7 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
    * @param metadataTableBasePath The base path of the metadata table
    */
   static String getDatasetBasePath(String metadataTableBasePath) {
-    int endPos = metadataTableBasePath.lastIndexOf(HoodieLocation.SEPARATOR + HoodieTableMetaClient.METADATA_TABLE_FOLDER_PATH);
+    int endPos = metadataTableBasePath.lastIndexOf(StoragePath.SEPARATOR + HoodieTableMetaClient.METADATA_TABLE_FOLDER_PATH);
     checkState(endPos != -1, metadataTableBasePath + " should be base path of the metadata table");
     return metadataTableBasePath.substring(0, endPos);
   }
@@ -108,45 +112,20 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
     if (basePath == null || basePath.isEmpty()) {
       return false;
     }
-    if (basePath.endsWith(HoodieLocation.SEPARATOR)) {
+    if (basePath.endsWith(StoragePath.SEPARATOR)) {
       basePath = basePath.substring(0, basePath.length() - 1);
     }
     return basePath.endsWith(HoodieTableMetaClient.METADATA_TABLE_FOLDER_PATH);
   }
 
-  static HoodieTableMetadata create(HoodieEngineContext engineContext, HoodieMetadataConfig metadataConfig, String datasetBasePath) {
-    return create(engineContext, metadataConfig, datasetBasePath, false);
-  }
-
-  static HoodieTableMetadata create(HoodieEngineContext engineContext, HoodieMetadataConfig metadataConfig, String datasetBasePath, boolean reuse) {
-    if (metadataConfig.enabled()) {
-      HoodieBackedTableMetadata metadata = createHoodieBackedTableMetadata(engineContext, metadataConfig, datasetBasePath, reuse);
-      // If the MDT is not initialized then we fallback to FSBackedTableMetadata
-      if (metadata.isMetadataTableInitialized()) {
-        return metadata;
-      }
-    }
-
-    return createFSBackedTableMetadata(engineContext, datasetBasePath);
-  }
-
-  static FileSystemBackedTableMetadata createFSBackedTableMetadata(HoodieEngineContext engineContext,
-                                                                   String datasetBasePath) {
-    return new FileSystemBackedTableMetadata(
-        engineContext, new SerializableConfiguration(engineContext.getHadoopConf()), datasetBasePath);
-  }
-
-  static HoodieBackedTableMetadata createHoodieBackedTableMetadata(HoodieEngineContext engineContext,
-                                                                   HoodieMetadataConfig metadataConfig,
-                                                                   String datasetBasePath,
-                                                                   boolean reuse) {
-    return new HoodieBackedTableMetadata(engineContext, metadataConfig, datasetBasePath, reuse);
+  static boolean isMetadataTable(StoragePath basePath) {
+    return isMetadataTable(basePath.toString());
   }
 
   /**
    * Fetch all the files at the given partition path, per the latest snapshot of the metadata.
    */
-  FileStatus[] getAllFilesInPartition(Path partitionPath) throws IOException;
+  List<StoragePathInfo> getAllFilesInPartition(StoragePath partitionPath) throws IOException;
 
   /**
    * Retrieve the paths of partitions under the provided sub-directories,
@@ -155,6 +134,13 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
   List<String> getPartitionPathWithPathPrefixUsingFilterExpression(List<String> relativePathPrefixes,
                                                                    Types.RecordType partitionFields,
                                                                    Expression expression) throws IOException;
+
+  default List<String> getPartitionPathWithPathPrefixUsingFilterExpression(List<String> relativePathPrefixes,
+                                                                           Types.RecordType partitionFields,
+                                                                           Expression expression,
+                                                                           List<Object> partitionPredicateExpressions) throws IOException {
+    return getPartitionPathWithPathPrefixUsingFilterExpression(relativePathPrefixes, partitionFields, expression);
+  }
 
   /**
    * Fetches all partition paths that are the sub-directories of the list of provided (relative) paths.
@@ -176,7 +162,13 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
    *
    * NOTE: Absolute partition paths are expected here
    */
-  Map<String, FileStatus[]> getAllFilesInPartitions(Collection<String> partitionPaths) throws IOException;
+  default Map<String, List<StoragePathInfo>> getAllFilesInPartitions(Collection<String> partitionPaths)
+      throws IOException {
+    return getAllFilesInPartitions(partitionPaths, Option.empty());
+  }
+
+  Map<String, List<StoragePathInfo>> getAllFilesInPartitions(Collection<String> partitionPaths,
+                                                             Option<StoragePathFilter> pathFilterOption) throws IOException;
 
   /**
    * Get the bloom filter for the FileID from the metadata table.
@@ -186,7 +178,21 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
    * @return BloomFilter if available, otherwise empty
    * @throws HoodieMetadataException
    */
-  Option<BloomFilter> getBloomFilter(final String partitionName, final String fileName)
+  default Option<BloomFilter> getBloomFilter(final String partitionName, final String fileName)
+      throws HoodieMetadataException {
+    return getBloomFilter(partitionName, fileName, MetadataPartitionType.BLOOM_FILTERS.getPartitionPath());
+  }
+
+  /**
+   * Get the bloom filter for the FileID from the metadata table.
+   *
+   * @param partitionName         - Partition name
+   * @param fileName              - File name for which bloom filter needs to be retrieved
+   * @param metadataPartitionName - Metadata partition name
+   * @return BloomFilter if available, otherwise empty
+   * @throws HoodieMetadataException
+   */
+  Option<BloomFilter> getBloomFilter(final String partitionName, final String fileName, final String metadataPartitionName)
       throws HoodieMetadataException;
 
   /**
@@ -196,7 +202,20 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
    * @return Map of partition file name pair to its bloom filter
    * @throws HoodieMetadataException
    */
-  Map<Pair<String, String>, BloomFilter> getBloomFilters(final List<Pair<String, String>> partitionNameFileNameList)
+  default Map<Pair<String, String>, BloomFilter> getBloomFilters(final List<Pair<String, String>> partitionNameFileNameList)
+      throws HoodieMetadataException {
+    return getBloomFilters(partitionNameFileNameList, MetadataPartitionType.BLOOM_FILTERS.getPartitionPath());
+  }
+
+  /**
+   * Get bloom filters for files from the metadata table index.
+   *
+   * @param partitionNameFileNameList - List of partition and file name pair for which bloom filters need to be retrieved
+   * @param metadataPartitionName     - Metadata partition name
+   * @return Map of partition file name pair to its bloom filter
+   * @throws HoodieMetadataException
+   */
+  Map<Pair<String, String>, BloomFilter> getBloomFilters(final List<Pair<String, String>> partitionNameFileNameList, final String metadataPartitionName)
       throws HoodieMetadataException;
 
   /**
@@ -211,22 +230,81 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
       throws HoodieMetadataException;
 
   /**
+   * Get column stats for files from the metadata table index.
+   *
+   * @param partitionNameFileNameList - List of partition and file name pair for which bloom filters need to be retrieved.
+   * @param columnNames               - List of column name for which stats are needed.
+   * @return Map of partition and file name pair to a list of column stats.
+   * @throws HoodieMetadataException
+   */
+  Map<Pair<String, String>, List<HoodieMetadataColumnStats>> getColumnStats(List<Pair<String, String>> partitionNameFileNameList, List<String> columnNames)
+      throws HoodieMetadataException;
+
+  /**
+   * Returns pairs of (record key, location of record key) which are found in the record index.
+   * Records that are not found are ignored and wont be part of map object that is returned.
+   */
+  HoodiePairData<String, HoodieRecordGlobalLocation> readRecordIndexLocationsWithKeys(HoodieData<String> recordKeys);
+
+  /**
+   * Returns pairs of (record key, location of record key) which are found in the record index.
+   * Records that are not found are ignored and wont be part of map object that is returned.
+   * @param recordKeys list of recordkeys to look up in the index
+   * @param dataTablePartition option of the data table partition to look up from. This is only applicable to partitioned rli
+   *                           record keys are not globally unique so the record key alone does not sufficiently identify an
+   *                           individual record.
+   * @return map from recordkey to the location of the record that was read from the index
+   *
+   */
+  HoodiePairData<String, HoodieRecordGlobalLocation> readRecordIndexLocationsWithKeys(HoodieData<String> recordKeys, Option<String> dataTablePartition);
+
+  /**
    * Returns the location of record keys which are found in the record index.
    * Records that are not found are ignored and wont be part of map object that is returned.
    */
-  Map<String, HoodieRecordGlobalLocation> readRecordIndex(List<String> recordKeys);
+  default HoodieData<HoodieRecordGlobalLocation> readRecordIndexLocations(HoodieData<String> recordKeys) {
+    return readRecordIndexLocationsWithKeys(recordKeys).values();
+  }
 
   /**
-   * Fetch records by key prefixes. Key prefix passed is expected to match the same prefix as stored in Metadata table partitions. For eg, in case of col stats partition,
-   * actual keys in metadata partition is encoded values of column name, partition name and file name. So, key prefixes passed to this method is expected to be encoded already.
+   * Returns the location of record keys for file slices filtered by the given file slice filter.
+   * <p>
+   * If the Metadata Table is not enabled, an exception is thrown to distinguish this from the absence of the key.
    *
-   * @param keyPrefixes   list of key prefixes for which interested records are looked up for.
-   * @param partitionName partition name in metadata table where the records are looked up for.
-   * @return {@link HoodieData} of {@link HoodieRecord}s with records matching the passed in key prefixes.
+   * @param fileSlicesFilter The file slices filter function
+   * @return Pairs of (record key, location of record) from the filtered record index file slices.
    */
-  HoodieData<HoodieRecord<HoodieMetadataPayload>> getRecordsByKeyPrefixes(List<String> keyPrefixes,
-                                                                          String partitionName,
-                                                                          boolean shouldLoadInMemory);
+  default HoodiePairData<String, HoodieRecordGlobalLocation> readRecordIndexLocations(SerializableFunctionUnchecked<List<FileSlice>, List<FileSlice>> fileSlicesFilter) {
+    throw new UnsupportedOperationException("readRecordIndexLocations(fileSlicesFilter) is not supported by this implementation");
+  }
+
+  /**
+   * Returns pairs of (secondary key, location of secondary key) which the provided secondary keys maps to.
+   * Records that are not found are ignored and won't be part of map object that is returned.
+   */
+  HoodiePairData<String, HoodieRecordGlobalLocation> readSecondaryIndexLocationsWithKeys(HoodieData<String> secondaryKeys, String partitionName);
+
+  /**
+   * Returns the location of secondary keys which are found in the secondary index.
+   * Records that are not found are ignored and won't be part of map object that is returned.
+   */
+  default HoodieData<HoodieRecordGlobalLocation> readSecondaryIndexLocations(HoodieData<String> secondaryKeys, String partitionName) {
+    return readSecondaryIndexLocationsWithKeys(secondaryKeys, partitionName).values();
+  }
+
+  /**
+   * Fetch records by key prefixes. The raw keys are encoded using their encode() method to generate
+   * the actual key prefixes used for lookup in the metadata table partitions.
+   *
+   * @param rawKeys           list of raw key objects to be encoded into key prefixes
+   * @param partitionName     partition name in metadata table where the records are looked up for
+   * @param shouldLoadInMemory whether to load records in memory
+   * @return {@link HoodieData} of {@link HoodieRecord}s with records matching the encoded key prefixes
+   */
+  HoodieData<HoodieRecord<HoodieMetadataPayload>> getRecordsByKeyPrefixes(
+      HoodieData<? extends RawKey> rawKeys,
+      String partitionName,
+      boolean shouldLoadInMemory);
 
   /**
    * Get the instant time to which the metadata is synced w.r.t data timeline.
@@ -247,4 +325,18 @@ public interface HoodieTableMetadata extends Serializable, AutoCloseable {
    * Returns the number of shards in a metadata table partition.
    */
   int getNumFileGroupsForPartition(MetadataPartitionType partition);
+
+  /**
+   * Get file groups in the record index partition grouped by bucket
+   * @param partition the metadata table partition type
+   * @return map from data table partition to list of filegroups that index that partition
+   */
+  Map<String, List<FileSlice>> getBucketizedFileGroupsForPartitionedRLI(MetadataPartitionType partition);
+
+  /**
+   * @param partitionPathList A list of pairs of the relative and absolute paths of the partitions.
+   * @return all the files from the partitions.
+   * @throws IOException upon error.
+   */
+  Map<Pair<String, StoragePath>, List<StoragePathInfo>> listPartitions(List<Pair<String, StoragePath>> partitionPathList) throws IOException;
 }

@@ -25,9 +25,10 @@ import org.apache.hudi.cli.functional.CLIFunctionalTestHarness;
 import org.apache.hudi.cli.testutils.HoodieTestCommitMetadataGenerator;
 import org.apache.hudi.cli.testutils.ShellEvaluationResultUtil;
 import org.apache.hudi.client.SparkRDDWriteClient;
+import org.apache.hudi.client.WriteClientTestUtils;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.fs.FSUtils;
-import org.apache.hudi.common.model.HoodieAvroRecord;
+import org.apache.hudi.common.model.HoodieAvroIndexedRecord;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
@@ -35,15 +36,15 @@ import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.versioning.TimelineLayoutVersion;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
-import org.apache.hudi.common.testutils.RawTripTestPayload;
 import org.apache.hudi.common.util.PartitionPathEncodeUtils;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.keygen.SimpleKeyGenerator;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.storage.HoodieStorageUtils;
 import org.apache.hudi.testutils.Assertions;
 
 import org.apache.avro.generic.GenericRecord;
-import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.logging.log4j.Level;
@@ -74,10 +75,10 @@ import java.util.Properties;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
-import static org.apache.hudi.common.table.HoodieTableConfig.ARCHIVELOG_FOLDER;
 import static org.apache.hudi.common.table.HoodieTableConfig.DROP_PARTITION_COLUMNS;
 import static org.apache.hudi.common.table.HoodieTableConfig.NAME;
 import static org.apache.hudi.common.table.HoodieTableConfig.TABLE_CHECKSUM;
+import static org.apache.hudi.common.table.HoodieTableConfig.TIMELINE_HISTORY_PATH;
 import static org.apache.hudi.common.table.HoodieTableConfig.TIMELINE_LAYOUT_VERSION;
 import static org.apache.hudi.common.table.HoodieTableConfig.TYPE;
 import static org.apache.hudi.common.table.HoodieTableConfig.VERSION;
@@ -106,12 +107,12 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
   public void init() throws IOException {
     String tableName = tableName();
     tablePath = tablePath(tableName);
-    fs = HadoopFSUtils.getFs(tablePath, hadoopConf());
+    fs = HadoopFSUtils.getFs(tablePath, storageConf());
 
     // Create table and connect
     new TableCommand().createTable(
         tablePath, tableName, HoodieTableType.COPY_ON_WRITE.name(),
-        HoodieTableConfig.ARCHIVELOG_FOLDER.defaultValue(), TimelineLayoutVersion.VERSION_1, "org.apache.hudi.common.model.HoodieAvroPayload");
+        HoodieTableConfig.TIMELINE_HISTORY_PATH.defaultValue(), TimelineLayoutVersion.VERSION_1, "org.apache.hudi.common.model.HoodieAvroPayload");
   }
 
   @AfterEach
@@ -125,7 +126,7 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
   @Test
   public void testAddPartitionMetaWithDryRun() throws IOException {
     // create commit instant
-    Files.createFile(Paths.get(tablePath, ".hoodie", "100.commit"));
+    Files.createFile(Paths.get(tablePath, ".hoodie/timeline/", "100.commit"));
 
     // create partition path
     String partition1 = Paths.get(tablePath, HoodieTestDataGenerator.DEFAULT_FIRST_PARTITION_PATH).toString();
@@ -140,7 +141,10 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
     assertTrue(ShellEvaluationResultUtil.isSuccess(result));
 
     // expected all 'No'.
-    String[][] rows = FSUtils.getAllPartitionFoldersThreeLevelsDown(fs, tablePath)
+    String[][] rows = FSUtils.getAllPartitionFoldersThreeLevelsDown(
+        HoodieStorageUtils.getStorage(
+            HadoopFSUtils.convertToStoragePath(new Path(tablePath)),
+            HadoopFSUtils.getStorageConf(fs.getConf())), tablePath)
         .stream()
         .map(partition -> new String[] {partition, "No", "None"})
         .toArray(String[][]::new);
@@ -170,7 +174,10 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
     Object result = shell.evaluate(() -> "repair addpartitionmeta --dryrun false");
     assertTrue(ShellEvaluationResultUtil.isSuccess(result));
 
-    List<String> paths = FSUtils.getAllPartitionFoldersThreeLevelsDown(fs, tablePath);
+    List<String> paths = FSUtils.getAllPartitionFoldersThreeLevelsDown(
+        HoodieStorageUtils.getStorage(
+            HadoopFSUtils.convertToStoragePath(new Path(tablePath)),
+            HadoopFSUtils.getStorageConf(fs.getConf())), tablePath);
     // after dry run, the action will be 'Repaired'
     String[][] rows = paths.stream()
         .map(partition -> new String[] {partition, "No", "Repaired"})
@@ -224,7 +231,7 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
 
     // check result
     List<String> allPropsStr = Arrays.asList(NAME.key(), TYPE.key(), VERSION.key(),
-        ARCHIVELOG_FOLDER.key(), TIMELINE_LAYOUT_VERSION.key(), TABLE_CHECKSUM.key(), DROP_PARTITION_COLUMNS.key());
+        TIMELINE_HISTORY_PATH.key(), TIMELINE_LAYOUT_VERSION.key(), TABLE_CHECKSUM.key(), DROP_PARTITION_COLUMNS.key());
     String[][] rows = allPropsStr.stream().sorted().map(key -> new String[] {key,
             oldProps.getOrDefault(key, "null"), result.getOrDefault(key, "null")})
         .toArray(String[][]::new);
@@ -240,9 +247,9 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
    */
   @Test
   public void testRemoveCorruptedPendingCleanAction() throws IOException {
-    HoodieCLI.conf = hadoopConf();
+    HoodieCLI.conf = storageConf();
 
-    Configuration conf = HoodieCLI.conf;
+    StorageConfiguration<?> conf = HoodieCLI.conf;
 
     HoodieTableMetaClient metaClient = HoodieCLI.getTableMetaClient();
 
@@ -272,9 +279,9 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
    */
   @Test
   public void testShowFailedCommits() {
-    HoodieCLI.conf = hadoopConf();
+    HoodieCLI.conf = storageConf();
 
-    Configuration conf = HoodieCLI.conf;
+    StorageConfiguration<?> conf = HoodieCLI.conf;
 
     HoodieTableMetaClient metaClient = HoodieCLI.getTableMetaClient();
 
@@ -284,7 +291,7 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
       HoodieTestCommitMetadataGenerator.createCommitFile(tablePath, timestamp, conf);
     }
 
-    metaClient.getActiveTimeline().getInstantsAsStream().filter(hoodieInstant -> Integer.parseInt(hoodieInstant.getTimestamp()) % 4 == 0).forEach(hoodieInstant -> {
+    metaClient.getActiveTimeline().getInstantsAsStream().filter(hoodieInstant -> Integer.parseInt(hoodieInstant.requestedTime()) % 4 == 0).forEach(hoodieInstant -> {
       metaClient.getActiveTimeline().deleteInstantFileIfExists(hoodieInstant);
       if (hoodieInstant.isCompleted()) {
         metaClient.getActiveTimeline().createCompleteInstant(hoodieInstant);
@@ -317,16 +324,15 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
   @Test
   public void testRepairDeprecatedPartition() throws IOException {
     tablePath = tablePath + "/repair_test/";
-    HoodieTableMetaClient.withPropertyBuilder()
+    HoodieTableMetaClient.newTableBuilder()
         .setTableType(HoodieTableType.COPY_ON_WRITE.name())
         .setTableName(tableName())
-        .setArchiveLogFolder(HoodieTableConfig.ARCHIVELOG_FOLDER.defaultValue())
+        .setArchiveLogFolder(HoodieTableConfig.TIMELINE_HISTORY_PATH.defaultValue())
         .setPayloadClassName("org.apache.hudi.common.model.HoodieAvroPayload")
-        .setTimelineLayoutVersion(TimelineLayoutVersion.VERSION_1)
         .setPartitionFields("partition_path")
         .setRecordKeyFields("_row_key")
         .setKeyGeneratorClassProp(SimpleKeyGenerator.class.getCanonicalName())
-        .initTable(HoodieCLI.conf, tablePath);
+        .initTable(HoodieCLI.conf.newInstance(), tablePath);
 
     HoodieTestDataGenerator dataGen = new HoodieTestDataGenerator();
     HoodieWriteConfig config = HoodieWriteConfig.newBuilder().withPath(tablePath).withSchema(TRIP_EXAMPLE_SCHEMA).build();
@@ -334,7 +340,7 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
     try (SparkRDDWriteClient client = new SparkRDDWriteClient(context(), config)) {
       String newCommitTime = "001";
       int numRecords = 10;
-      client.startCommitWithTime(newCommitTime);
+      WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
 
       List<HoodieRecord> records = dataGen.generateInserts(newCommitTime, numRecords);
       JavaRDD<HoodieRecord> writeRecords = context().getJavaSparkContext().parallelize(records, 1);
@@ -347,17 +353,12 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
       List<HoodieRecord> records2 = new ArrayList<>();
       records1.forEach(entry -> {
         HoodieKey hoodieKey = new HoodieKey(entry.getRecordKey(), PartitionPathEncodeUtils.DEPRECATED_DEFAULT_PARTITION_PATH);
-        RawTripTestPayload testPayload = (RawTripTestPayload) entry.getData();
-        try {
-          GenericRecord genericRecord = (GenericRecord) testPayload.getRecordToInsert(HoodieTestDataGenerator.AVRO_SCHEMA);
-          genericRecord.put("partition_path", null);
-          records2.add(new HoodieAvroRecord(hoodieKey, new RawTripTestPayload(genericRecord.toString(), hoodieKey.getRecordKey(), hoodieKey.getPartitionPath(), TRIP_EXAMPLE_SCHEMA)));
-        } catch (IOException e) {
-          e.printStackTrace();
-        }
+        GenericRecord genericRecord = (GenericRecord) entry.getData();
+        genericRecord.put("partition_path", null);
+        records2.add(new HoodieAvroIndexedRecord(hoodieKey, genericRecord));
       });
 
-      client.startCommitWithTime(newCommitTime);
+      WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
       // ingest records2 which has null for partition path fields, but goes into "default" partition.
       JavaRDD<HoodieRecord> writeRecords2 = context().getJavaSparkContext().parallelize(records2, 1);
       List<WriteStatus> result2 = client.bulkInsert(writeRecords2, newCommitTime).collect();
@@ -385,16 +386,15 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
   @Test
   public void testRenamePartition() throws IOException {
     tablePath = tablePath + "/rename_partition_test/";
-    HoodieTableMetaClient.withPropertyBuilder()
+    HoodieTableMetaClient.newTableBuilder()
         .setTableType(HoodieTableType.COPY_ON_WRITE.name())
         .setTableName(tableName())
-        .setArchiveLogFolder(HoodieTableConfig.ARCHIVELOG_FOLDER.defaultValue())
+        .setArchiveLogFolder(HoodieTableConfig.TIMELINE_HISTORY_PATH.defaultValue())
         .setPayloadClassName("org.apache.hudi.common.model.HoodieAvroPayload")
-        .setTimelineLayoutVersion(TimelineLayoutVersion.VERSION_1)
         .setPartitionFields("partition_path")
         .setRecordKeyFields("_row_key")
         .setKeyGeneratorClassProp(SimpleKeyGenerator.class.getCanonicalName())
-        .initTable(HoodieCLI.conf, tablePath);
+        .initTable(HoodieCLI.conf.newInstance(), tablePath);
 
     HoodieTestDataGenerator dataGen = new HoodieTestDataGenerator();
     HoodieWriteConfig config = HoodieWriteConfig.newBuilder().withPath(tablePath).withSchema(TRIP_EXAMPLE_SCHEMA).build();
@@ -402,7 +402,7 @@ public class TestRepairsCommand extends CLIFunctionalTestHarness {
     try (SparkRDDWriteClient client = new SparkRDDWriteClient(context(), config)) {
       String newCommitTime = "001";
       int numRecords = 20;
-      client.startCommitWithTime(newCommitTime);
+      WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
 
       List<HoodieRecord> records = dataGen.generateInserts(newCommitTime, numRecords);
       JavaRDD<HoodieRecord> writeRecords = context().getJavaSparkContext().parallelize(records, 1);

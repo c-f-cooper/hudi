@@ -18,17 +18,18 @@
 
 package org.apache.hudi.integ.testsuite.reader;
 
-import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.schema.HoodieSchemaUtils;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.testutils.HoodieTestUtils;
 import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.utilities.testutils.UtilitiesTestBase;
 
-import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.spark.api.java.JavaRDD;
 import org.junit.jupiter.api.AfterAll;
@@ -38,6 +39,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.HashSet;
 import java.util.List;
 
@@ -55,14 +57,14 @@ public class TestDFSHoodieDatasetInputReader extends UtilitiesTestBase {
   }
 
   @AfterAll
-  public static void cleanupClass() {
+  public static void cleanupClass() throws IOException {
     UtilitiesTestBase.cleanUpUtilitiesTestServices();
   }
 
   @BeforeEach
   public void setup() throws Exception {
     super.setup();
-    HoodieTestUtils.init(jsc.hadoopConfiguration(), basePath);
+    HoodieTestUtils.init(HadoopFSUtils.getStorageConf(jsc.hadoopConfiguration()), basePath);
   }
 
   @AfterEach
@@ -85,7 +87,7 @@ public class TestDFSHoodieDatasetInputReader extends UtilitiesTestBase {
     writeStatuses.count();
 
     DFSHoodieDatasetInputReader reader = new DFSHoodieDatasetInputReader(jsc, config.getBasePath(),
-        HoodieAvroUtils.addMetadataFields(new Schema.Parser().parse(config.getSchema())).toString());
+        HoodieSchemaUtils.addMetadataFields(HoodieSchema.parse(config.getSchema())).toString());
     // Try to read 100 records for the same partition path and same file ID
     JavaRDD<GenericRecord> records = reader.read(1, 1, 100L);
     assertTrue(records.count() <= 100);

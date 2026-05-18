@@ -20,6 +20,8 @@ package org.apache.hudi.utilities.sources;
 
 import org.apache.hudi.HoodieConversionUtils;
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
+import org.apache.hudi.common.table.checkpoint.StreamerCheckpointV2;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.exception.HoodieException;
@@ -29,6 +31,7 @@ import org.apache.hudi.utilities.config.PulsarSourceConfig;
 import org.apache.hudi.utilities.exception.HoodieReadFromSourceException;
 import org.apache.hudi.utilities.schema.SchemaProvider;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.PulsarClient;
@@ -43,8 +46,6 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.pulsar.JsonUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -66,9 +67,8 @@ import static org.apache.hudi.utilities.config.PulsarSourceConfig.PULSAR_SOURCE_
 /**
  * Source fetching data from Pulsar topics
  */
+@Slf4j
 public class PulsarSource extends RowSource implements Closeable {
-
-  private static final Logger LOG = LoggerFactory.getLogger(PulsarSource.class);
 
   private static final Duration GRACEFUL_SHUTDOWN_TIMEOUT = Duration.ofSeconds(20);
 
@@ -112,8 +112,8 @@ public class PulsarSource extends RowSource implements Closeable {
   }
 
   @Override
-  protected Pair<Option<Dataset<Row>>, String> fetchNextBatch(Option<String> lastCheckpointStr, long sourceLimit) {
-    Pair<MessageId, MessageId> startingEndingOffsetsPair = computeOffsets(lastCheckpointStr, sourceLimit);
+  protected Pair<Option<Dataset<Row>>, Checkpoint> fetchNextBatch(Option<Checkpoint> lastCheckpoint, long sourceLimit) {
+    Pair<MessageId, MessageId> startingEndingOffsetsPair = computeOffsets(lastCheckpoint, sourceLimit);
 
     MessageId startingOffset = startingEndingOffsetsPair.getLeft();
     MessageId endingOffset = startingEndingOffsetsPair.getRight();
@@ -130,7 +130,7 @@ public class PulsarSource extends RowSource implements Closeable {
         .option("endingOffsets", endingOffsetStr)
         .load();
 
-    return Pair.of(Option.of(transform(sourceRows)), endingOffsetStr);
+    return Pair.of(Option.of(transform(sourceRows)), new StreamerCheckpointV2(endingOffsetStr));
   }
 
   @Override
@@ -143,8 +143,8 @@ public class PulsarSource extends RowSource implements Closeable {
     return rows.drop(PULSAR_META_FIELDS);
   }
 
-  private Pair<MessageId, MessageId> computeOffsets(Option<String> lastCheckpointStrOpt, long sourceLimit) {
-    MessageId startingOffset = decodeStartingOffset(lastCheckpointStrOpt);
+  private Pair<MessageId, MessageId> computeOffsets(Option<Checkpoint> lastCheckpointOpt, long sourceLimit) {
+    MessageId startingOffset = decodeStartingOffset(lastCheckpointOpt);
     MessageId endingOffset = fetchLatestOffset();
 
     if (endingOffset.compareTo(startingOffset) < 0) {
@@ -159,9 +159,9 @@ public class PulsarSource extends RowSource implements Closeable {
     return Pair.of(startingOffset, endingOffset);
   }
 
-  private MessageId decodeStartingOffset(Option<String> lastCheckpointStrOpt) {
-    return lastCheckpointStrOpt
-        .map(lastCheckpoint -> JsonUtils.topicOffsets(lastCheckpoint).apply(topicName))
+  private MessageId decodeStartingOffset(Option<Checkpoint> lastCheckpointOpt) {
+    return lastCheckpointOpt
+        .map(lastCheckpoint -> JsonUtils.topicOffsets(lastCheckpoint.getCheckpointKey()).apply(topicName))
         .orElseGet(() -> {
           PulsarSourceConfig.OffsetAutoResetStrategy autoResetStrategy = PulsarSourceConfig.OffsetAutoResetStrategy.valueOf(
               getStringWithAltKeys(props, PULSAR_SOURCE_OFFSET_AUTO_RESET_STRATEGY,
@@ -184,7 +184,7 @@ public class PulsarSource extends RowSource implements Closeable {
     try {
       pulsarConsumer.get().acknowledgeCumulative(latestConsumedOffset);
     } catch (PulsarClientException e) {
-      LOG.error(String.format("Failed to ack messageId (%s) for topic '%s'", latestConsumedOffset, topicName), e);
+      log.error("Failed to ack messageId ({}) for topic '{}'", latestConsumedOffset, topicName, e);
       throw new HoodieReadFromSourceException("Failed to ack message for topic", e);
     }
   }
@@ -193,7 +193,7 @@ public class PulsarSource extends RowSource implements Closeable {
     try {
       return pulsarConsumer.get().getLastMessageId();
     } catch (PulsarClientException e) {
-      LOG.error(String.format("Failed to fetch latest messageId for topic '%s'", topicName), e);
+      log.error("Failed to fetch latest messageId for topic '{}'", topicName, e);
       throw new HoodieReadFromSourceException("Failed to fetch latest messageId for topic", e);
     }
   }
@@ -211,7 +211,7 @@ public class PulsarSource extends RowSource implements Closeable {
           .subscriptionType(SubscriptionType.Exclusive)
           .subscribe();
     } catch (PulsarClientException e) {
-      LOG.error(String.format("Failed to subscribe to Pulsar topic '%s'", topicName), e);
+      log.error("Failed to subscribe to Pulsar topic '{}'", topicName, e);
       throw new HoodieIOException("Failed to subscribe to Pulsar topic", e);
     }
   }
@@ -222,7 +222,7 @@ public class PulsarSource extends RowSource implements Closeable {
           .serviceUrl(serviceEndpointURL)
           .build();
     } catch (PulsarClientException e) {
-      LOG.error(String.format("Failed to init Pulsar client connecting to '%s'", serviceEndpointURL), e);
+      log.error("Failed to init Pulsar client connecting to '{}'", serviceEndpointURL, e);
       throw new HoodieIOException("Failed to init Pulsar client", e);
     }
   }

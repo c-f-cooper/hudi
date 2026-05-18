@@ -18,27 +18,33 @@
 
 package org.apache.hudi
 
-import org.apache.avro.Schema
-import org.apache.avro.generic.GenericRecord
-import org.apache.hudi.DataSourceWriteOptions.{INSERT_DROP_DUPS, PAYLOAD_CLASS_NAME, PRECOMBINE_FIELD}
-import org.apache.hudi.avro.HoodieAvroUtils
+import org.apache.hudi.DataSourceWriteOptions.INSERT_DROP_DUPS
+import org.apache.hudi.avro.{AvroRecordContext, AvroSchemaCache, HoodieAvroUtils}
 import org.apache.hudi.common.config.TypedProperties
 import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.common.model._
+import org.apache.hudi.common.model.WriteOperationType.isChangingRecords
+import org.apache.hudi.common.schema.{HoodieSchema, HoodieSchemaCache}
+import org.apache.hudi.common.table.HoodieTableConfig
+import org.apache.hudi.common.table.read.DeleteContext
+import org.apache.hudi.common.util.{ConfigUtils, HoodieRecordUtils, Option => HOption, OrderingValues}
 import org.apache.hudi.config.HoodieWriteConfig
+import org.apache.hudi.keygen.{BaseKeyGenerator, KeyGenUtils, SparkKeyGeneratorInterface}
 import org.apache.hudi.keygen.constant.KeyGeneratorOptions
 import org.apache.hudi.keygen.factory.HoodieSparkKeyGeneratorFactory
-import org.apache.hudi.keygen.{BaseKeyGenerator, KeyGenUtils, SparkKeyGeneratorInterface}
+import org.apache.hudi.util.JFunction
+
+import org.apache.avro.generic.GenericRecord
 import org.apache.spark.TaskContext
 import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{DataFrame, HoodieInternalRowUtils}
 import org.apache.spark.sql.HoodieInternalRowUtils.getCachedUnsafeRowWriter
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.types.StructType
-import org.apache.spark.sql.{DataFrame, HoodieInternalRowUtils}
 import org.slf4j.LoggerFactory
 
-import scala.collection.JavaConversions.mapAsJavaMap
+import scala.collection.JavaConverters._
 
 /** Utility class for converting dataframe into RDD[HoodieRecord]. */
 object HoodieCreateRecordUtils {
@@ -49,13 +55,14 @@ object HoodieCreateRecordUtils {
                                        parameters: Map[String, String],
                                        recordName: String,
                                        recordNameSpace: String,
-                                       writerSchema: Schema,
-                                       dataFileSchema: Schema,
+                                       writerSchema: HoodieSchema,
+                                       dataFileSchema: HoodieSchema,
                                        operation: WriteOperationType,
                                        instantTime: String,
                                        preppedSparkSqlWrites: Boolean,
                                        preppedSparkSqlMergeInto: Boolean,
-                                       preppedWriteOperation: Boolean)
+                                       preppedWriteOperation: Boolean,
+                                       tableConfig: HoodieTableConfig)
 
   def createHoodieRecordRdd(args: createHoodieRecordRddArgs) = {
     val df = args.df
@@ -70,10 +77,11 @@ object HoodieCreateRecordUtils {
     val preppedSparkSqlWrites = args.preppedSparkSqlWrites
     val preppedSparkSqlMergeInto = args.preppedSparkSqlMergeInto
     val preppedWriteOperation = args.preppedWriteOperation
+    val orderingFields = args.tableConfig.getOrderingFields
 
     val shouldDropPartitionColumns = config.getBoolean(DataSourceWriteOptions.DROP_PARTITION_COLUMNS)
     val recordType = config.getRecordMerger.getRecordType
-    val autoGenerateRecordKeys: Boolean = !parameters.containsKey(KeyGeneratorOptions.RECORDKEY_FIELD_NAME.key())
+    val autoGenerateRecordKeys: Boolean = !parameters.asJava.containsKey(KeyGeneratorOptions.RECORDKEY_FIELD_NAME.key())
 
     var shouldCombine = false
     if (preppedWriteOperation && !preppedSparkSqlWrites && !preppedSparkSqlMergeInto) {// prepped pk less via spark-ds
@@ -107,60 +115,65 @@ object HoodieCreateRecordUtils {
     recordType match {
       case HoodieRecord.HoodieRecordType.AVRO =>
         // avroRecords will contain meta fields when isPrepped is true.
-        val avroRecords: RDD[GenericRecord] = HoodieSparkUtils.createRdd(df, recordName, recordNameSpace,
-          Some(writerSchema))
+        val avroRecords: RDD[GenericRecord] = HoodieSparkUtils.createRdd(df, recordName, recordNameSpace, Some(writerSchema))
 
         avroRecords.mapPartitions(it => {
           val sparkPartitionId = TaskContext.getPartitionId()
-          val keyGenProps = new TypedProperties(config.getProps)
+          val keyGenProps = TypedProperties.copy(config.getProps)
           if (autoGenerateRecordKeys) {
             keyGenProps.setProperty(KeyGenUtils.RECORD_KEY_GEN_PARTITION_ID_CONFIG, String.valueOf(sparkPartitionId))
             keyGenProps.setProperty(KeyGenUtils.RECORD_KEY_GEN_INSTANT_TIME_CONFIG, instantTime)
           }
           val keyGenerator : Option[BaseKeyGenerator] = if (usePreppedInsteadOfKeyGen) None else Some(HoodieSparkKeyGeneratorFactory.createKeyGenerator(keyGenProps).asInstanceOf[BaseKeyGenerator])
-          val dataFileSchema = new Schema.Parser().parse(dataFileSchemaStr)
+          val dataFileSchema = HoodieSchema.parse(dataFileSchemaStr)
           val consistentLogicalTimestampEnabled = parameters.getOrElse(
             DataSourceWriteOptions.KEYGENERATOR_CONSISTENT_LOGICAL_TIMESTAMP_ENABLED.key(),
             DataSourceWriteOptions.KEYGENERATOR_CONSISTENT_LOGICAL_TIMESTAMP_ENABLED.defaultValue()).toBoolean
+          val requiresPayload = isChangingRecords(operation) && !config.isFileGroupReaderBasedMergeHandle
+          val mergeProps = ConfigUtils.getMergeProps(config.getProps, args.tableConfig)
+          val deleteContext = new DeleteContext(mergeProps, writerSchema).withReaderSchema(writerSchema);
 
           // handle dropping partition columns
           it.map { avroRec =>
-            val (hoodieKey: HoodieKey, recordLocation: Option[HoodieRecordLocation]) = HoodieCreateRecordUtils.getHoodieKeyAndMaybeLocationFromAvroRecord(keyGenerator, avroRec,
+            val isDelete: Boolean = AvroRecordContext.getFieldAccessorInstance.isDeleteRecord(avroRec, deleteContext)
+            val (hoodieKey: HoodieKey, recordLocation: HOption[HoodieRecordLocation]) = HoodieCreateRecordUtils.getHoodieKeyAndMaybeLocationFromAvroRecord(keyGenerator, avroRec,
               preppedSparkSqlWrites || preppedWriteOperation, preppedSparkSqlWrites || preppedWriteOperation || preppedSparkSqlMergeInto)
             val avroRecWithoutMeta: GenericRecord = if (preppedSparkSqlWrites || preppedSparkSqlMergeInto || preppedWriteOperation) {
-              HoodieAvroUtils.rewriteRecord(avroRec, HoodieAvroUtils.removeMetadataFields(dataFileSchema))
+              HoodieAvroUtils.rewriteRecord(avroRec, org.apache.hudi.common.schema.HoodieSchemaUtils.removeMetadataFields(dataFileSchema).toAvroSchema)
             } else {
               avroRec
             }
 
             val processedRecord = if (shouldDropPartitionColumns) {
-              HoodieAvroUtils.rewriteRecord(avroRecWithoutMeta, dataFileSchema)
+              HoodieAvroUtils.rewriteRecord(avroRecWithoutMeta, dataFileSchema.getAvroSchema)
             } else {
               avroRecWithoutMeta
             }
-
-            val hoodieRecord = if (shouldCombine) {
-              val orderingVal = HoodieAvroUtils.getNestedFieldVal(avroRec, config.getString(PRECOMBINE_FIELD),
-                false, consistentLogicalTimestampEnabled).asInstanceOf[Comparable[_]]
-              DataSourceUtils.createHoodieRecord(processedRecord, orderingVal, hoodieKey,
-                config.getString(PAYLOAD_CLASS_NAME), recordLocation)
+            val hoodieRecord = if (shouldCombine && !orderingFields.isEmpty) {
+              val orderingVal = OrderingValues.create(
+                orderingFields,
+                JFunction.toJavaFunction[String, Comparable[_]](
+                  field => HoodieAvroUtils.getNestedFieldVal(avroRec, field, false,
+                    consistentLogicalTimestampEnabled).asInstanceOf[Comparable[_]]))
+              HoodieRecordUtils.createHoodieRecord(processedRecord, orderingVal, hoodieKey,
+                config.getPayloadClass, null, recordLocation, requiresPayload, isDelete)
             } else {
-              DataSourceUtils.createHoodieRecord(processedRecord, hoodieKey,
-                config.getString(PAYLOAD_CLASS_NAME), recordLocation)
+              HoodieRecordUtils.createHoodieRecord(processedRecord, hoodieKey,
+                config.getPayloadClass, recordLocation, requiresPayload, isDelete)
             }
             hoodieRecord
           }
         }).toJavaRDD()
 
       case HoodieRecord.HoodieRecordType.SPARK =>
-        val dataFileSchema = new Schema.Parser().parse(dataFileSchemaStr)
+        val dataFileSchema = HoodieSchemaCache.intern(HoodieSchema.parse(dataFileSchemaStr))
         val dataFileStructType = HoodieInternalRowUtils.getCachedSchema(dataFileSchema)
-        val writerStructType = HoodieInternalRowUtils.getCachedSchema(writerSchema)
+        val writerStructType = HoodieInternalRowUtils.getCachedSchema(HoodieSchemaCache.intern(writerSchema))
         val sourceStructType = df.schema
 
         df.queryExecution.toRdd.mapPartitions { it =>
           val sparkPartitionId = TaskContext.getPartitionId()
-          val keyGenProps = new TypedProperties(config.getProps)
+          val keyGenProps = TypedProperties.copy(config.getProps)
           if (autoGenerateRecordKeys) {
             keyGenProps.setProperty(KeyGenUtils.RECORD_KEY_GEN_PARTITION_ID_CONFIG, String.valueOf(sparkPartitionId))
             keyGenProps.setProperty(KeyGenUtils.RECORD_KEY_GEN_INSTANT_TIME_CONFIG, instantTime)
@@ -193,7 +206,7 @@ object HoodieCreateRecordUtils {
 
   def getHoodieKeyAndMaybeLocationFromAvroRecord(keyGenerator: Option[BaseKeyGenerator], avroRec: GenericRecord,
                                                  useMetaFieldsForRecordKeyAndPartition: Boolean, fetchRecordLocationFromMetaFields: Boolean):
-  (HoodieKey, Option[HoodieRecordLocation]) = {
+  (HoodieKey, HOption[HoodieRecordLocation]) = {
     //use keygen for sqlMergeIntoPrepped recordKey and partitionPath because the keygenerator handles
     //fetching from the meta fields if they are populated and otherwise doing keygen
     val recordKey = if (useMetaFieldsForRecordKeyAndPartition) {
@@ -221,11 +234,11 @@ object HoodieCreateRecordUtils {
     else {
       None
     }
-    val recordLocation: Option[HoodieRecordLocation] = if (instantTime.isDefined && fileName.isDefined) {
+    val recordLocation: HOption[HoodieRecordLocation] = if (instantTime.isDefined && fileName.isDefined) {
       val fileId = FSUtils.getFileId(fileName.get)
-      Some(new HoodieRecordLocation(instantTime.get, fileId))
+      HOption.of(new HoodieRecordLocation(instantTime.get, fileId))
     } else {
-      None
+      HOption.empty()
     }
     (hoodieKey, recordLocation)
   }

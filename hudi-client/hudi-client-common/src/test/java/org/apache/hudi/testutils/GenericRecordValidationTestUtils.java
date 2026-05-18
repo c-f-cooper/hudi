@@ -18,10 +18,12 @@
 
 package org.apache.hudi.testutils;
 
-import org.apache.hudi.avro.HoodieAvroUtils;
-import org.apache.hudi.common.config.HoodieReaderConfig;
 import org.apache.hudi.common.model.HoodieFileFormat;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.schema.HoodieSchemaField;
+import org.apache.hudi.common.schema.HoodieSchemaType;
+import org.apache.hudi.common.schema.HoodieSchemaUtils;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.util.CollectionUtils;
 import org.apache.hudi.config.HoodieWriteConfig;
@@ -29,12 +31,14 @@ import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieValidationException;
 import org.apache.hudi.hadoop.utils.HoodieRealtimeRecordReaderUtils;
 import org.apache.hudi.io.storage.HoodieAvroHFileReaderImplBase;
-import org.apache.hudi.io.storage.HoodieFileReaderFactory;
+import org.apache.hudi.io.storage.HoodieIOFactory;
+import org.apache.hudi.storage.HoodieStorage;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.HoodieStorageUtils;
 
-import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.ArrayWritable;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.Text;
@@ -64,8 +68,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class GenericRecordValidationTestUtils {
 
   public static void assertGenericRecords(GenericRecord record1, GenericRecord record2,
-                                          Schema schema, List<String> excludeFields) {
-    for (Schema.Field f: schema.getFields()) {
+                                          HoodieSchema schema, List<String> excludeFields) {
+    for (HoodieSchemaField f: schema.getFields()) {
       String fieldName = f.name();
       if (excludeFields.contains(fieldName)) {
         continue;
@@ -78,6 +82,10 @@ public class GenericRecordValidationTestUtils {
               HoodieRealtimeRecordReaderUtils.arrayWritableToString((ArrayWritable) value2));
         } else if (value1 instanceof Text && value2 instanceof BytesWritable) {
           assertArrayEquals(((Text) value1).getBytes(), ((BytesWritable) value2).getBytes());
+        } else if (f.schema().getType() == HoodieSchemaType.ENUM
+            && value1 instanceof BytesWritable && value2 instanceof Text) {
+          // TODO(HUDI-8660): Revisit ENUM handling in Spark parquet reader and writer
+          assertArrayEquals(((BytesWritable) value1).getBytes(), ((Text) value2).getBytes());
         } else {
           assertEquals(value1, value2, "Field name " + fieldName + " is not same."
               + " Val1: " + value1 + ", Val2:" + value2);
@@ -90,37 +98,36 @@ public class GenericRecordValidationTestUtils {
   }
 
   public static void assertDataInMORTable(HoodieWriteConfig config, String instant1, String instant2,
-                                          Configuration hadoopConf, List<String> partitionPaths) {
+                                          StorageConfiguration<?> storageConf, List<String> partitionPaths) {
     List<String> excludeFields = CollectionUtils.createImmutableList(COMMIT_TIME_METADATA_FIELD, COMMIT_SEQNO_METADATA_FIELD,
         FILENAME_METADATA_FIELD, OPERATION_METADATA_FIELD);
-    assertDataInMORTable(config, instant1, instant2, hadoopConf, partitionPaths, excludeFields);
+    assertDataInMORTable(config, instant1, instant2, storageConf, partitionPaths, excludeFields);
   }
 
   public static void assertDataInMORTable(HoodieWriteConfig config, String instant1, String instant2,
-                                          Configuration hadoopConf, List<String> partitionPaths, List<String> excludeFields) {
-    JobConf jobConf = new JobConf(hadoopConf);
+                                          StorageConfiguration<?> storageConf, List<String> partitionPaths, List<String> excludeFields) {
+    JobConf jobConf = new JobConf(storageConf.unwrapAs(Configuration.class));
     List<String> fullPartitionPaths = partitionPaths.stream()
         .map(partitionPath -> Paths.get(config.getBasePath(), partitionPath).toString())
         .collect(Collectors.toList());
 
     jobConf.set(String.format(HOODIE_CONSUME_COMMIT, config.getTableName()), instant1);
-    jobConf.set(HoodieReaderConfig.ENABLE_OPTIMIZED_LOG_BLOCKS_SCAN.key(), "true");
     List<GenericRecord> records = HoodieMergeOnReadTestUtils.getRecordsUsingInputFormat(
-        hadoopConf, fullPartitionPaths, config.getBasePath(), jobConf, true);
+        storageConf, fullPartitionPaths, config.getBasePath(), jobConf, true);
     Map<String, GenericRecord> prevRecordsMap = records.stream()
         .collect(Collectors.toMap(rec -> rec.get(RECORD_KEY_METADATA_FIELD).toString(), Function.identity()));
 
     jobConf.set(String.format(HOODIE_CONSUME_COMMIT, config.getTableName()), instant2);
     List<GenericRecord> records1 = HoodieMergeOnReadTestUtils.getRecordsUsingInputFormat(
-        hadoopConf, fullPartitionPaths, config.getBasePath(), jobConf, true);
+        storageConf, fullPartitionPaths, config.getBasePath(), jobConf, true);
     Map<String, GenericRecord> newRecordsMap = records1.stream()
         .collect(Collectors.toMap(rec -> rec.get(RECORD_KEY_METADATA_FIELD).toString(), Function.identity()));
 
     // Verify row count.
     assertEquals(prevRecordsMap.size(), newRecordsMap.size());
 
-    Schema readerSchema = HoodieAvroUtils.addMetadataFields(
-        new Schema.Parser().parse(config.getSchema()), config.allowOperationMetadataField());
+    HoodieSchema readerSchema = HoodieSchemaUtils.addMetadataFields(
+        HoodieSchema.parse(config.getSchema()), config.allowOperationMetadataField());
 
     // Verify every field.
     prevRecordsMap.forEach((key, value) -> {
@@ -129,23 +136,29 @@ public class GenericRecordValidationTestUtils {
     });
   }
 
-  public static Map<String, GenericRecord> getRecordsMap(HoodieWriteConfig config, Configuration hadoopConf,
+  public static Map<String, GenericRecord> getRecordsMap(HoodieWriteConfig config, StorageConfiguration<?> storageConf,
                                                          HoodieTestDataGenerator dataGen) {
-    JobConf jobConf = new JobConf(hadoopConf);
+    JobConf jobConf = new JobConf(storageConf.unwrapAs(Configuration.class));
     List<String> fullPartitionPaths = Arrays.stream(dataGen.getPartitionPaths())
         .map(partitionPath -> Paths.get(config.getBasePath(), partitionPath).toString())
         .collect(Collectors.toList());
     return HoodieMergeOnReadTestUtils.getRecordsUsingInputFormat(
-            hadoopConf, fullPartitionPaths, config.getBasePath(), jobConf, true).stream()
+            storageConf,
+            fullPartitionPaths,
+            config.getBasePath(),
+            jobConf,
+            true)
+        .stream()
         .collect(Collectors.toMap(rec -> rec.get(RECORD_KEY_METADATA_FIELD).toString(), Function.identity()));
   }
 
-  public static Stream<GenericRecord> readHFile(Configuration conf, String[] paths) {
+  public static Stream<GenericRecord> readHFile(StorageConfiguration<?> storageConf, String[] paths) {
     List<GenericRecord> valuesAsList = new LinkedList<>();
     for (String path : paths) {
+      HoodieStorage storage = HoodieStorageUtils.getStorage(path, storageConf);
       try (HoodieAvroHFileReaderImplBase reader = (HoodieAvroHFileReaderImplBase)
-          HoodieFileReaderFactory.getReaderFactory(HoodieRecord.HoodieRecordType.AVRO)
-              .getFileReader(DEFAULT_HUDI_CONFIG_FOR_READER, conf, new Path(path), HoodieFileFormat.HFILE)) {
+          HoodieIOFactory.getIOFactory(storage).getReaderFactory(HoodieRecord.HoodieRecordType.AVRO)
+              .getFileReader(DEFAULT_HUDI_CONFIG_FOR_READER, new StoragePath(path), HoodieFileFormat.HFILE)) {
         valuesAsList.addAll(HoodieAvroHFileReaderImplBase.readAllRecords(reader)
             .stream().map(e -> (GenericRecord) e).collect(Collectors.toList()));
       } catch (IOException e) {

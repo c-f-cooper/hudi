@@ -17,32 +17,36 @@
 
 package org.apache.hudi.functional
 
-import org.apache.hadoop.fs.FileSystem
+import org.apache.hudi.{DataSourceWriteOptions, DefaultSparkRecordMerger, ScalaAssertionSupport}
 import org.apache.hudi.HoodieConversionUtils.toJavaOption
 import org.apache.hudi.common.config.HoodieMetadataConfig
 import org.apache.hudi.common.table.HoodieTableConfig
-import org.apache.hudi.common.testutils.RawTripTestPayload.recordsToStrings
-import org.apache.hudi.common.util
+import org.apache.hudi.common.testutils.HoodieTestDataGenerator.recordsToStrings
+import org.apache.hudi.common.util.Option
 import org.apache.hudi.config.HoodieWriteConfig
 import org.apache.hudi.testutils.HoodieSparkClientTestBase
 import org.apache.hudi.util.JFunction
-import org.apache.hudi.{DataSourceWriteOptions, HoodieSparkRecordMerger, ScalaAssertionSupport}
+
+import org.apache.hadoop.fs.FileSystem
 import org.apache.spark.scheduler.{SparkListener, SparkListenerStageCompleted}
-import org.apache.spark.sql._
+import org.apache.spark.sql.{SaveMode, SparkSession, SparkSessionExtensions}
 import org.apache.spark.sql.hudi.HoodieSparkSessionExtension
-import org.apache.spark.sql.types._
-import org.junit.jupiter.api.Assertions.assertEquals
+import org.apache.spark.sql.types.StructType
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
+import org.slf4j.LoggerFactory
 
 import java.util.function.Consumer
-import scala.collection.JavaConversions._
+
+import scala.collection.JavaConverters._
 
 /**
  * Tests around Dag execution for Spark DataSource.
  */
 class TestSparkDataSourceDAGExecution extends HoodieSparkClientTestBase with ScalaAssertionSupport {
+  private val log = LoggerFactory.getLogger(getClass)
   var spark: SparkSession = null
   val commonOpts = Map(
     "hoodie.insert.shuffle.parallelism" -> "4",
@@ -52,16 +56,16 @@ class TestSparkDataSourceDAGExecution extends HoodieSparkClientTestBase with Sca
     HoodieTableConfig.PARTITION_METAFILE_USE_BASE_FORMAT.key() -> "true",
     DataSourceWriteOptions.RECORDKEY_FIELD.key -> "_row_key",
     DataSourceWriteOptions.PARTITIONPATH_FIELD.key -> "partition",
-    DataSourceWriteOptions.PRECOMBINE_FIELD.key -> "timestamp",
+    HoodieTableConfig.ORDERING_FIELDS.key -> "timestamp",
     HoodieWriteConfig.TBL_NAME.key -> "hoodie_test",
     HoodieMetadataConfig.ENABLE.key -> "false"
   )
-  val sparkOpts = Map(HoodieWriteConfig.RECORD_MERGER_IMPLS.key -> classOf[HoodieSparkRecordMerger].getName)
+  val sparkOpts = Map(HoodieWriteConfig.RECORD_MERGE_IMPL_CLASSES.key -> classOf[DefaultSparkRecordMerger].getName)
 
   val verificationCol: String = "driver"
   val updatedVerificationVal: String = "driver_update"
 
-  override def getSparkSessionExtensionsInjector: util.Option[Consumer[SparkSessionExtensions]] =
+  override def getSparkSessionExtensionsInjector: Option[Consumer[SparkSessionExtensions]] =
     toJavaOption(
       Some(
         JFunction.toJavaConsumer((receiver: SparkSessionExtensions) => new HoodieSparkSessionExtension().apply(receiver)))
@@ -73,30 +77,21 @@ class TestSparkDataSourceDAGExecution extends HoodieSparkClientTestBase with Sca
     initSparkContexts()
     spark = sqlContext.sparkSession
     initTestDataGenerator()
-    initFileSystem()
-  }
-
-  @AfterEach
-  override def tearDown(): Unit = {
-    cleanupSparkContexts()
-    cleanupTestDataGenerator()
-    cleanupFileSystem()
-    FileSystem.closeAll()
-    System.gc()
+    initHoodieStorage()
   }
 
   @ParameterizedTest
   @CsvSource(Array(
     "upsert,org.apache.hudi.client.SparkRDDWriteClient.commit",
     "insert,org.apache.hudi.client.SparkRDDWriteClient.commit",
-    "bulk_insert,org.apache.hudi.HoodieSparkSqlWriterInternal.bulkInsertAsRow"))
+    "bulk_insert,org.apache.hudi.client.SparkRDDWriteClient.commit"))
   def testWriteOperationDoesNotTriggerRepeatedDAG(operation: String, event: String): Unit = {
     // register stage event listeners
     val stageListener = new StageListener(event)
     spark.sparkContext.addSparkListener(stageListener)
 
     var structType: StructType = null
-    val records = recordsToStrings(dataGen.generateInserts("%05d".format(1), 10)).toList
+    val records = recordsToStrings(dataGen.generateInserts("%05d".format(1), 10)).asScala.toList
     val inputDF = spark.read.json(spark.sparkContext.parallelize(records, 2))
     structType = inputDF.schema
     inputDF.write.format("hudi")
@@ -112,12 +107,12 @@ class TestSparkDataSourceDAGExecution extends HoodieSparkClientTestBase with Sca
   @Test
   def testClusteringDoesNotTriggerRepeatedDAG(): Unit = {
     // register stage event listeners
-    val stageListener = new StageListener("org.apache.hudi.table.action.commit.BaseCommitActionExecutor.executeClustering")
+    val stageListener = new StageListener("org.apache.hudi.client.BaseHoodieTableServiceClient.cluster")
     spark.sparkContext.addSparkListener(stageListener)
 
     var structType: StructType = null
     for (i <- 1 to 2) {
-      val records = recordsToStrings(dataGen.generateInserts("%05d".format(i), 100)).toList
+      val records = recordsToStrings(dataGen.generateInserts("%05d".format(i), 100)).asScala.toList
       val inputDF = spark.read.json(spark.sparkContext.parallelize(records, 2))
       structType = inputDF.schema
       inputDF.write.format("hudi")
@@ -128,12 +123,12 @@ class TestSparkDataSourceDAGExecution extends HoodieSparkClientTestBase with Sca
     }
 
     // trigger clustering.
-    val records = recordsToStrings(dataGen.generateInserts("%05d".format(4), 100)).toList
+    val records = recordsToStrings(dataGen.generateInserts("%05d".format(4), 100)).asScala.toList
     val inputDF = spark.read.json(spark.sparkContext.parallelize(records, 2))
     structType = inputDF.schema
     inputDF.write.format("hudi")
       .options(commonOpts)
-      .option("hoodie.cleaner.commits.retained", "0")
+      .option("hoodie.clean.commits.retained", "0")
       .option("hoodie.parquet.small.file.limit", "0")
       .option("hoodie.clustering.inline", "true")
       .option("hoodie.clustering.inline.max.commits", "2")
@@ -147,12 +142,12 @@ class TestSparkDataSourceDAGExecution extends HoodieSparkClientTestBase with Sca
   @Test
   def testCompactionDoesNotTriggerRepeatedDAG(): Unit = {
     // register stage event listeners
-    val stageListener = new StageListener("org.apache.hudi.table.action.compact.RunCompactionActionExecutor.execute")
+    val stageListener = new StageListener("org.apache.hudi.client.BaseHoodieTableServiceClient.commitCompaction")
     spark.sparkContext.addSparkListener(stageListener)
 
     var structType: StructType = null
     for (i <- 1 to 2) {
-      val records = recordsToStrings(dataGen.generateInserts("%05d".format(i), 100)).toList
+      val records = recordsToStrings(dataGen.generateInserts("%05d".format(i), 100)).asScala.toList
       val inputDF = spark.read.json(spark.sparkContext.parallelize(records, 2))
       structType = inputDF.schema
       inputDF.write.format("hudi")
@@ -164,7 +159,7 @@ class TestSparkDataSourceDAGExecution extends HoodieSparkClientTestBase with Sca
     }
 
     // trigger compaction
-    val records = recordsToStrings(dataGen.generateUniqueUpdates("%05d".format(4), 100)).toList
+    val records = recordsToStrings(dataGen.generateUniqueUpdates("%05d".format(4), 100)).asScala.toList
     val inputDF = spark.read.json(spark.sparkContext.parallelize(records, 2))
     structType = inputDF.schema
     inputDF.write.format("hudi")

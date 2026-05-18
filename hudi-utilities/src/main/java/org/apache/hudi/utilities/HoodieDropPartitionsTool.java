@@ -18,19 +18,15 @@
 package org.apache.hudi.utilities;
 
 import org.apache.hudi.DataSourceWriteOptions;
+import org.apache.hudi.client.HoodieWriteResult;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.model.HoodieRecordPayload;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
-import org.apache.hudi.common.config.HoodieTimeGeneratorConfig;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
-import org.apache.hudi.common.table.timeline.TimeGenerator;
-import org.apache.hudi.common.table.timeline.TimeGenerators;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.ValidationUtils;
-import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.hive.HiveSyncConfig;
@@ -46,7 +42,6 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.conf.HiveConf;
-import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,6 +49,7 @@ import org.slf4j.LoggerFactory;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -62,6 +58,7 @@ import java.util.stream.Collectors;
 import scala.Tuple2;
 
 /**
+ * TODO: [HUDI-8294]
  * A tool with spark-submit to drop Hudi table partitions.
  *
  * <p>
@@ -106,13 +103,14 @@ import scala.Tuple2;
  */
 public class HoodieDropPartitionsTool implements Serializable {
 
+  private static final long serialVersionUID = 1L;
   private static final Logger LOG = LoggerFactory.getLogger(HoodieDropPartitionsTool.class);
   // Spark context
   private final transient JavaSparkContext jsc;
   // config
   private final Config cfg;
   // Properties with source, hoodie client, key generator etc.
-  private TypedProperties props;
+  private final TypedProperties props;
 
   private final HoodieTableMetaClient metaClient;
 
@@ -124,7 +122,8 @@ public class HoodieDropPartitionsTool implements Serializable {
         ? UtilHelpers.buildProperties(cfg.configs)
         : readConfigFromFileSystem(jsc, cfg);
     this.metaClient = HoodieTableMetaClient.builder()
-        .setConf(jsc.hadoopConfiguration()).setBasePath(cfg.basePath)
+        .setConf(HadoopFSUtils.getStorageConfWithCopy(jsc.hadoopConfiguration()))
+        .setBasePath(cfg.basePath)
         .setLoadActiveTimelineOnLoad(true)
         .build();
   }
@@ -161,8 +160,6 @@ public class HoodieDropPartitionsTool implements Serializable {
     public String partitions = null;
     @Parameter(names = {"--parallelism", "-pl"}, description = "Parallelism for hoodie insert/upsert/delete", required = false)
     public int parallelism = 1500;
-    @Parameter(names = {"--instant-time", "-it"}, description = "instant time for delete table partitions operation.", required = false)
-    public String instantTime = null;
     @Parameter(names = {"--sync-hive-meta", "-sync"}, description = "Sync information to HMS.", required = false)
     public boolean syncToHive = false;
     @Parameter(names = {"--hive-database", "-db"}, description = "Database to sync to.", required = false)
@@ -192,6 +189,8 @@ public class HoodieDropPartitionsTool implements Serializable {
     public String sparkMaster = null;
     @Parameter(names = {"--spark-memory", "-sm"}, description = "spark memory to use", required = false)
     public String sparkMemory = "1g";
+    @Parameter(names = {"--enable-hive-support", "-ehs"}, description = "Enables hive support during spark context initialization.", required = false)
+    public Boolean enableHiveSupport = false;
     @Parameter(names = {"--props"}, description = "path to properties file on localfs or dfs, with configurations for "
         + "hoodie client for deleting table partitions")
     public String propsFilePath = null;
@@ -210,7 +209,6 @@ public class HoodieDropPartitionsTool implements Serializable {
           + "   --table-name " + tableName + ", \n"
           + "   --partitions " + partitions + ", \n"
           + "   --parallelism " + parallelism + ", \n"
-          + "   --instantTime " + instantTime + ", \n"
           + "   --sync-hive-meta " + syncToHive + ", \n"
           + "   --hive-database " + hiveDataBase + ", \n"
           + "   --hive-table-name " + hiveTableName + ", \n"
@@ -242,7 +240,6 @@ public class HoodieDropPartitionsTool implements Serializable {
           && Objects.equals(runningMode, config.runningMode)
           && Objects.equals(tableName, config.tableName)
           && Objects.equals(partitions, config.partitions)
-          && Objects.equals(instantTime, config.instantTime)
           && Objects.equals(syncToHive, config.syncToHive)
           && Objects.equals(hiveDataBase, config.hiveDataBase)
           && Objects.equals(hiveTableName, config.hiveTableName)
@@ -262,7 +259,7 @@ public class HoodieDropPartitionsTool implements Serializable {
 
     @Override
     public int hashCode() {
-      return Objects.hash(basePath, runningMode, tableName, partitions, instantTime,
+      return Objects.hash(basePath, runningMode, tableName, partitions,
           syncToHive, hiveDataBase, hiveTableName, hiveUserName, hivePassWord, hiveURL,
           hivePartitionsField, hiveUseJdbc, hiveHMSUris, partitionValueExtractorClass,
           sparkMaster, sparkMemory, propsFilePath, configs, hiveSyncIgnoreException, help);
@@ -276,14 +273,16 @@ public class HoodieDropPartitionsTool implements Serializable {
       cmd.usage();
       System.exit(1);
     }
-    SparkConf sparkConf = UtilHelpers.buildSparkConf("Hoodie-Drop-Table-Partitions", cfg.sparkMaster);
-    sparkConf.set("spark.executor.memory", cfg.sparkMemory);
-    JavaSparkContext jsc = new JavaSparkContext(sparkConf);
+    Map<String, String> sparkConfigMap = new HashMap<>();
+    sparkConfigMap.put("spark.executor.memory", cfg.sparkMemory);
+    JavaSparkContext jsc = UtilHelpers.buildSparkContext("Hoodie-Drop-Table-Partitions",
+        cfg.sparkMaster, cfg.enableHiveSupport, sparkConfigMap);
+
     HoodieDropPartitionsTool tool = new HoodieDropPartitionsTool(jsc, cfg);
     try {
       tool.run();
     } catch (Throwable throwable) {
-      LOG.error("Fail to run deleting table partitions for " + cfg.toString(), throwable);
+      LOG.error("Fail to run deleting table partitions for " + cfg, throwable);
     } finally {
       jsc.stop();
     }
@@ -291,11 +290,6 @@ public class HoodieDropPartitionsTool implements Serializable {
 
   public void run() {
     try {
-      if (StringUtils.isNullOrEmpty(cfg.instantTime)) {
-        TimeGenerator timeGenerator = TimeGenerators
-            .getTimeGenerator(HoodieTimeGeneratorConfig.defaultConfig(cfg.basePath), jsc.hadoopConfiguration());
-        cfg.instantTime = HoodieActiveTimeline.createNewInstantTime(true, timeGenerator);
-      }
       LOG.info(cfg.toString());
 
       Mode mode = Mode.valueOf(cfg.runningMode.toUpperCase());
@@ -320,6 +314,7 @@ public class HoodieDropPartitionsTool implements Serializable {
   public void dryRun() {
     try (SparkRDDWriteClient<HoodieRecordPayload> client =  UtilHelpers.createHoodieClient(jsc, cfg.basePath, "", cfg.parallelism, Option.empty(), props)) {
       HoodieSparkTable<HoodieRecordPayload> table = HoodieSparkTable.create(client.getConfig(), client.getEngineContext());
+      client.validateAgainstTableProperties(table.getMetaClient().getTableConfig(), client.getConfig());
       List<String> parts = Arrays.asList(cfg.partitions.split(","));
       Map<String, List<String>> partitionToReplaceFileIds = jsc.parallelize(parts, parts.size()).distinct()
           .mapToPair(partitionPath -> new Tuple2<>(partitionPath, table.getSliceView().getLatestFileSlices(partitionPath).map(fg -> fg.getFileId()).distinct().collect(Collectors.toList())))
@@ -336,13 +331,12 @@ public class HoodieDropPartitionsTool implements Serializable {
   }
 
   private void doDeleteTablePartitions() {
-
-    // need to do commit in SparkDeletePartitionCommitActionExecutor#execute
-    this.props.put(HoodieWriteConfig.AUTO_COMMIT_ENABLE.key(), "true");
     try (SparkRDDWriteClient<HoodieRecordPayload> client =  UtilHelpers.createHoodieClient(jsc, cfg.basePath, "", cfg.parallelism, Option.empty(), props)) {
       List<String> partitionsToDelete = Arrays.asList(cfg.partitions.split(","));
-      client.startCommitWithTime(cfg.instantTime, HoodieTimeline.REPLACE_COMMIT_ACTION);
-      client.deletePartitions(partitionsToDelete, cfg.instantTime);
+      String instantTime = client.startCommit(HoodieTimeline.REPLACE_COMMIT_ACTION);
+      HoodieWriteResult result = client.deletePartitions(partitionsToDelete, instantTime);
+      client.commit(instantTime, result.getWriteStatuses(), Option.empty(), HoodieTimeline.REPLACE_COMMIT_ACTION,
+          result.getPartitionToReplaceFileIds(), Option.empty());
     }
   }
 
@@ -379,7 +373,7 @@ public class HoodieDropPartitionsTool implements Serializable {
         + "). Hive metastore URL :"
         + hiveSyncConfig.getStringOrDefault(HiveSyncConfigHolder.HIVE_URL)
         + ", basePath :" + cfg.basePath);
-    LOG.info("Hive Sync Conf => " + hiveSyncConfig.toString());
+    LOG.info("Hive Sync Conf => " + hiveSyncConfig);
     FileSystem fs = HadoopFSUtils.getFs(cfg.basePath, jsc.hadoopConfiguration());
     HiveConf hiveConf = new HiveConf();
     if (!StringUtils.isNullOrEmpty(cfg.hiveHMSUris)) {

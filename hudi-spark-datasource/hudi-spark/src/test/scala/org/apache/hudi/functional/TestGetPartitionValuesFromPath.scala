@@ -18,7 +18,7 @@
 
 package org.apache.hudi.functional
 
-import org.apache.spark.sql.hudi.HoodieSparkSqlTestBase
+import org.apache.spark.sql.hudi.common.HoodieSparkSqlTestBase
 
 class TestGetPartitionValuesFromPath extends HoodieSparkSqlTestBase {
 
@@ -65,7 +65,7 @@ class TestGetPartitionValuesFromPath extends HoodieSparkSqlTestBase {
            |tblproperties (
            | primaryKey = 'id',
            | type = 'mor',
-           | preCombineField = 'ts',
+           | orderingFields = 'ts',
            | hoodie.datasource.write.drop.partition.columns = 'true'
            |)
            |partitioned by (region, dt)""".stripMargin)

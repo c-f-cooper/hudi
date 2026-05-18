@@ -17,6 +17,8 @@
 
 package org.apache.hudi.sink.utils;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.state.KeyedStateStore;
 import org.apache.flink.metrics.groups.OperatorMetricGroup;
@@ -31,20 +33,19 @@ import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.streaming.runtime.tasks.TestProcessingTimeService;
 
 import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Mock {@link StreamingRuntimeContext} to use in tests.
  *
  * <p>NOTE: Adapted from Apache Flink, the MockStreamOperator is modified to support MapState.
  */
+@Getter
 public class MockStreamingRuntimeContext extends StreamingRuntimeContext {
 
   private final boolean isCheckpointingEnabled;
 
-  private final int numParallelSubtasks;
-  private final int subtaskIndex;
-
-  private int attemptNumber;
+  private final MockTaskInfo taskInfo;
 
   public MockStreamingRuntimeContext(
       boolean isCheckpointingEnabled,
@@ -66,45 +67,59 @@ public class MockStreamingRuntimeContext extends StreamingRuntimeContext {
     super(new MockStreamOperator(), environment, new HashMap<>());
 
     this.isCheckpointingEnabled = isCheckpointingEnabled;
-    this.numParallelSubtasks = numParallelSubtasks;
-    this.subtaskIndex = subtaskIndex;
-    this.attemptNumber = 0;
+    this.taskInfo = new MockTaskInfo(numParallelSubtasks, subtaskIndex, 0);
   }
 
-  @Override
-  public boolean isCheckpointingEnabled() {
-    return isCheckpointingEnabled;
+  public MockStreamingRuntimeContext(
+      boolean isCheckpointingEnabled,
+      int numParallelSubtasks,
+      int subtaskIndex,
+      MockEnvironment environment,
+      ExecutionConfig executionConfig) {
+
+    super(new MockStreamOperator(executionConfig), environment, new HashMap<>());
+
+    this.isCheckpointingEnabled = isCheckpointingEnabled;
+    this.taskInfo = new MockTaskInfo(numParallelSubtasks, subtaskIndex, 0);
   }
 
-  @Override
   public int getIndexOfThisSubtask() {
-    return subtaskIndex;
+    return taskInfo.getIndexOfThisSubtask();
   }
 
-  @Override
   public int getNumberOfParallelSubtasks() {
-    return numParallelSubtasks;
+    return taskInfo.getNumberOfParallelSubtasks();
   }
 
-  @Override
   public int getAttemptNumber() {
-    return this.attemptNumber;
+    return taskInfo.getAttemptNumber();
   }
 
   public void setAttemptNumber(int attemptNumber) {
-    this.attemptNumber = attemptNumber;
+    this.taskInfo.setAttemptNumber(attemptNumber);
   }
 
   private static class MockStreamOperator extends AbstractStreamOperator<Integer> {
     private static final long serialVersionUID = -1153976702711944427L;
 
     private transient TestProcessingTimeService testProcessingTimeService;
+    private final transient ExecutionConfig executionConfig;
 
-    private transient MockOperatorStateStore mockOperatorStateStore;
+    @Setter
+    private transient Object currentKey;
+    private final transient Map<Object, MockKeyedStateStore> mockKeyedStateStoreMap = new HashMap<>();
+
+    MockStreamOperator() {
+      this(new ExecutionConfig());
+    }
+
+    MockStreamOperator(ExecutionConfig executionConfig) {
+      this.executionConfig = executionConfig;
+    }
 
     @Override
     public ExecutionConfig getExecutionConfig() {
-      return new ExecutionConfig();
+      return executionConfig;
     }
 
     @Override
@@ -122,10 +137,7 @@ public class MockStreamingRuntimeContext extends StreamingRuntimeContext {
 
     @Override
     public KeyedStateStore getKeyedStateStore() {
-      if (mockOperatorStateStore == null) {
-        mockOperatorStateStore = new MockOperatorStateStore();
-      }
-      return mockOperatorStateStore;
+      return currentKey != null ? mockKeyedStateStoreMap.computeIfAbsent(currentKey, k -> new MockKeyedStateStore()) : null;
     }
   }
 

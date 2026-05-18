@@ -57,6 +57,13 @@ public class CloudSourceConfig extends HoodieConfig {
           + "Multiple API calls with this batch size are sent to cloud events queue, until we consume hoodie.streamer.source.cloud.meta.max.num.messages.per.sync"
           + "from the queue or hoodie.streamer.source.cloud.meta.max.fetch.time.per.sync.ms amount of time has passed or queue is empty. ");
 
+  public static final ConfigProperty<Integer> META_EVENTS_PER_PARTITION = ConfigProperty
+      .key(STREAMER_CONFIG_PREFIX + "source.cloud.meta.events.per.partition")
+      .defaultValue(10000)
+      .markAdvanced()
+      .sinceVersion("1.2.0")
+      .withDocumentation("Number of metadata events to be grouped into a single partition while creating dataframe from metadata events.");
+
   public static final ConfigProperty<Integer> MAX_NUM_MESSAGES_PER_SYNC = ConfigProperty
       .key(STREAMER_CONFIG_PREFIX + "source.cloud.meta.max.num.messages.per.sync")
       .defaultValue(1000)
@@ -85,14 +92,24 @@ public class CloudSourceConfig extends HoodieConfig {
       .noDefaultValue()
       .withAlternatives(DELTA_STREAMER_CONFIG_PREFIX + "source.cloud.data.select.relpath.prefix")
       .markAdvanced()
-      .withDocumentation("Only selects objects in the bucket whose relative path matches this prefix");
+      .withDocumentation("Only selects objects in the bucket whose relative path starts with this prefix");
+
+  public static final ConfigProperty<String> SELECT_RELATIVE_PATH_REGEX = ConfigProperty
+      .key(STREAMER_CONFIG_PREFIX + "source.cloud.data.select.relative.path.regex")
+      .noDefaultValue()
+      .markAdvanced()
+      .sinceVersion("1.0.0")
+      .withDocumentation("Only selects objects in the bucket whose relative path matches this regex. "
+          + "For example: When hoodie.streamer.source.cloud.data.select.relpath.prefix is set to /path/prefix, and the hoodie.streamer.source.cloud.data.select.relative.path.regex"
+          + " is regex/files[0-9]+, only files located in the /path/prefix/regex directory that match the pattern (e.g., file1, file2, etc.) will be ingested.\n"
+          + "If hoodie.streamer.source.cloud.data.select.relpath.prefix is not set, the ingestion process will look for files matching /regex/files[0-9]+ in the source bucket.");
 
   public static final ConfigProperty<String> IGNORE_RELATIVE_PATH_PREFIX = ConfigProperty
       .key(STREAMER_CONFIG_PREFIX + "source.cloud.data.ignore.relpath.prefix")
       .noDefaultValue()
       .withAlternatives(DELTA_STREAMER_CONFIG_PREFIX + "source.cloud.data.ignore.relpath.prefix")
       .markAdvanced()
-      .withDocumentation("Ignore objects in the bucket whose relative path matches this prefix");
+      .withDocumentation("Ignore objects in the bucket whose relative path starts this prefix");
 
   public static final ConfigProperty<String> IGNORE_RELATIVE_PATH_SUBSTR = ConfigProperty
       .key(STREAMER_CONFIG_PREFIX + "source.cloud.data.ignore.relpath.substring")
@@ -107,7 +124,7 @@ public class CloudSourceConfig extends HoodieConfig {
       .withAlternatives(DELTA_STREAMER_CONFIG_PREFIX + "source.cloud.data.datasource.options")
       .markAdvanced()
       .withDocumentation("A JSON string passed to the Spark DataFrameReader while loading the dataset. "
-          + "Example: hoodie.streamer.gcp.spark.datasource.options={\"header\":\"true\",\"encoding\":\"UTF-8\"}\n");
+          + "Example: `hoodie.streamer.gcp.spark.datasource.options={\"header\":\"true\",\"encoding\":\"UTF-8\"}`\n");
 
   public static final ConfigProperty<String> CLOUD_DATAFILE_EXTENSION = ConfigProperty
       .key(STREAMER_CONFIG_PREFIX + "source.cloud.data.select.file.extension")
@@ -136,9 +153,11 @@ public class CloudSourceConfig extends HoodieConfig {
       .defaultValue(false)
       .markAdvanced()
       .sinceVersion("0.14.1")
-      .withDocumentation("Boolean value for specifying path format in load args of spark.read.format(\"..\").load(\"a.xml,b.xml,c.xml\"),\n"
-          + "   * set true if path format needs to be comma separated string value, if false it's passed as array of strings like\n"
-          + "   * spark.read.format(\"..\").load(new String[]{a.xml,b.xml,c.xml})");
+      .withDocumentation("Boolean value for specifying path format in load args of "
+          + "`spark.read.format(\"..\").load(\"a.xml,b.xml,c.xml\")`. "
+          + "Set true if path format needs to be comma separated string value; "
+          + "false if it's passed as array of strings like"
+          + "`spark.read.format(\"..\").load(new String[]{a.xml,b.xml,c.xml})`");
 
   public static final ConfigProperty<String> SOURCE_MAX_BYTES_PER_PARTITION = ConfigProperty
       .key(STREAMER_CONFIG_PREFIX + "source.cloud.data.partition.max.size")
@@ -155,4 +174,24 @@ public class CloudSourceConfig extends HoodieConfig {
       .withDocumentation("Max time in secs to consume " + MAX_NUM_MESSAGES_PER_SYNC.key() + " messages from cloud queue. Cloud event queues like SQS, "
           + "PubSub can return empty responses even when messages are available the queue, this config ensures we don't wait forever "
           + "to consume MAX_MESSAGES_CONF messages, but time out and move on further.");
+
+  public static final ConfigProperty<Boolean> SPARK_DATASOURCE_READER_COALESCE_ALIAS_COLUMNS = ConfigProperty
+      .key(STREAMER_CONFIG_PREFIX + "source.cloud.data.reader.coalesce.aliases")
+      .defaultValue(true)
+      .markAdvanced()
+      .sinceVersion("1.0.0")
+      .withDocumentation("Boolean value to allow coalesce alias columns with actual columns while reading from source");
+
+  public static final ConfigProperty<Boolean> CLOUD_INCREMENTAL_MERGE_SCHEMA = ConfigProperty
+      .key(STREAMER_CONFIG_PREFIX + "source.cloud.data.merge.schema.enable")
+      .defaultValue(true)
+      .markAdvanced()
+      .sinceVersion("1.2.0")
+      .withDocumentation("For Parquet and ORC data files in S3/GCS incremental ingestion, merge schemas across all "
+          + "files in each read (Spark mergeSchema). Default true so mixed-schema batches during initial "
+          + "ingest/bootstrap produce a valid unified schema. Set false to restore prior behavior. "
+          + SPARK_DATASOURCE_OPTIONS.key() + " is applied after this flag and can override mergeSchema. "
+          + "Note: the per-read mergeSchema option is honored by Spark's native Parquet reader and by Spark's "
+          + "native ORC reader (Spark 3.0+, default ORC impl since Spark 2.4). On older runtimes the option is "
+          + "silently ignored.");
 }

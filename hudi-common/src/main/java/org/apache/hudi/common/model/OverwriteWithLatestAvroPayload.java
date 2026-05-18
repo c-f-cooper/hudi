@@ -18,8 +18,8 @@
 
 package org.apache.hudi.common.model;
 
-import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.OrderingValues;
 
 import org.apache.avro.JsonProperties;
 import org.apache.avro.Schema;
@@ -30,8 +30,6 @@ import java.io.IOException;
 import java.util.Objects;
 
 /**
- * Default payload.
- *
  * <ol>
  * <li> preCombine - Picks the latest delta record for a key, based on an ordering field;
  * <li> combineAndGetUpdateValue/getInsertValue - Simply overwrites storage with latest delta record
@@ -45,21 +43,12 @@ public class OverwriteWithLatestAvroPayload extends BaseAvroPayload
   }
 
   public OverwriteWithLatestAvroPayload(Option<GenericRecord> record) {
-    this(record.isPresent() ? record.get() : null, 0); // natural order
+    this(record.isPresent() ? record.get() : null, OrderingValues.getDefault()); // natural order
   }
 
   @Override
   public OverwriteWithLatestAvroPayload preCombine(OverwriteWithLatestAvroPayload oldValue) {
-    if (oldValue.recordBytes.length == 0) {
-      // use natural order for delete record
-      return this;
-    }
-    if (oldValue.orderingVal.compareTo(orderingVal) > 0) {
-      // pick the payload with greatest ordering value
-      return oldValue;
-    } else {
-      return this;
-    }
+    return this;
   }
 
   @Override
@@ -69,11 +58,11 @@ public class OverwriteWithLatestAvroPayload extends BaseAvroPayload
 
   @Override
   public Option<IndexedRecord> getInsertValue(Schema schema) throws IOException {
-    if (recordBytes.length == 0 || isDeletedRecord) {
+    if (isEmptyRecord() || isDeletedRecord) {
       return Option.empty();
     }
 
-    return Option.of((IndexedRecord) HoodieAvroUtils.bytesToAvro(recordBytes, schema));
+    return getRecord(schema);
   }
 
   /**

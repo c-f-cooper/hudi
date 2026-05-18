@@ -19,25 +19,35 @@
 
 package org.apache.hudi.functional
 
-import org.apache.hudi.common.config.HoodieMetadataConfig
-import org.apache.hudi.common.model.HoodieRecord
+import org.apache.hudi.{DataSourceReadOptions, DataSourceWriteOptions, HoodieDataSourceHelpers, HoodieSchemaConversionUtils}
+import org.apache.hudi.common.config.{HoodieMetadataConfig, RecordMergeMode}
+import org.apache.hudi.common.model.{DefaultHoodieRecordPayload, EventTimeAvroPayload, HoodieRecord, HoodieRecordMerger, HoodieTableType, OverwriteWithLatestAvroPayload, PartialUpdateAvroPayload}
+import org.apache.hudi.common.model.HoodieRecord.HoodieRecordType
+import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient}
+import org.apache.hudi.common.table.read.CustomPayloadForTesting
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator
-import org.apache.hudi.common.testutils.RawTripTestPayload.recordsToStrings
+import org.apache.hudi.common.testutils.HoodieTestDataGenerator.recordsToStrings
+import org.apache.hudi.common.testutils.HoodieTestUtils
 import org.apache.hudi.config.{HoodieCompactionConfig, HoodieIndexConfig, HoodieWriteConfig}
+import org.apache.hudi.exception.HoodieException
+import org.apache.hudi.functional.CommonOptionUtils.getWriterReaderOpts
+import org.apache.hudi.index.HoodieIndex.IndexType
 import org.apache.hudi.keygen.NonpartitionedKeyGenerator
-import org.apache.hudi.testutils.SparkClientFunctionalTestHarness
+import org.apache.hudi.storage.StoragePath
+import org.apache.hudi.testutils.{DataSourceTestUtils, SparkClientFunctionalTestHarness}
 import org.apache.hudi.testutils.SparkClientFunctionalTestHarness.getSparkSqlConf
-import org.apache.hudi.{DataSourceReadOptions, DataSourceWriteOptions, HoodieDataSourceHelpers}
-import org.apache.hudi.common.fs.FSUtils
-import org.apache.hudi.hadoop.fs.HadoopFSUtils
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql._
-import org.junit.jupiter.api.Assertions.{assertEquals, assertTrue}
+import org.apache.spark.sql.functions.lit
+import org.apache.spark.sql.types.StructType
+import org.junit.jupiter.api.Assertions
+import org.junit.jupiter.api.Assertions.{assertEquals, assertNull, assertTrue}
+import org.junit.jupiter.api.function.Executable
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
 
-import scala.collection.JavaConversions._
+import scala.collection.JavaConverters._
 
 class TestSparkDataSource extends SparkClientFunctionalTestHarness {
 
@@ -51,7 +61,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     "hoodie.bulkinsert.shuffle.parallelism" -> s"$parallelism",
     "hoodie.delete.shuffle.parallelism" -> s"$parallelism",
     DataSourceWriteOptions.RECORDKEY_FIELD.key -> "_row_key",
-    DataSourceWriteOptions.PRECOMBINE_FIELD.key -> "timestamp",
+    HoodieTableConfig.ORDERING_FIELDS.key -> "timestamp",
     HoodieWriteConfig.TBL_NAME.key -> "hoodie_test"
   )
 
@@ -77,17 +87,17 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     // order of cols in inputDf and hudiDf differs slightly. so had to choose columns specifically to compare df directly.
     val colsToSelect = "_row_key, begin_lat,  begin_lon, city_to_state.LA, current_date, current_ts, distance_in_meters, driver, end_lat, end_lon, fare.amount, fare.currency, partition, partition_path, rider, timestamp, weight, _hoodie_is_deleted"
     val dataGen = new HoodieTestDataGenerator(0xDEED)
-    val fs = HadoopFSUtils.getFs(basePath, spark.sparkContext.hadoopConfiguration)
+    val storage = HoodieTestUtils.getStorage(new StoragePath(basePath))
     // Insert Operation
-    val records0 = recordsToStrings(dataGen.generateInserts("000", 10)).toList
+    val records0 = recordsToStrings(dataGen.generateInserts("000", 10)).asScala.toList
     val inputDf0 = spark.read.json(spark.sparkContext.parallelize(records0, parallelism)).cache
     inputDf0.write.format("org.apache.hudi")
       .options(options)
       .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.BULK_INSERT_OPERATION_OPT_VAL)
       .mode(SaveMode.Overwrite)
       .save(basePath)
-
-    assertTrue(HoodieDataSourceHelpers.hasNewCommits(fs, basePath, "000"))
+    val commitCompletionTime1 = DataSourceTestUtils.latestCommitCompletionTime(storage, basePath)
+    assertTrue(HoodieDataSourceHelpers.hasNewCommits(storage, basePath, "000"))
 
     // Snapshot query
     val snapshotDf1 = spark.read.format("org.apache.hudi")
@@ -98,13 +108,14 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     val snapshotRows1 = snapshotDf1.collect.toList
     snapshotDf1.unpersist(true)
 
-    val records1 = recordsToStrings(dataGen.generateUniqueUpdates("001", 5)).toList
+    val records1 = recordsToStrings(dataGen.generateUniqueUpdates("001", 5)).asScala.toList
     val updateDf = spark.read.json(spark.sparkContext.parallelize(records1, parallelism)).cache
     updateDf.write.format("org.apache.hudi")
       .options(options)
       .mode(SaveMode.Append)
       .save(basePath)
-    val commitInstantTime2 = HoodieDataSourceHelpers.latestCommit(fs, basePath)
+    val commitInstantTime2 = HoodieDataSourceHelpers.latestCommit(storage, basePath)
+    val commitCompletionTime2 = DataSourceTestUtils.latestCommitCompletionTime(storage, basePath)
 
     val snapshotDf2 = spark.read.format("org.apache.hudi")
       .option(HoodieMetadataConfig.ENABLE.key, isMetadataEnabledOnRead)
@@ -114,7 +125,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     val snapshotRows2 = snapshotDf2.collect.toList
     snapshotDf2.unpersist(true)
 
-    val records2 = recordsToStrings(dataGen.generateUniqueUpdates("002", 6)).toList
+    val records2 = recordsToStrings(dataGen.generateUniqueUpdates("002", 6)).asScala.toList
     val inputDf2 = spark.read.json(spark.sparkContext.parallelize(records2, parallelism)).cache
     val uniqueKeyCnt2 = inputDf2.select("_row_key").distinct().count()
     inputDf2.write.format("org.apache.hudi")
@@ -122,8 +133,9 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
       .mode(SaveMode.Append)
       .save(basePath)
 
-    val commitInstantTime3 = HoodieDataSourceHelpers.latestCommit(fs, basePath)
-    assertEquals(3, HoodieDataSourceHelpers.listCommitsSince(fs, basePath, "000").size())
+    val commitInstantTime3 = HoodieDataSourceHelpers.latestCommit(storage, basePath)
+    val commitCompletionTime3 = DataSourceTestUtils.latestCommitCompletionTime(storage, basePath)
+    assertEquals(3, HoodieDataSourceHelpers.listCommitsSince(storage, basePath, "000").size())
 
     // Snapshot Query
     val snapshotDf3 = spark.read.format("org.apache.hudi")
@@ -135,11 +147,11 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
 
     // Read Incremental Query
     // we have 2 commits, try pulling the first commit (which is not the latest)
-    val firstCommit = HoodieDataSourceHelpers.listCommitsSince(fs, basePath, "000").get(0)
+    val firstCommit = HoodieDataSourceHelpers.listCommitsSince(storage, basePath, "000").get(0)
     val hoodieIncViewDf1 = spark.read.format("org.apache.hudi")
       .option(DataSourceReadOptions.QUERY_TYPE.key, DataSourceReadOptions.QUERY_TYPE_INCREMENTAL_OPT_VAL)
-      .option(DataSourceReadOptions.BEGIN_INSTANTTIME.key, "000")
-      .option(DataSourceReadOptions.END_INSTANTTIME.key, firstCommit)
+      .option(DataSourceReadOptions.START_COMMIT.key, "000")
+      .option(DataSourceReadOptions.END_COMMIT.key, commitCompletionTime1)
       .option(HoodieMetadataConfig.ENABLE.key, isMetadataEnabledOnRead)
       .load(basePath)
     assertEquals(10, hoodieIncViewDf1.count(), "should have pulled 10 initial inserts")
@@ -147,7 +159,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     assertEquals(1, countsPerCommit.length)
     assertEquals(firstCommit, countsPerCommit(0).get(0))
 
-    val records3 = recordsToStrings(dataGen.generateUniqueUpdates("003", 8)).toList
+    val records3 = recordsToStrings(dataGen.generateUniqueUpdates("003", 8)).asScala.toList
     val inputDf3 = spark.read.json(spark.sparkContext.parallelize(records3, parallelism)).cache
     inputDf3.write.format("org.apache.hudi")
       .options(options)
@@ -157,8 +169,8 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     // another incremental query with commit2 and commit3
     val hoodieIncViewDf2 = spark.read.format("org.apache.hudi")
       .option(DataSourceReadOptions.QUERY_TYPE.key, DataSourceReadOptions.QUERY_TYPE_INCREMENTAL_OPT_VAL)
-      .option(DataSourceReadOptions.BEGIN_INSTANTTIME.key, commitInstantTime2)
-      .option(DataSourceReadOptions.END_INSTANTTIME.key(), commitInstantTime3)
+      .option(DataSourceReadOptions.START_COMMIT.key, commitCompletionTime2)
+      .option(DataSourceReadOptions.END_COMMIT.key(), commitCompletionTime3)
       .option(HoodieMetadataConfig.ENABLE.key, isMetadataEnabledOnRead)
       .load(basePath)
 
@@ -184,7 +196,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
       assertEquals(10, snapshotRows4.length)
 
       // trigger compaction and try out Read optimized query.
-      val records4 = recordsToStrings(dataGen.generateUniqueUpdates("004", 4)).toList
+      val records4 = recordsToStrings(dataGen.generateUniqueUpdates("004", 4)).asScala.toList
       val inputDf4 = spark.read.json(spark.sparkContext.parallelize(records4, parallelism)).cache
       inputDf4.write.format("org.apache.hudi")
         .options(options)
@@ -238,9 +250,9 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     // order of cols in inputDf and hudiDf differs slightly. so had to choose columns specifically to compare df directly.
     val colsToSelect = "_row_key, begin_lat,  begin_lon, city_to_state.LA, current_date, current_ts, distance_in_meters, driver, end_lat, end_lon, fare.amount, fare.currency, partition, partition_path, rider, timestamp, weight, _hoodie_is_deleted"
     val dataGen = new HoodieTestDataGenerator(0xDEED)
-    val fs = HadoopFSUtils.getFs(basePath, spark.sparkContext.hadoopConfiguration)
+    val storage = HoodieTestUtils.getStorage(new StoragePath(basePath))
     // Insert Operation
-    val records0 = recordsToStrings(dataGen.generateInserts("000", 10)).toList
+    val records0 = recordsToStrings(dataGen.generateInserts("000", 10)).asScala.toList
     val inputDf0 = spark.read.json(spark.sparkContext.parallelize(records0, parallelism)).cache
     inputDf0.write.format("org.apache.hudi")
       .options(options)
@@ -248,7 +260,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
       .mode(SaveMode.Overwrite)
       .save(basePath)
 
-    assertTrue(HoodieDataSourceHelpers.hasNewCommits(fs, basePath, "000"))
+    assertTrue(HoodieDataSourceHelpers.hasNewCommits(storage, basePath, "000"))
 
     // Snapshot query
     val snapshotDf1 = spark.read.format("org.apache.hudi")
@@ -256,7 +268,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
       .load(basePath)
     assertEquals(10, snapshotDf1.count())
 
-    val records1 = recordsToStrings(dataGen.generateInserts("001", 5)).toList
+    val records1 = recordsToStrings(dataGen.generateInserts("001", 5)).asScala.toList
     val inputDf1 = spark.read.json(spark.sparkContext.parallelize(records1, parallelism)).cache
     inputDf1.write.format("org.apache.hudi")
       .options(options)
@@ -271,7 +283,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     compareEntireInputDfWithHudiDf(inputDf1.union(inputDf0), snapshotDf2, colsToSelect)
     snapshotDf2.unpersist(true)
 
-    val records2 = recordsToStrings(dataGen.generateInserts("002", 6)).toList
+    val records2 = recordsToStrings(dataGen.generateInserts("002", 6)).asScala.toList
     val inputDf2 = spark.read.json(spark.sparkContext.parallelize(records2, parallelism)).cache
     inputDf2.write.format("org.apache.hudi")
       .options(options)
@@ -279,7 +291,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
       .mode(SaveMode.Append)
       .save(basePath)
 
-    assertEquals(3, HoodieDataSourceHelpers.listCommitsSince(fs, basePath, "000").size())
+    assertEquals(3, HoodieDataSourceHelpers.listCommitsSince(storage, basePath, "000").size())
 
     // Snapshot Query
     val snapshotDf3 = spark.read.format("org.apache.hudi")
@@ -294,11 +306,264 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     inputDf2.unpersist(true)
   }
 
+  @ParameterizedTest
+  @CsvSource(value = Array("COPY_ON_WRITE,8,EVENT_TIME_ORDERING,RECORD_INDEX",
+    "COPY_ON_WRITE,8,COMMIT_TIME_ORDERING,RECORD_INDEX",
+    "COPY_ON_WRITE,8,EVENT_TIME_ORDERING,GLOBAL_SIMPLE",
+    "COPY_ON_WRITE,8,COMMIT_TIME_ORDERING,GLOBAL_SIMPLE",
+    "MERGE_ON_READ,8,EVENT_TIME_ORDERING,RECORD_INDEX",
+    "MERGE_ON_READ,8,COMMIT_TIME_ORDERING,RECORD_INDEX",
+    "MERGE_ON_READ,8,EVENT_TIME_ORDERING,GLOBAL_SIMPLE",
+    "MERGE_ON_READ,8,COMMIT_TIME_ORDERING,GLOBAL_SIMPLE"))
+  def testDeletesWithHoodieIsDeleted(tableType: HoodieTableType, tableVersion: Int, mergeMode: RecordMergeMode, indexType: IndexType): Unit = {
+    var (writeOpts, readOpts) = getWriterReaderOpts(HoodieRecordType.AVRO)
+    writeOpts = writeOpts ++ Map(
+      "hoodie.write.table.version" -> tableVersion.toString,
+      "hoodie.datasource.write.table.type" -> tableType.name(),
+      HoodieTableConfig.ORDERING_FIELDS.key() -> "ts",
+      "hoodie.write.record.merge.mode" -> mergeMode.name(),
+      "hoodie.index.type" -> indexType.name(),
+      "hoodie.metadata.record.index.enable" -> "true",
+      "hoodie.record.index.update.partition.path" -> "true",
+      "hoodie.parquet.small.file.limit" -> "0")
+
+    writeOpts = writeOpts + (if (indexType == IndexType.RECORD_INDEX) {
+      "hoodie.record.index.update.partition.path" -> "true"
+    } else {
+      "hoodie.simple.index.update.partition.path" -> "true"
+    })
+
+    // generate the inserts
+    val schema = DataSourceTestUtils.getStructTypeExampleSchema
+    val structType = HoodieSchemaConversionUtils.convertHoodieSchemaToStructType(schema)
+    val inserts = DataSourceTestUtils.generateRandomRows(400)
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(inserts)), structType)
+
+    df.write.format("hudi")
+      .options(writeOpts)
+      .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
+      .option(DataSourceWriteOptions.TABLE_TYPE.key, tableType.name())
+      .mode(SaveMode.Overwrite)
+      .save(basePath)
+
+    val hudiSnapshotDF1 = spark.read.format("hudi")
+      .options(readOpts)
+      .load(basePath)
+    assertEquals(400, hudiSnapshotDF1.count())
+
+    // ingest batch2 with mix of updates and deletes. some of them are updating same partition, some of them are moving to new partition.
+    // some are having higher ts and some are having lower ts.
+    ingestNewBatch(tableType, 200, structType, inserts.subList(0, 200), writeOpts)
+
+    val expectedRecordCount2 = if (mergeMode == RecordMergeMode.EVENT_TIME_ORDERING) 350 else 300;
+    val hudiSnapshotDF2 = spark.read.format("hudi")
+      .options(readOpts)
+      .load(basePath)
+    assertEquals(expectedRecordCount2, hudiSnapshotDF2.count())
+
+    // querying subset of column. even if not including _hoodie_is_deleted, snapshot read should return right data.
+    assertEquals(expectedRecordCount2, spark.read.format("hudi")
+      .options(readOpts).load(basePath).select("_hoodie_record_key", "_hoodie_partition_path").count())
+
+    // ingest batch3 with mix of updates and deletes. some of them are updating same partition, some of them are moving to new partition.
+    // some are having higher ts and some are having lower ts.
+    ingestNewBatch(tableType, 200, structType, inserts.subList(200, 400), writeOpts)
+
+    val expectedRecordCount3 = if (mergeMode == RecordMergeMode.EVENT_TIME_ORDERING) 300 else 200;
+    val hudiSnapshotDF3 = spark.read.format("hudi")
+      .options(readOpts)
+      .load(basePath)
+    assertEquals(expectedRecordCount3, hudiSnapshotDF3.count())
+
+    // querying subset of column. even if not including _hoodie_is_deleted, snapshot read should return right data.
+    assertEquals(expectedRecordCount3, spark.read.format("hudi")
+      .options(readOpts).load(basePath).select("_hoodie_record_key", "_hoodie_partition_path").count())
+  }
+
+  @ParameterizedTest
+  @CsvSource(value = Array(
+    "8,EVENT_TIME_ORDERING",
+    "8,COMMIT_TIME_ORDERING",
+    "8,CUSTOM",
+    "9,EVENT_TIME_ORDERING",
+    "9,COMMIT_TIME_ORDERING",
+    "9,CUSTOM"))
+  def testImmutabilityOfMergeConfigs(tableVersion: Int,
+                                     mergeMode: RecordMergeMode): Unit = {
+    var (writeOpts, readOpts) = getWriterReaderOpts(HoodieRecordType.AVRO)
+    val payloadClass = if (mergeMode == RecordMergeMode.EVENT_TIME_ORDERING) {
+      classOf[DefaultHoodieRecordPayload].getName
+    } else if (mergeMode == RecordMergeMode.COMMIT_TIME_ORDERING) {
+      classOf[OverwriteWithLatestAvroPayload].getName
+    } else {
+      classOf[CustomPayloadForTesting].getName
+    }
+    val strategyId = if (mergeMode == RecordMergeMode.EVENT_TIME_ORDERING) {
+      HoodieRecordMerger.EVENT_TIME_BASED_MERGE_STRATEGY_UUID
+    } else if (mergeMode == RecordMergeMode.COMMIT_TIME_ORDERING) {
+      HoodieRecordMerger.COMMIT_TIME_BASED_MERGE_STRATEGY_UUID
+    } else {
+      HoodieRecordMerger.PAYLOAD_BASED_MERGE_STRATEGY_UUID
+    }
+    writeOpts = writeOpts ++ Map(
+      DataSourceWriteOptions.TABLE_TYPE.key -> "COPY_ON_WRITE",
+      HoodieWriteConfig.WRITE_TABLE_VERSION.key -> tableVersion.toString,
+      HoodieWriteConfig.AUTO_UPGRADE_VERSION.key -> "false",
+      HoodieWriteConfig.WRITE_PAYLOAD_CLASS_NAME.key -> payloadClass,
+      HoodieTableConfig.ORDERING_FIELDS.key -> "ts",
+      HoodieWriteConfig.RECORD_MERGE_MODE.key -> mergeMode.name())
+
+    // generate the inserts
+    val schema = DataSourceTestUtils.getStructTypeExampleSchema
+    val structType = HoodieSchemaConversionUtils.convertHoodieSchemaToStructType(schema)
+    val inserts = DataSourceTestUtils.generateRandomRows(400)
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(
+      convertRowListToSeq(inserts)), structType)
+
+    // Do insert.
+    df.write.format("hudi")
+      .options(writeOpts)
+      .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
+      .mode(SaveMode.Overwrite)
+      .save(basePath)
+    // Validate data quality.
+    val readDf = spark.read.format("hudi")
+      .options(readOpts)
+      .load(basePath)
+    assertEquals(400, readDf.count())
+    // Validate table configs.
+    val metaClient = HoodieTableMetaClient.builder().setBasePath(basePath).setConf(storageConf).build()
+    assertEquals(tableVersion, metaClient.getTableConfig.getTableVersion.versionCode())
+    assertEquals(mergeMode, metaClient.getTableConfig.getRecordMergeMode)
+    if (tableVersion < 9) {
+      assertEquals(strategyId, metaClient.getTableConfig.getRecordMergeStrategyId)
+    }
+
+    val df1 = df.limit(1)
+    val diffMergeMode = if (mergeMode == RecordMergeMode.EVENT_TIME_ORDERING) {
+      RecordMergeMode.COMMIT_TIME_ORDERING
+    } else {
+      RecordMergeMode.EVENT_TIME_ORDERING
+    }
+    if (tableVersion < 9) {
+      df1.write.format("hudi")
+        .option(HoodieWriteConfig.RECORD_MERGE_MODE.key, diffMergeMode.name)
+        .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL)
+        .option(HoodieWriteConfig.AUTO_UPGRADE_VERSION.key, "false")
+        .mode(SaveMode.Append)
+        .save(basePath)
+      val finalDf = spark.read.format("hudi")
+        .options(readOpts)
+        .load(basePath)
+      df1.write.format("hudi")
+        .option(HoodieWriteConfig.WRITE_PAYLOAD_CLASS_NAME.key, classOf[EventTimeAvroPayload].getName)
+        .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL)
+        .option(HoodieWriteConfig.AUTO_UPGRADE_VERSION.key, "false")
+        .mode(SaveMode.Append)
+        .save(basePath)
+      df1.write.format("hudi")
+        .option(HoodieWriteConfig.RECORD_MERGE_STRATEGY_ID.key, classOf[EventTimeAvroPayload].getName)
+        .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL)
+        .option(HoodieWriteConfig.AUTO_UPGRADE_VERSION.key, "false")
+        .mode(SaveMode.Append)
+        .save(basePath)
+      assertEquals(399, finalDf.count())
+    } else {
+      Assertions.assertThrows(classOf[HoodieException], () => {
+        df1.write.format("hudi")
+          .option(HoodieWriteConfig.RECORD_MERGE_MODE.key, diffMergeMode.name)
+          .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL)
+          .option(HoodieWriteConfig.AUTO_UPGRADE_VERSION.key, "false")
+          .mode(SaveMode.Append)
+          .save(basePath)
+      })
+      if (mergeMode != RecordMergeMode.CUSTOM) {
+        Assertions.assertDoesNotThrow(
+          new Executable {
+            override def execute(): Unit = {
+              df1.write.format("hudi")
+                .option(HoodieWriteConfig.WRITE_PAYLOAD_CLASS_NAME.key, classOf[EventTimeAvroPayload].getName)
+                .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL)
+                .option(HoodieWriteConfig.AUTO_UPGRADE_VERSION.key, "false")
+                .mode(SaveMode.Append)
+                .save(basePath)
+            }
+          }
+        )
+      } else {
+        Assertions.assertThrows(classOf[HoodieException], () => {
+          df1.write.format("hudi")
+          .option(HoodieWriteConfig.WRITE_PAYLOAD_CLASS_NAME.key, classOf[EventTimeAvroPayload].getName)
+          .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL)
+          .option(HoodieWriteConfig.AUTO_UPGRADE_VERSION.key, "false")
+          .mode(SaveMode.Append)
+          .save(basePath)
+        })
+      }
+      Assertions.assertThrows(classOf[HoodieException], () => {
+        df1.write.format("hudi")
+          .option(HoodieWriteConfig.RECORD_MERGE_STRATEGY_ID.key, HoodieRecordMerger.CUSTOM_MERGE_STRATEGY_UUID)
+          .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL)
+          .option(HoodieWriteConfig.AUTO_UPGRADE_VERSION.key, "false")
+          .mode(SaveMode.Append)
+          .save(basePath)
+      })
+    }
+  }
+
+  def ingestNewBatch(tableType: HoodieTableType, recordsToUpdate: Integer, structType: StructType, inserts: java.util.List[Row],
+                     writeOpts: Map[String, String]): Unit = {
+    val toUpdate = sqlContext.createDataFrame(DataSourceTestUtils.getUniqueRows(inserts, recordsToUpdate), structType).collectAsList()
+
+    val updateToSamePartitionHigherTs = sqlContext.createDataFrame(toUpdate.subList(0, recordsToUpdate / 4), structType)
+    val rowsToUpdate1 = DataSourceTestUtils.updateRowsWithUpdatedTs(updateToSamePartitionHigherTs)
+    val updates1 = rowsToUpdate1.subList(0, recordsToUpdate / 8)
+    val updateDf1 = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(updates1)), structType)
+    val deletes1 = rowsToUpdate1.subList(recordsToUpdate / 8, recordsToUpdate / 4)
+    val deleteDf1 = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(deletes1)), structType)
+    val batch1 = deleteDf1.withColumn("_hoodie_is_deleted", lit(true)).union(updateDf1)
+    batch1.cache()
+
+    val updateToDiffPartitionHigherTs = sqlContext.createDataFrame(toUpdate.subList(recordsToUpdate / 4, recordsToUpdate / 2), structType)
+    val rowsToUpdate2 = DataSourceTestUtils.updateRowsWithUpdatedTs(updateToDiffPartitionHigherTs, false, true)
+    val updates2 = rowsToUpdate2.subList(0, recordsToUpdate / 8)
+    val updateDf2 = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(updates2)), structType)
+    val deletes2 = rowsToUpdate2.subList(recordsToUpdate / 8, recordsToUpdate / 4)
+    val deleteDf2 = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(deletes2)), structType)
+    val batch2 = deleteDf2.withColumn("_hoodie_is_deleted", lit(true)).union(updateDf2)
+    batch2.cache()
+
+    val updateToSamePartitionLowerTs = sqlContext.createDataFrame(toUpdate.subList(recordsToUpdate / 2, recordsToUpdate * 3 / 4), structType)
+    val rowsToUpdate3 = DataSourceTestUtils.updateRowsWithUpdatedTs(updateToSamePartitionLowerTs, true, false)
+    val updates3 = rowsToUpdate3.subList(0, recordsToUpdate / 8)
+    val updateDf3 = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(updates3)), structType)
+    val deletes3 = rowsToUpdate3.subList(recordsToUpdate / 8, recordsToUpdate / 4)
+    val deleteDf3 = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(deletes3)), structType)
+    val batch3 = deleteDf3.withColumn("_hoodie_is_deleted", lit(true)).union(updateDf3)
+    batch3.cache()
+
+    val updateToDiffPartitionLowerTs = sqlContext.createDataFrame(toUpdate.subList(recordsToUpdate * 3 / 4, recordsToUpdate), structType)
+    val rowsToUpdate4 = DataSourceTestUtils.updateRowsWithUpdatedTs(updateToDiffPartitionLowerTs, true, true)
+    val updates4 = rowsToUpdate4.subList(0, recordsToUpdate / 8)
+    val updateDf4 = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(updates4)), structType)
+    val deletes4 = rowsToUpdate4.subList(recordsToUpdate / 8, recordsToUpdate / 4)
+    val deleteDf4 = spark.createDataFrame(spark.sparkContext.parallelize(convertRowListToSeq(deletes4)), structType)
+    val batch4 = deleteDf4.withColumn("_hoodie_is_deleted", lit(true)).union(updateDf4)
+    batch4.cache()
+
+    batch1.union(batch2).union(batch3).union(batch4).write.format("hudi")
+      .options(writeOpts)
+      .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.UPSERT_OPERATION_OPT_VAL)
+      .option(DataSourceWriteOptions.TABLE_TYPE.key, tableType.name())
+      .mode(SaveMode.Append)
+      .save(basePath)
+  }
+
   def compareUpdateDfWithHudiDf(inputDf: Dataset[Row], hudiDf: Dataset[Row], beforeRows: List[Row], colsToCompare: String): Unit = {
     val hudiWithoutMetaDf = hudiDf.drop(HoodieRecord.RECORD_KEY_METADATA_FIELD, HoodieRecord.PARTITION_PATH_METADATA_FIELD, HoodieRecord.COMMIT_SEQNO_METADATA_FIELD, HoodieRecord.COMMIT_TIME_METADATA_FIELD, HoodieRecord.FILENAME_METADATA_FIELD)
     hudiWithoutMetaDf.registerTempTable("hudiTbl")
     inputDf.registerTempTable("inputTbl")
-    val beforeDf = spark.createDataFrame(beforeRows, hudiDf.schema)
+    val beforeDf = spark.createDataFrame(beforeRows.asJava, hudiDf.schema)
     beforeDf.registerTempTable("beforeTbl")
     val hudiDfToCompare = spark.sqlContext.sql("select " + colsToCompare + " from hudiTbl")
     val inputDfToCompare = spark.sqlContext.sql("select " + colsToCompare + " from inputTbl")
@@ -309,7 +574,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
   }
 
   def compareEntireInputRowsWithHudiDf(inputRows: List[Row], hudiDf: Dataset[Row], colsToCompare: String): Unit = {
-    val inputDf = spark.createDataFrame(inputRows, hudiDf.schema)
+    val inputDf = spark.createDataFrame(inputRows.asJava, hudiDf.schema)
     compareEntireInputDfWithHudiDf(inputDf, hudiDf, colsToCompare)
   }
 
@@ -354,4 +619,7 @@ class TestSparkDataSource extends SparkClientFunctionalTestHarness {
     assertEquals(hudiDf1ToCompare.count, hudiDf1ToCompare.intersect(hudiDf2ToCompare).count)
     assertEquals(0, hudiDf1ToCompare.except(hudiDf2ToCompare).count)
   }
+
+  def convertRowListToSeq(inputList: java.util.List[Row]): Seq[Row] =
+    asScalaIteratorConverter(inputList.iterator).asScala.toSeq
 }

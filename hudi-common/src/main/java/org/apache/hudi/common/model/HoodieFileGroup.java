@@ -24,20 +24,26 @@ import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.VisibleForTesting;
 
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.ToString;
+
 import java.io.Serializable;
 import java.util.Comparator;
 import java.util.List;
 import java.util.TreeMap;
 import java.util.stream.Stream;
 
-import static org.apache.hudi.common.table.timeline.HoodieTimeline.GREATER_THAN_OR_EQUALS;
-import static org.apache.hudi.common.table.timeline.HoodieTimeline.LESSER_THAN;
-import static org.apache.hudi.common.table.timeline.HoodieTimeline.LESSER_THAN_OR_EQUALS;
-import static org.apache.hudi.common.table.timeline.HoodieTimeline.compareTimestamps;
+import static org.apache.hudi.common.table.timeline.InstantComparison.GREATER_THAN_OR_EQUALS;
+import static org.apache.hudi.common.table.timeline.InstantComparison.LESSER_THAN;
+import static org.apache.hudi.common.table.timeline.InstantComparison.LESSER_THAN_OR_EQUALS;
+import static org.apache.hudi.common.table.timeline.InstantComparison.compareTimestamps;
 
 /**
  * A set of data/base files + set of log files, that make up a unit for all operations.
  */
+@EqualsAndHashCode
+@ToString
 public class HoodieFileGroup implements Serializable {
 
   public static Comparator<String> getReverseCommitTimeComparator() {
@@ -47,6 +53,7 @@ public class HoodieFileGroup implements Serializable {
   /**
    * file group id.
    */
+  @Getter
   private final HoodieFileGroupId fileGroupId;
 
   /**
@@ -57,6 +64,9 @@ public class HoodieFileGroup implements Serializable {
   /**
    * Timeline, based on which all getter work.
    */
+  @Getter
+  @EqualsAndHashCode.Exclude
+  @ToString.Exclude
   private final HoodieTimeline timeline;
 
   /**
@@ -125,7 +135,7 @@ public class HoodieFileGroup implements Serializable {
     if (completionTimeOpt.isPresent()) {
       for (String commitTime : fileSlices.keySet()) {
         // find the largest commit time that is smaller than the log delta commit completion time
-        if (HoodieTimeline.compareTimestamps(completionTimeOpt.get(), GREATER_THAN_OR_EQUALS, commitTime)) {
+        if (compareTimestamps(completionTimeOpt.get(), GREATER_THAN_OR_EQUALS, commitTime)) {
           return commitTime;
         }
       }
@@ -141,16 +151,12 @@ public class HoodieFileGroup implements Serializable {
     return fileGroupId.getPartitionPath();
   }
 
-  public HoodieFileGroupId getFileGroupId() {
-    return fileGroupId;
-  }
-
   /**
    * A FileSlice is considered committed, if one of the following is true - There is a committed data file - There are
    * some log files, that are based off a commit or delta commit.
    */
   private boolean isFileSliceCommitted(FileSlice slice) {
-    if (!compareTimestamps(slice.getBaseInstantTime(), LESSER_THAN_OR_EQUALS, lastInstant.get().getTimestamp())) {
+    if (!compareTimestamps(slice.getBaseInstantTime(), LESSER_THAN_OR_EQUALS, lastInstant.get().requestedTime())) {
       return false;
     }
 
@@ -182,7 +188,7 @@ public class HoodieFileGroup implements Serializable {
   }
 
   public Stream<FileSlice> getAllFileSlicesBeforeOn(String maxInstantTime) {
-    return fileSlices.values().stream().filter(slice -> compareTimestamps(slice.getBaseInstantTime(), LESSER_THAN_OR_EQUALS, maxInstantTime));
+    return getAllFileSlices().filter(slice -> compareTimestamps(slice.getBaseInstantTime(), LESSER_THAN_OR_EQUALS, maxInstantTime));
   }
 
   /**
@@ -233,25 +239,11 @@ public class HoodieFileGroup implements Serializable {
     return getAllFileSlices().filter(slice -> slice.getBaseFile().isPresent()).map(slice -> slice.getBaseFile().get());
   }
 
-  @Override
-  public String toString() {
-    final StringBuilder sb = new StringBuilder("HoodieFileGroup {");
-    sb.append("id=").append(fileGroupId);
-    sb.append(", fileSlices='").append(fileSlices).append('\'');
-    sb.append(", lastInstant='").append(lastInstant).append('\'');
-    sb.append('}');
-    return sb.toString();
-  }
-
   public void addFileSlice(FileSlice slice) {
     fileSlices.put(slice.getBaseInstantTime(), slice);
   }
 
   public Stream<FileSlice> getAllRawFileSlices() {
     return fileSlices.values().stream();
-  }
-
-  public HoodieTimeline getTimeline() {
-    return timeline;
   }
 }

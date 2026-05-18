@@ -18,25 +18,26 @@
 
 package org.apache.hudi.functional
 
+import org.apache.hudi.{DataSourceReadOptions, DataSourceWriteOptions}
 import org.apache.hudi.HoodieFileIndex.DataSkippingFailureMode
 import org.apache.hudi.common.config.HoodieMetadataConfig
-import org.apache.hudi.common.table.HoodieTableMetaClient
+import org.apache.hudi.common.table.HoodieTableConfig
 import org.apache.hudi.common.table.timeline.{HoodieInstant, HoodieTimeline}
-import org.apache.hudi.common.testutils.RawTripTestPayload.recordsToStrings
+import org.apache.hudi.common.testutils.HoodieTestDataGenerator.recordsToStrings
 import org.apache.hudi.config.{HoodieClusteringConfig, HoodieWriteConfig}
 import org.apache.hudi.testutils.HoodieSparkClientTestBase
-import org.apache.hudi.{DataSourceReadOptions, DataSourceWriteOptions}
+
 import org.apache.spark.sql._
 import org.apache.spark.sql.types._
-import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Tag}
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.params.ParameterizedTest
-import org.junit.jupiter.params.provider.Arguments.arguments
 import org.junit.jupiter.params.provider.{Arguments, MethodSource}
+import org.junit.jupiter.params.provider.Arguments.arguments
 
-import scala.collection.JavaConversions._
+import scala.collection.JavaConverters._
 
-@Tag("functional")
+@Tag("functional-c")
 class TestLayoutOptimization extends HoodieSparkClientTestBase {
   var spark: SparkSession = _
 
@@ -62,7 +63,7 @@ class TestLayoutOptimization extends HoodieSparkClientTestBase {
     "hoodie.bulkinsert.shuffle.parallelism" -> "4",
     DataSourceWriteOptions.RECORDKEY_FIELD.key() -> "_row_key",
     DataSourceWriteOptions.PARTITIONPATH_FIELD.key() -> "partition",
-    DataSourceWriteOptions.PRECOMBINE_FIELD.key() -> "timestamp",
+    HoodieTableConfig.ORDERING_FIELDS.key() -> "timestamp",
     HoodieWriteConfig.TBL_NAME.key -> "hoodie_test"
   ) ++ metadataOpts
 
@@ -72,7 +73,7 @@ class TestLayoutOptimization extends HoodieSparkClientTestBase {
     initSparkContexts()
     spark = sqlContext.sparkSession
     initTestDataGenerator()
-    initFileSystem()
+    initHoodieStorage()
   }
 
   @AfterEach
@@ -94,7 +95,7 @@ class TestLayoutOptimization extends HoodieSparkClientTestBase {
 
     val targetRecordsCount = 10000
     // Bulk Insert Operation
-    val records = recordsToStrings(dataGen.generateInserts("001", targetRecordsCount)).toList
+    val records = recordsToStrings(dataGen.generateInserts("001", targetRecordsCount)).asScala.toList
     val writeDf: Dataset[Row] = spark.read.json(spark.sparkContext.parallelize(records, 2))
 
     // If there are any failures in the Data Skipping flow, test should fail
@@ -119,11 +120,7 @@ class TestLayoutOptimization extends HoodieSparkClientTestBase {
       .mode(SaveMode.Overwrite)
       .save(basePath)
 
-    val hudiMetaClient = HoodieTableMetaClient.builder
-      .setConf(hadoopConf)
-      .setBasePath(basePath)
-      .setLoadActiveTimelineOnLoad(true)
-      .build
+    val hudiMetaClient = createMetaClient(basePath)
 
     val lastCommit = hudiMetaClient.getActiveTimeline.getAllCommitsTimeline.lastInstant().get()
 

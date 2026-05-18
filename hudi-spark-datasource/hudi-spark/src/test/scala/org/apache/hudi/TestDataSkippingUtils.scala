@@ -18,7 +18,10 @@
 package org.apache.hudi
 
 import org.apache.hudi.ColumnStatsIndexSupport.composeIndexSchema
+import org.apache.hudi.SparkAdapterSupport.sparkAdapter
 import org.apache.hudi.testutils.HoodieSparkClientTestBase
+
+import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.HoodieCatalystExpressionUtils.resolveExpr
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.encoders.DummyExpressionHolder
@@ -30,14 +33,14 @@ import org.apache.spark.sql.functions.{col, lower}
 import org.apache.spark.sql.hudi.DataSkippingUtils
 import org.apache.spark.sql.internal.SQLConf.SESSION_LOCAL_TIMEZONE
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.{Column, HoodieCatalystExpressionUtils, Row, SparkSession}
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.params.ParameterizedTest
-import org.junit.jupiter.params.provider.Arguments.arguments
 import org.junit.jupiter.params.provider.{Arguments, MethodSource}
+import org.junit.jupiter.params.provider.Arguments.arguments
 
 import java.sql.Timestamp
+
 import scala.collection.JavaConverters._
 import scala.collection.immutable.HashSet
 
@@ -83,7 +86,7 @@ class TestDataSkippingUtils extends HoodieSparkClientTestBase with SparkAdapterS
       )
     )
 
-  val (indexSchema: StructType, targetIndexedColumns:  Seq[String]) = composeIndexSchema(indexedCols, indexedCols.toSet, sourceTableSchema)
+  val (indexSchema: StructType, targetIndexedColumns:  Seq[String]) = composeIndexSchema(indexedCols, indexedCols, sourceTableSchema)
 
   @ParameterizedTest
   @MethodSource(Array(
@@ -123,14 +126,14 @@ class TestDataSkippingUtils extends HoodieSparkClientTestBase with SparkAdapterS
   @MethodSource(Array("testStringsLookupFilterExpressionsSource"))
   def testStringsLookupFilterExpressions(sourceExpr: Expression, input: Seq[IndexRow], output: Seq[String]): Unit = {
     val resolvedExpr = resolveExpr(spark, sourceExpr, sourceTableSchema)
-    val lookupFilter = DataSkippingUtils.translateIntoColumnStatsIndexFilterExpr(resolvedExpr, indexSchema)
+    val lookupFilter = DataSkippingUtils.translateIntoColumnStatsIndexFilterExpr(resolvedExpr, indexedCols = indexedCols)
 
-    val spark2 = spark
-    import spark2.implicits._
+    val sparkB = spark
+    import sparkB.implicits._
 
     val indexDf = spark.createDataset(input)
 
-    val rows = indexDf.where(new Column(lookupFilter))
+    val rows = indexDf.where(sparkAdapter.createColumnFromExpression(lookupFilter))
       .select("fileName")
       .collect()
       .map(_.getString(0))
@@ -153,11 +156,11 @@ class TestDataSkippingUtils extends HoodieSparkClientTestBase with SparkAdapterS
   }
 
   private def applyFilterExpr(resolvedExpr: Expression, input: Seq[IndexRow]): Seq[String] = {
-    val lookupFilter = DataSkippingUtils.translateIntoColumnStatsIndexFilterExpr(resolvedExpr, indexSchema)
+    val lookupFilter = DataSkippingUtils.translateIntoColumnStatsIndexFilterExpr(resolvedExpr, indexedCols = indexedCols)
 
     val indexDf = spark.createDataFrame(input.map(_.toRow).asJava, indexSchema)
 
-    indexDf.where(new Column(lookupFilter))
+    indexDf.where(sparkAdapter.createColumnFromExpression(lookupFilter))
       .select("fileName")
       .collect()
       .map(_.getString(0))
@@ -169,7 +172,7 @@ object TestDataSkippingUtils {
   def testStringsLookupFilterExpressionsSource(): java.util.stream.Stream[Arguments] = {
     java.util.stream.Stream.of(
       arguments(
-        col("B").startsWith("abc").expr,
+        sparkAdapter.getExpressionFromColumn(col("B").startsWith("abc")),
         Seq(
           IndexRow("file_1", valueCount = 1, B_minValue = "aba", B_maxValue = "adf", B_nullCount = 1), // may contain strings starting w/ "abc"
           IndexRow("file_2", valueCount = 1, B_minValue = "adf", B_maxValue = "azy", B_nullCount = 0),
@@ -177,7 +180,7 @@ object TestDataSkippingUtils {
         ),
         Seq("file_1")),
       arguments(
-        Not(col("B").startsWith("abc").expr),
+        Not(sparkAdapter.getExpressionFromColumn(col("B").startsWith("abc"))),
         Seq(
           IndexRow("file_1", valueCount = 1, B_minValue = "aba", B_maxValue = "adf", B_nullCount = 1), // may contain strings starting w/ "abc"
           IndexRow("file_2", valueCount = 1, B_minValue = "adf", B_maxValue = "azy", B_nullCount = 0),
@@ -187,7 +190,7 @@ object TestDataSkippingUtils {
         Seq("file_1", "file_2", "file_3")),
       arguments(
         // Composite expression
-        Not(lower(col("B")).startsWith("abc").expr),
+        Not(sparkAdapter.getExpressionFromColumn(lower(col("B")).startsWith("abc"))),
         Seq(
           IndexRow("file_1", valueCount = 1, B_minValue = "ABA", B_maxValue = "ADF", B_nullCount = 1), // may contain strings starting w/ "ABC" (after upper)
           IndexRow("file_2", valueCount = 1, B_minValue = "ADF", B_maxValue = "AZY", B_nullCount = 0),

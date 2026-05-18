@@ -18,19 +18,27 @@
 
 package org.apache.hudi.io.storage.row;
 
-import org.apache.hadoop.fs.Path;
 import org.apache.hudi.common.bloom.BloomFilter;
 import org.apache.hudi.common.bloom.BloomFilterFactory;
+import org.apache.hudi.common.config.HoodieParquetConfig;
+import org.apache.hudi.common.config.HoodieStorageConfig;
+import org.apache.hudi.common.engine.LocalTaskContextSupplier;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.config.HoodieWriteConfig;
-import org.apache.hudi.io.storage.HoodieParquetConfig;
+import org.apache.hudi.io.storage.HoodieSparkLanceWriter;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.hadoop.HadoopStorageConfiguration;
 import org.apache.hudi.table.HoodieTable;
+
+import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
 
+import static org.apache.hudi.common.model.HoodieFileFormat.LANCE;
 import static org.apache.hudi.common.model.HoodieFileFormat.PARQUET;
+import static org.apache.hudi.common.util.ParquetUtils.getCompressionCodecName;
 
 /**
  * Factory to assist in instantiating a new {@link HoodieInternalRowFileWriter}.
@@ -47,7 +55,7 @@ public class HoodieInternalRowFileWriterFactory {
    * @throws IOException if format is not supported or if any exception during instantiating the RowFileWriter.
    *
    */
-  public static HoodieInternalRowFileWriter getInternalRowFileWriter(Path path,
+  public static HoodieInternalRowFileWriter getInternalRowFileWriter(StoragePath path,
                                                                      HoodieTable hoodieTable,
                                                                      HoodieWriteConfig writeConfig,
                                                                      StructType schema)
@@ -55,32 +63,55 @@ public class HoodieInternalRowFileWriterFactory {
     final String extension = FSUtils.getFileExtension(path.getName());
     if (PARQUET.getFileExtension().equals(extension)) {
       return newParquetInternalRowFileWriter(path, hoodieTable, writeConfig, schema, tryInstantiateBloomFilter(writeConfig));
+    } else if (LANCE.getFileExtension().equals(extension)) {
+      long maxFileSize = writeConfig.getLongOrDefault(HoodieStorageConfig.LANCE_MAX_FILE_SIZE);
+      long allocatorSize = writeConfig.getLongOrDefault(HoodieStorageConfig.LANCE_WRITE_ALLOCATOR_SIZE_BYTES);
+      long flushByteWatermark = writeConfig.getLongOrDefault(HoodieStorageConfig.LANCE_WRITE_FLUSH_BYTE_WATERMARK);
+      return newLanceInternalRowFileWriter(path, hoodieTable, schema, maxFileSize, allocatorSize, flushByteWatermark);
     }
     throw new UnsupportedOperationException(extension + " format not supported yet.");
   }
 
-  private static HoodieInternalRowFileWriter newParquetInternalRowFileWriter(Path path,
+  private static HoodieInternalRowFileWriter newParquetInternalRowFileWriter(StoragePath path,
                                                                              HoodieTable table,
                                                                              HoodieWriteConfig writeConfig,
                                                                              StructType structType,
                                                                              Option<BloomFilter> bloomFilterOpt
   )
       throws IOException {
-    HoodieRowParquetWriteSupport writeSupport =
-            new HoodieRowParquetWriteSupport(table.getHadoopConf(), structType, bloomFilterOpt, writeConfig.getStorageConfig());
+    HoodieRowParquetWriteSupport writeSupport = HoodieRowParquetWriteSupport
+        .getHoodieRowParquetWriteSupport((Configuration) table.getStorageConf().unwrap(), structType, bloomFilterOpt, writeConfig);
 
     return new HoodieInternalRowParquetWriter(
         path,
         new HoodieParquetConfig<>(
             writeSupport,
-            writeConfig.getParquetCompressionCodec(),
+            getCompressionCodecName(writeConfig.getParquetCompressionCodec()),
             writeConfig.getParquetBlockSize(),
             writeConfig.getParquetPageSize(),
             writeConfig.getParquetMaxFileSize(),
-            writeSupport.getHadoopConf(),
+            new HadoopStorageConfiguration(writeSupport.getHadoopConf()),
             writeConfig.getParquetCompressionRatio(),
             writeConfig.parquetDictionaryEnabled()
         ));
+  }
+
+  private static HoodieInternalRowFileWriter newLanceInternalRowFileWriter(StoragePath path,
+                                                                           HoodieTable table,
+                                                                           StructType structType,
+                                                                           long maxFileSize,
+                                                                           long allocatorSize,
+                                                                           long flushByteWatermark)
+      throws IOException {
+    return HoodieSparkLanceWriter.builder()
+        .file(path)
+        .sparkSchema(structType)
+        .taskContextSupplier(new LocalTaskContextSupplier())
+        .storage(table.getStorage())
+        .maxFileSize(maxFileSize)
+        .allocatorSize(allocatorSize)
+        .flushByteWatermark(flushByteWatermark)
+        .build();
   }
 
   private static Option<BloomFilter> tryInstantiateBloomFilter(HoodieWriteConfig writeConfig) {

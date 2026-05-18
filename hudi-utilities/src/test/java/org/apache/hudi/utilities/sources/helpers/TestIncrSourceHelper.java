@@ -19,13 +19,17 @@
 package org.apache.hudi.utilities.sources.helpers;
 
 import org.apache.hudi.client.SparkRDDWriteClient;
+import org.apache.hudi.client.WriteClientTestUtils;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
 import org.apache.hudi.common.model.HoodieAvroPayload;
 import org.apache.hudi.common.model.HoodieAvroRecord;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.schema.HoodieSchemaField;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.checkpoint.StreamerCheckpointV1;
 import org.apache.hudi.common.table.timeline.TimelineUtils;
 import org.apache.hudi.common.table.timeline.versioning.TimelineLayoutVersion;
 import org.apache.hudi.common.testutils.SchemaTestUtil;
@@ -40,7 +44,6 @@ import org.apache.hudi.utilities.sources.TestS3EventsHoodieIncrSource;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.spark.api.java.JavaRDD;
@@ -60,7 +63,6 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.apache.hudi.DataSourceReadOptions.QUERY_TYPE_INCREMENTAL_OPT_VAL;
-import static org.apache.hudi.common.table.timeline.HoodieTimeline.INIT_INSTANT_TS;
 import static org.apache.hudi.testutils.Assertions.assertNoWriteErrors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -71,13 +73,13 @@ class TestIncrSourceHelper extends SparkClientFunctionalTestHarness {
   private JavaSparkContext jsc;
   private HoodieTableMetaClient metaClient;
 
-  private static final Schema S3_METADATA_SCHEMA = SchemaTestUtil.getSchemaFromResource(
+  private static final HoodieSchema S3_METADATA_SCHEMA = SchemaTestUtil.getSchemaFromResource(
       TestS3EventsHoodieIncrSource.class, "/streamer-config/s3-metadata.avsc", true);
 
   @BeforeEach
   public void setUp() throws IOException {
     jsc = JavaSparkContext.fromSparkContext(spark().sparkContext());
-    metaClient = getHoodieMetaClient(hadoopConf(), basePath());
+    metaClient = getHoodieMetaClient(storageConf(), basePath());
   }
 
   private String generateS3EventMetadata(Long objectSize, String bucketName, String objectKey, String commitTime)
@@ -122,7 +124,7 @@ class TestIncrSourceHelper extends SparkClientFunctionalTestHarness {
         "s3.object.key", "s3.object.size");
     Pair<CloudObjectIncrCheckpoint, Option<Dataset<Row>>> result = IncrSourceHelper.filterAndGenerateCheckpointBasedOnSourceLimit(
         emptyDataset, 50L, queryInfo, new CloudObjectIncrCheckpoint(null, null));
-    assertEquals(INIT_INSTANT_TS, result.getKey().toString());
+    assertEquals("commit2", result.getKey().toString());
     assertTrue(!result.getRight().isPresent());
   }
 
@@ -261,8 +263,10 @@ class TestIncrSourceHelper extends SparkClientFunctionalTestHarness {
     filePathSizeAndCommitTime.add(Triple.of("path/to/file8.json", 100L, "commit3"));
     filePathSizeAndCommitTime.add(Triple.of("path/to/file6.json", 250L, "commit3"));
     filePathSizeAndCommitTime.add(Triple.of("path/to/file7.json", 50L, "commit3"));
+    filePathSizeAndCommitTime.add(Triple.of("path/to/file8.json", 50L, "commit3"));
     Dataset<Row> inputDs = generateDataset(filePathSizeAndCommitTime);
 
+    // Test case 1 when queryInfo.endInstant() is equal to lastCheckpointCommit
     QueryInfo queryInfo = new QueryInfo(
         QUERY_TYPE_INCREMENTAL_OPT_VAL(), "commit1", "commit1",
         "commit3", "_hoodie_commit_time",
@@ -271,26 +275,35 @@ class TestIncrSourceHelper extends SparkClientFunctionalTestHarness {
         inputDs, 1500L, queryInfo, new CloudObjectIncrCheckpoint("commit3", "path/to/file8.json"));
     assertEquals("commit3#path/to/file8.json", result.getKey().toString());
     assertTrue(!result.getRight().isPresent());
+    // Test case 2 when queryInfo.endInstant() is greater than lastCheckpointCommit
+    queryInfo = new QueryInfo(
+        QUERY_TYPE_INCREMENTAL_OPT_VAL(), "commit1", "commit1",
+        "commit4", "_hoodie_commit_time",
+        "s3.object.key", "s3.object.size");
+    result = IncrSourceHelper.filterAndGenerateCheckpointBasedOnSourceLimit(
+        inputDs, 1500L, queryInfo, new CloudObjectIncrCheckpoint("commit3","path/to/file8.json"));
+    assertEquals("commit4", result.getKey().toString());
+    assertTrue(!result.getRight().isPresent());
   }
 
   private HoodieRecord generateS3EventMetadata(String commitTime, String bucketName, String objectKey, Long objectSize) {
     String partitionPath = bucketName;
-    Schema schema = S3_METADATA_SCHEMA;
-    GenericRecord rec = new GenericData.Record(schema);
-    Schema.Field s3Field = schema.getField("s3");
-    Schema s3Schema = s3Field.schema().getTypes().get(1); // Assuming the record schema is the second type
+    HoodieSchema schema = S3_METADATA_SCHEMA;
+    GenericRecord rec = new GenericData.Record(schema.toAvroSchema());
+    HoodieSchemaField s3Field = schema.getField("s3").get();
+    HoodieSchema s3Schema = s3Field.schema().getTypes().get(1); // Assuming the record schema is the second type
     // Create a generic record for the "s3" field
-    GenericRecord s3Record = new GenericData.Record(s3Schema);
+    GenericRecord s3Record = new GenericData.Record(s3Schema.toAvroSchema());
 
-    Schema.Field s3BucketField = s3Schema.getField("bucket");
-    Schema s3Bucket = s3BucketField.schema().getTypes().get(1); // Assuming the record schema is the second type
-    GenericRecord s3BucketRec = new GenericData.Record(s3Bucket);
+    HoodieSchemaField s3BucketField = s3Schema.getField("bucket").get();
+    HoodieSchema s3Bucket = s3BucketField.schema().getTypes().get(1); // Assuming the record schema is the second type
+    GenericRecord s3BucketRec = new GenericData.Record(s3Bucket.toAvroSchema());
     s3BucketRec.put("name", bucketName);
 
 
-    Schema.Field s3ObjectField = s3Schema.getField("object");
-    Schema s3Object = s3ObjectField.schema().getTypes().get(1); // Assuming the record schema is the second type
-    GenericRecord s3ObjectRec = new GenericData.Record(s3Object);
+    HoodieSchemaField s3ObjectField = s3Schema.getField("object").get();
+    HoodieSchema s3Object = s3ObjectField.schema().getTypes().get(1); // Assuming the record schema is the second type
+    GenericRecord s3ObjectRec = new GenericData.Record(s3Object.toAvroSchema());
     s3ObjectRec.put("key", objectKey);
     s3ObjectRec.put("size", objectSize);
 
@@ -327,15 +340,13 @@ class TestIncrSourceHelper extends SparkClientFunctionalTestHarness {
     HoodieWriteConfig writeConfig = getWriteConfig();
     try (SparkRDDWriteClient writeClient = getHoodieWriteClient(writeConfig)) {
 
-      writeClient.startCommitWithTime(commitTime);
+      WriteClientTestUtils.startCommitWithTime(writeClient, commitTime);
       List<HoodieRecord> s3MetadataRecords = Arrays.asList(
           generateS3EventMetadata(commitTime, "bucket-1", "data-file-1.json", 1L)
       );
-      JavaRDD<WriteStatus> result = writeClient.upsert(jsc().parallelize(s3MetadataRecords, 1), commitTime);
-
-      List<WriteStatus> statuses = result.collect();
-      assertNoWriteErrors(statuses);
-
+      List<WriteStatus> statusList = writeClient.upsert(jsc().parallelize(s3MetadataRecords, 1), commitTime).collect();
+      writeClient.commit(commitTime, jsc.parallelize(statusList));
+      assertNoWriteErrors(statusList);
       return Pair.of(commitTime, s3MetadataRecords);
     }
   }
@@ -354,15 +365,17 @@ class TestIncrSourceHelper extends SparkClientFunctionalTestHarness {
     String orderColumn = "_hoodie_commit_time";
     String keyColumn = "s3.object.key";
     String limitColumn = "s3.object.size";
-    QueryInfo queryInfo = IncrSourceHelper.generateQueryInfo(jsc, basePath(), 5, Option.of(startInstant), null,
-        TimelineUtils.HollowCommitHandling.BLOCK, orderColumn, keyColumn, limitColumn, true, Option.empty());
+    QueryInfo queryInfo = IncrSourceHelper.generateQueryInfo(jsc, basePath(), 5,
+        Option.of(new StreamerCheckpointV1(startInstant)), null,
+        TimelineUtils.HollowCommitHandling.BLOCK, orderColumn, keyColumn, limitColumn, true, Option.empty(), Option.empty());
     assertEquals(String.valueOf(Integer.parseInt(commitTimeForReads) - 1), queryInfo.getPreviousInstant());
     assertEquals(commitTimeForReads, queryInfo.getStartInstant());
     assertEquals(commitTimeForWrites, queryInfo.getEndInstant());
 
     startInstant = commitTimeForWrites;
-    queryInfo = IncrSourceHelper.generateQueryInfo(jsc, basePath(), 5, Option.of(startInstant), null,
-        TimelineUtils.HollowCommitHandling.BLOCK, orderColumn, keyColumn, limitColumn, true, Option.empty());
+    queryInfo = IncrSourceHelper.generateQueryInfo(jsc, basePath(), 5,
+        Option.of(new StreamerCheckpointV1(startInstant)), null,
+        TimelineUtils.HollowCommitHandling.BLOCK, orderColumn, keyColumn, limitColumn, true, Option.empty(), Option.empty());
     assertEquals(commitTimeForReads, queryInfo.getPreviousInstant());
     assertEquals(commitTimeForWrites, queryInfo.getStartInstant());
     assertEquals(commitTimeForWrites, queryInfo.getEndInstant());

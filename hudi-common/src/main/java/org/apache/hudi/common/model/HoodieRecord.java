@@ -18,15 +18,22 @@
 
 package org.apache.hudi.common.model;
 
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.table.read.DeleteContext;
 import org.apache.hudi.common.util.CollectionUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
+import org.apache.hudi.exception.HoodieIOException;
 import org.apache.hudi.keygen.BaseKeyGenerator;
 
 import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.KryoSerializable;
 import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 
@@ -46,6 +53,7 @@ import java.util.stream.IntStream;
 /**
  * A Single Record managed by Hoodie.
  */
+@NoArgsConstructor
 public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterface, KryoSerializable, Serializable {
 
   private static final long serialVersionUID = 3015229555587559252L;
@@ -56,7 +64,12 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
   public static final String FILENAME_METADATA_FIELD = HoodieMetadataField.FILENAME_METADATA_FIELD.getFieldName();
   public static final String OPERATION_METADATA_FIELD = HoodieMetadataField.OPERATION_METADATA_FIELD.getFieldName();
   public static final String HOODIE_IS_DELETED_FIELD = "_hoodie_is_deleted";
+  // If the ordering value is not set, this default order value is set and
+  // always treated as the commit time ordering.
+  public static final int DEFAULT_ORDERING_VALUE = 0;
 
+  @AllArgsConstructor(access = AccessLevel.PACKAGE)
+  @Getter
   public enum HoodieMetadataField {
     COMMIT_TIME_METADATA_FIELD("_hoodie_commit_time"),
     COMMIT_SEQNO_METADATA_FIELD("_hoodie_commit_seqno"),
@@ -66,14 +79,6 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
     OPERATION_METADATA_FIELD("_hoodie_operation");
 
     private final String fieldName;
-
-    HoodieMetadataField(String fieldName) {
-      this.fieldName = fieldName;
-    }
-
-    public String getFieldName() {
-      return fieldName;
-    }
   }
 
   /**
@@ -118,6 +123,7 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
   /**
    * Identifies the record across the table.
    */
+  @Getter
   protected HoodieKey key;
 
   /**
@@ -148,12 +154,17 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
   /**
    * The cdc operation.
    */
+  @Getter
   protected HoodieOperation operation;
 
   /**
    * The metaData of the record.
    */
   protected Option<Map<String, String>> metaData;
+
+  protected transient Comparable<?> orderingValue;
+
+  protected Boolean isDelete;
 
   public HoodieRecord(HoodieKey key, T data) {
     this(key, data, null, Option.empty());
@@ -167,6 +178,18 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
     this.sealed = false;
     this.ignoreIndexUpdate = false;
     this.operation = operation;
+    this.metaData = metaData;
+  }
+
+  public HoodieRecord(HoodieKey key, T data, HoodieOperation operation, Boolean isDelete, Option<Map<String, String>> metaData) {
+    this.key = key;
+    this.data = data;
+    this.currentLocation = null;
+    this.newLocation = null;
+    this.sealed = false;
+    this.ignoreIndexUpdate = false;
+    this.operation = operation;
+    this.isDelete = isDelete;
     this.metaData = metaData;
   }
 
@@ -191,23 +214,40 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
     this.ignoreIndexUpdate = record.ignoreIndexUpdate;
   }
 
-  public HoodieRecord() {}
-
   public abstract HoodieRecord<T> newInstance();
 
   public abstract HoodieRecord<T> newInstance(HoodieKey key, HoodieOperation op);
 
   public abstract HoodieRecord<T> newInstance(HoodieKey key);
 
-  public HoodieKey getKey() {
-    return key;
+  /**
+   * Get ordering value for the record from the cached variable, or extracting from the record if not cached.
+   *
+   * @param recordSchema Hudi schema for the record
+   * @param props Properties containing the necessary configurations
+   * @param orderingFields name of the ordering fields
+   * @return The ordering value for the record
+   */
+  public Comparable<?> getOrderingValue(HoodieSchema recordSchema, Properties props, String[] orderingFields) {
+    if (orderingValue == null) {
+      orderingValue = doGetOrderingValue(recordSchema, props, orderingFields);
+    }
+    return orderingValue;
   }
 
-  public HoodieOperation getOperation() {
-    return operation;
-  }
+  /**
+   * Extracting the ordering value from the record.
+   *
+   * @param recordSchema Hudi schema for the record
+   * @param props Properties containing the necessary configurations
+   * @param orderingFields name of the ordering fields
+   * @return The ordering value for the record
+   */
+  protected abstract Comparable<?> doGetOrderingValue(HoodieSchema recordSchema, Properties props, String[] orderingFields);
 
-  public abstract Comparable<?> getOrderingValue(Schema recordSchema, Properties props);
+  public Comparable<?> getOrderingValueAsJava(HoodieSchema recordSchema, Properties props, String[] orderingFields) {
+    return getOrderingValue(recordSchema, props, orderingFields);
+  }
 
   public T getData() {
     if (data == null) {
@@ -269,6 +309,9 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
    */
   public void setIgnoreIndexUpdate(boolean ignoreFlag) {
     this.ignoreIndexUpdate = ignoreFlag;
+    if (ignoreFlag) {
+      this.operation = HoodieOperation.UPDATE_BEFORE;
+    }
   }
 
   public boolean getIgnoreIndexUpdate() {
@@ -296,12 +339,10 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
 
   @Override
   public String toString() {
-    final StringBuilder sb = new StringBuilder("HoodieRecord{");
-    sb.append("key=").append(key);
-    sb.append(", currentLocation='").append(currentLocation).append('\'');
-    sb.append(", newLocation='").append(newLocation).append('\'');
-    sb.append('}');
-    return sb.toString();
+    return "HoodieRecord{" + "key=" + key
+        + ", currentLocation='" + currentLocation + '\''
+        + ", newLocation='" + newLocation + '\''
+        + '}';
   }
 
   public String getPartitionPath() {
@@ -316,9 +357,9 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
 
   public abstract HoodieRecordType getRecordType();
 
-  public abstract String getRecordKey(Schema recordSchema, Option<BaseKeyGenerator> keyGeneratorOpt);
+  public abstract String getRecordKey(HoodieSchema recordSchema, Option<BaseKeyGenerator> keyGeneratorOpt);
 
-  public abstract String getRecordKey(Schema recordSchema, String keyFieldName);
+  public abstract String getRecordKey(HoodieSchema recordSchema, String keyFieldName);
 
   public void seal() {
     this.sealed = true;
@@ -364,6 +405,9 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
     //       implementation
     writeRecordPayload(data, kryo, output);
     kryo.writeObjectOrNull(output, ignoreIndexUpdate, Boolean.class);
+    kryo.writeObjectOrNull(output, isDelete, Boolean.class);
+    kryo.writeClassAndObject(output, orderingValue);
+    kryo.writeClassAndObject(output, metaData == null ? null : metaData.orElse(null));
   }
 
   /**
@@ -380,44 +424,94 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
     //       implementation
     this.data = readRecordPayload(kryo, input);
     this.ignoreIndexUpdate = kryo.readObjectOrNull(input, Boolean.class);
+    this.isDelete = kryo.readObjectOrNull(input, Boolean.class);
+    this.orderingValue = (Comparable<?>) kryo.readClassAndObject(input);
+    this.metaData = Option.ofNullable((Map<String, String>) kryo.readClassAndObject(input));
 
     // NOTE: We're always seal object after deserialization
     this.sealed = true;
   }
 
   /**
+   * This method converts a value for a column with certain Avro Logical data types that require special handling.
+   * <p>
+   * E.g., Logical Date Type is converted to actual Date value instead of Epoch Integer which is how it is
+   * represented/stored in parquet.
+   * <p>
+   * E.g., Decimal Data Type is converted to actual decimal value instead of bytes/fixed which is how it is
+   * represented/stored in parquet.
+   */
+  public abstract Object convertColumnValueForLogicalType(
+      HoodieSchema fieldSchema, Object fieldValue, boolean keepConsistentLogicalTimestamp);
+
+  /**
    * Get column in record to support RDDCustomColumnsSortPartitioner
    * @return
    */
-  public abstract Object[] getColumnValues(Schema recordSchema, String[] columns, boolean consistentLogicalTimestampEnabled);
+  public abstract Object[] getColumnValues(HoodieSchema recordSchema, String[] columns, boolean consistentLogicalTimestampEnabled);
+
+  /**
+   * Get column as Java type in record to collect index stats: col_stats, secondary index, etc.
+   * The Java type is required to keep the value engine agnostic.
+   *
+   * @return the column value
+   */
+  public abstract Object getColumnValueAsJava(HoodieSchema recordSchema, String column, Properties props);
 
   /**
    * Support bootstrap.
    */
-  public abstract HoodieRecord joinWith(HoodieRecord other, Schema targetSchema);
+  public abstract HoodieRecord joinWith(HoodieRecord other, HoodieSchema targetSchema);
 
   /**
    * Rewrites record into new target schema containing Hudi-specific meta-fields
    *
    * NOTE: This operation is idempotent
    */
-  public abstract HoodieRecord prependMetaFields(Schema recordSchema, Schema targetSchema, MetadataValues metadataValues, Properties props);
+  public abstract HoodieRecord prependMetaFields(HoodieSchema recordSchema, HoodieSchema targetSchema, MetadataValues metadataValues, Properties props);
+
+  /**
+   * Update a specific metadata field with given value.
+   *
+   * @param recordSchema the schema for the record
+   * @param ordinal the ordinal for the target medata field
+   * @param value the new value for the target metadata field
+   * @return the new HoodieRecord with updated metadata value
+   */
+  public HoodieRecord updateMetaField(HoodieSchema recordSchema, int ordinal, String value) {
+    throw new UnsupportedOperationException("updateMetaField is not supported yet for: " + this.getClass().getSimpleName());
+  }
 
   /**
    * Support schema evolution.
    */
-  public abstract HoodieRecord rewriteRecordWithNewSchema(Schema recordSchema, Properties props, Schema newSchema, Map<String, String> renameCols);
+  public abstract HoodieRecord rewriteRecordWithNewSchema(HoodieSchema recordSchema, Properties props, HoodieSchema newSchema, Map<String, String> renameCols);
 
-  public HoodieRecord rewriteRecordWithNewSchema(Schema recordSchema, Properties props, Schema newSchema) {
+  public HoodieRecord rewriteRecordWithNewSchema(HoodieSchema recordSchema, Properties props, HoodieSchema newSchema) {
     return rewriteRecordWithNewSchema(recordSchema, props, newSchema, Collections.emptyMap());
   }
 
-  public abstract boolean isDelete(Schema recordSchema, Properties props) throws IOException;
+  public boolean isDelete(DeleteContext deleteContext, Properties props) {
+    if (isDelete == null) {
+      try {
+        isDelete = checkIsDelete(deleteContext, props);
+      } catch (IOException e) {
+        throw new HoodieIOException("Failed to check DELETE record.", e);
+      }
+    }
+    return isDelete;
+  }
+
+  /**
+   * Check whether the record is DELETE by the data content.
+   * todo: all subclass
+   */
+  protected abstract boolean checkIsDelete(DeleteContext deleteContext, Properties props) throws IOException;
 
   /**
    * Is EmptyRecord. Generated by ExpressionPayload.
    */
-  public abstract boolean shouldIgnore(Schema recordSchema, Properties props) throws IOException;
+  public abstract boolean shouldIgnore(HoodieSchema recordSchema, Properties props) throws IOException;
 
   /**
    * This is used to copy data.
@@ -430,8 +524,8 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
     return instantTime + "_" + partitionId + "_" + recordIndex;
   }
 
-  protected static boolean hasMetaFields(Schema schema) {
-    return schema.getField(HoodieRecord.RECORD_KEY_METADATA_FIELD) != null;
+  protected static boolean hasMetaFields(HoodieSchema schema) {
+    return schema.getField(HoodieRecord.RECORD_KEY_METADATA_FIELD).isPresent();
   }
 
   /**
@@ -450,11 +544,12 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
    * We can see the usage of IGNORE_RECORD in
    * org.apache.spark.sql.hudi.command.payload.ExpressionPayload
    */
+  @NoArgsConstructor(access = AccessLevel.PRIVATE)
   private static class EmptyRecord implements GenericRecord {
-    private EmptyRecord() {}
 
     @Override
-    public void put(int i, Object v) {}
+    public void put(int i, Object v) {
+    }
 
     @Override
     public Object get(int i) {
@@ -467,7 +562,8 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
     }
 
     @Override
-    public void put(String key, Object v) {}
+    public void put(String key, Object v) {
+    }
 
     @Override
     public Object get(String key) {
@@ -476,6 +572,6 @@ public abstract class HoodieRecord<T> implements HoodieRecordCompatibilityInterf
   }
 
   public enum HoodieRecordType {
-    AVRO, SPARK
+    AVRO, SPARK, HIVE, FLINK
   }
 }

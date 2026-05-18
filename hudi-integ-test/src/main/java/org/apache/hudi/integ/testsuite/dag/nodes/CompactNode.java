@@ -22,14 +22,18 @@ import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.integ.testsuite.configuration.DeltaConfig.Config;
 import org.apache.hudi.integ.testsuite.dag.ExecutionContext;
+import org.apache.hudi.table.action.HoodieWriteMetadata;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.spark.api.java.JavaRDD;
 
 /**
  * Represents a compact node in the DAG of operations for a workflow.
  */
+@Slf4j
 public class CompactNode extends DagNode<JavaRDD<WriteStatus>> {
 
   public CompactNode(Config config) {
@@ -46,15 +50,17 @@ public class CompactNode extends DagNode<JavaRDD<WriteStatus>> {
    */
   @Override
   public void execute(ExecutionContext executionContext, int curItrCount) throws Exception {
-    HoodieTableMetaClient metaClient =
-        HoodieTableMetaClient.builder().setConf(executionContext.getHoodieTestSuiteWriter().getConfiguration()).setBasePath(executionContext.getHoodieTestSuiteWriter().getCfg().targetBasePath)
-            .build();
+    HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder()
+        .setConf(HadoopFSUtils.getStorageConfWithCopy(executionContext.getHoodieTestSuiteWriter().getConfiguration()))
+        .setBasePath(executionContext.getHoodieTestSuiteWriter().getCfg().targetBasePath)
+        .build();
     Option<HoodieInstant> lastInstant = metaClient.getActiveTimeline()
         .getWriteTimeline().filterPendingCompactionTimeline().lastInstant();
     if (lastInstant.isPresent()) {
       log.info("Compacting instant {}", lastInstant.get());
-      this.result = executionContext.getHoodieTestSuiteWriter().compact(Option.of(lastInstant.get().getTimestamp()));
-      executionContext.getHoodieTestSuiteWriter().commitCompaction(result, executionContext.getJsc().emptyRDD(), Option.of(lastInstant.get().getTimestamp()));
+      HoodieWriteMetadata<JavaRDD<WriteStatus>> writeMetadata = executionContext.getHoodieTestSuiteWriter().compact(Option.of(lastInstant.get().requestedTime()));
+      executionContext.getHoodieTestSuiteWriter().commitCompaction(Option.of(lastInstant.get().requestedTime()), writeMetadata);
+      this.result = writeMetadata.getWriteStatuses();
     }
   }
 }

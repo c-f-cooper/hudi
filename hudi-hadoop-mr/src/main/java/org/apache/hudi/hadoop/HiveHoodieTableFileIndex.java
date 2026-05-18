@@ -18,8 +18,6 @@
 
 package org.apache.hudi.hadoop;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.Path;
 import org.apache.hudi.BaseHoodieTableFileIndex;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.engine.HoodieEngineContext;
@@ -27,6 +25,8 @@ import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieTableQueryType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.storage.StoragePath;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,7 +45,7 @@ public class HiveHoodieTableFileIndex extends BaseHoodieTableFileIndex {
                                   HoodieTableMetaClient metaClient,
                                   TypedProperties configProperties,
                                   HoodieTableQueryType queryType,
-                                  List<Path> queryPaths,
+                                  List<StoragePath> queryPaths,
                                   Option<String> specifiedQueryInstant,
                                   boolean shouldIncludePendingCommits
   ) {
@@ -55,6 +55,7 @@ public class HiveHoodieTableFileIndex extends BaseHoodieTableFileIndex {
         queryType,
         queryPaths,
         specifiedQueryInstant,
+        false,
         shouldIncludePendingCommits,
         true,
         new NoopCache(),
@@ -74,27 +75,10 @@ public class HiveHoodieTableFileIndex extends BaseHoodieTableFileIndex {
   }
 
   @Override
-  public Object[] doParsePartitionColumnValues(String[] partitionColumns, String partitionPath) {
+  public Object[] parsePartitionColumnValues(String[] partitionColumns, String partitionPath) {
     // NOTE: Parsing partition path into partition column values isn't required on Hive,
     //       since Hive does partition pruning in a different way (based on the input-path being
     //       fetched by the query engine)
     return new Object[0];
-  }
-
-  static class NoopCache implements FileStatusCache {
-    @Override
-    public Option<FileStatus[]> get(Path path) {
-      return Option.empty();
-    }
-
-    @Override
-    public void put(Path path, FileStatus[] leafFiles) {
-      // no-op
-    }
-
-    @Override
-    public void invalidate() {
-      // no-op
-    }
   }
 }

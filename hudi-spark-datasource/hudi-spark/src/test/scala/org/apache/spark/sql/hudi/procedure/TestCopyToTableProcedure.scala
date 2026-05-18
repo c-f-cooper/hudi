@@ -17,6 +17,10 @@
 
 package org.apache.spark.sql.hudi.procedure
 
+import org.apache.hudi.common.testutils.HoodieTestUtils
+import org.apache.hudi.storage.StoragePath
+import org.apache.hudi.testutils.DataSourceTestUtils
+
 import org.apache.spark.sql.Row
 
 import java.util
@@ -38,7 +42,7 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 
@@ -74,7 +78,7 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 
@@ -120,7 +124,7 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 
@@ -167,6 +171,7 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
   test("Test Call copy_to_table Procedure with incremental") {
     withTempDir { tmp =>
       val tableName = generateTableName
+      val tablePath = tmp.getCanonicalPath + tableName
       // create table
       spark.sql(
         s"""
@@ -176,10 +181,10 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
            |  price double,
            |  ts long
            |) using hudi
-           | location '${tmp.getCanonicalPath}/$tableName'
+           | location '$tablePath'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 
@@ -187,12 +192,12 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
       spark.sql(s"insert into $tableName select 1, 'a1', 10, 1000")
       spark.sql(s"insert into $tableName select 2, 'a2', 20, 1500")
 
-      // mark beginTime
-      val beginTime = spark.sql(s"select max(_hoodie_commit_time) from $tableName").collectAsList().get(0).get(0)
+      // mark startCompletionTime
+      val storage = HoodieTestUtils.getStorage(new StoragePath(tablePath))
+      val startCompletionTime = DataSourceTestUtils.latestCommitCompletionTime(storage, tablePath)
       spark.sql(s"insert into $tableName select 3, 'a3', 30, 2000")
       spark.sql(s"insert into $tableName select 4, 'a4', 40, 2500")
-      val endTime = spark.sql(s"select max(_hoodie_commit_time) from $tableName").collectAsList().get(0).get(0)
-
+      val endCompletionTime = DataSourceTestUtils.latestCommitCompletionTime(storage, tablePath)
 
       val copyTableName = generateTableName
       // Check required fields
@@ -202,8 +207,8 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
       val copyCmd = spark.sql(s"call copy_to_table" + s"(table=>'$tableName'" +
         s",new_table=>'$copyTableName'" +
         s",query_type=>'incremental'" +
-        s",begin_instance_time=>'$beginTime'" +
-        s",end_instance_time=>'$endTime')").collectAsList()
+        s",begin_instance_time=>'$startCompletionTime'" +
+        s",end_instance_time=>'$endCompletionTime')").collectAsList()
       assert(copyCmd.size() == 1 && copyCmd.get(0).get(0) == 0)
 
       val df = spark.sql(s"select * from $copyTableName")
@@ -229,7 +234,7 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
            | options (
            |  type='mor',
            |  primaryKey = 'id',
-           |  preCombineField = 'ts',
+           |  orderingFields = 'ts',
            |  hoodie.compact.inline.max.delta.commits='5',
            |  hoodie.compact.inline='true'
            |
@@ -279,7 +284,7 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 
@@ -329,7 +334,7 @@ class TestCopyToTableProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 

@@ -21,6 +21,9 @@ package org.apache.hudi.config;
 import org.apache.hudi.common.config.ConfigClassProperty;
 import org.apache.hudi.common.config.ConfigGroups;
 import org.apache.hudi.common.config.ConfigProperty;
+import org.apache.hudi.common.config.HoodieConfig;
+
+import lombok.Getter;
 
 import javax.annotation.concurrent.Immutable;
 
@@ -30,7 +33,7 @@ import java.util.Arrays;
 @ConfigClassProperty(name = "Error table Configs",
     groupName = ConfigGroups.Names.WRITE_CLIENT,
     description = "Configurations that are required for Error table configs")
-public class HoodieErrorTableConfig {
+public class HoodieErrorTableConfig extends HoodieConfig {
   public static final ConfigProperty<Boolean> ERROR_TABLE_ENABLED = ConfigProperty
       .key("hoodie.errortable.enable")
       .defaultValue(false)
@@ -75,7 +78,7 @@ public class HoodieErrorTableConfig {
   public static final ConfigProperty<Boolean> ERROR_ENABLE_VALIDATE_RECORD_CREATION = ConfigProperty
       .key("hoodie.errortable.validate.recordcreation.enable")
       .defaultValue(true)
-      .sinceVersion("0.14.2")
+      .sinceVersion("0.15.0")
       .withDocumentation("Records that fail to be created due to keygeneration failure or other issues will be sent to the Error Table");
 
   public static final ConfigProperty<String> ERROR_TABLE_WRITE_FAILURE_STRATEGY = ConfigProperty
@@ -84,18 +87,26 @@ public class HoodieErrorTableConfig {
       .withDocumentation("The config specifies the failure strategy if error table write fails. "
           + "Use one of - " + Arrays.toString(ErrorWriteFailureStrategy.values()));
 
+  public static final ConfigProperty<Boolean> ERROR_TABLE_PERSIST_SOURCE_RDD = ConfigProperty
+      .key("hoodie.errortable.source.rdd.persist")
+      .defaultValue(false)
+      .withDocumentation("Enabling this config, persists the sourceRDD to disk which helps in faster processing of data table + error table write DAG");
+
+  public static final ConfigProperty<Boolean> ENABLE_ERROR_TABLE_WRITE_UNIFICATION = ConfigProperty
+      .key("hoodie.errortable.write.union.enable")
+      .defaultValue(false)
+      .withDocumentation("Enable error table union with data table when writing for improved commit performance. "
+          + "By default it is disabled meaning data table and error table writes are sequential");
+
   public enum ErrorWriteFailureStrategy {
     ROLLBACK_COMMIT("Rollback the corresponding base table write commit for which the error events were triggered"),
     LOG_ERROR("Error is logged but the base table write succeeds");
 
+    @Getter
     private final String description;
 
     ErrorWriteFailureStrategy(String description) {
       this.description = description;
-    }
-
-    public String getDescription() {
-      return description;
     }
 
     @Override

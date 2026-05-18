@@ -31,10 +31,12 @@ import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.config.HoodieInternalConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.data.HoodieJavaPairRDD;
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -42,14 +44,14 @@ import java.util.stream.Collectors;
 public class DatasetBulkInsertOverwriteCommitActionExecutor extends BaseDatasetBulkInsertCommitActionExecutor {
 
   public DatasetBulkInsertOverwriteCommitActionExecutor(HoodieWriteConfig config,
-                                                        SparkRDDWriteClient writeClient,
-                                                        String instantTime) {
+                                                        SparkRDDWriteClient writeClient, String instantTime) {
     super(config, writeClient, instantTime);
   }
 
   @Override
   protected Option<HoodieData<WriteStatus>> doExecute(Dataset<Row> records, boolean arePartitionRecordsSorted) {
-    table.getActiveTimeline().transitionRequestedToInflight(new HoodieInstant(HoodieInstant.State.REQUESTED, getCommitActionType(), instantTime), Option.empty());
+    table.getActiveTimeline().transitionRequestedToInflight(table.getMetaClient().createNewInstant(HoodieInstant.State.REQUESTED,
+        getCommitActionType(), instantTime), Option.empty());
     return Option.of(HoodieDatasetBulkInsertHelper
         .bulkInsert(records, instantTime, table, writeConfig, arePartitionRecordsSorted, false));
   }
@@ -61,6 +63,11 @@ public class DatasetBulkInsertOverwriteCommitActionExecutor extends BaseDatasetB
 
   @Override
   protected Map<String, List<String>> getPartitionToReplacedFileIds(HoodieData<WriteStatus> writeStatuses) {
+    if (!table.isPartitioned()) {
+      // Short-circuit for unpartitioned tables - only one partition path: empty string
+      return Collections.singletonMap(StringUtils.EMPTY_STRING, getAllExistingFileIds(StringUtils.EMPTY_STRING));
+    }
+
     String staticOverwritePartition = writeConfig.getStringOrDefault(HoodieInternalConfig.STATIC_OVERWRITE_PARTITION_PATHS);
     if (StringUtils.nonEmpty(staticOverwritePartition)) {
       // static insert overwrite partitions

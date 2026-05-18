@@ -18,23 +18,27 @@
 
 package org.apache.hudi.table.action.cluster.strategy;
 
-import org.apache.hudi.avro.model.HoodieClusteringGroup;
 import org.apache.hudi.common.engine.HoodieEngineContext;
+import org.apache.hudi.common.engine.HoodieLocalEngineContext;
 import org.apache.hudi.config.HoodieClusteringConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.storage.hadoop.HadoopStorageConfiguration;
 import org.apache.hudi.table.HoodieTable;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestPartitionAwareClusteringPlanStrategy {
@@ -43,10 +47,12 @@ public class TestPartitionAwareClusteringPlanStrategy {
   HoodieTable table;
   @Mock
   HoodieEngineContext context;
+  
   HoodieWriteConfig hoodieWriteConfig;
 
   @BeforeEach
   public void setUp() {
+    MockitoAnnotations.openMocks(this);
     Properties props = new Properties();
     props.setProperty("hoodie.clustering.plan.strategy.partition.regex.pattern", "2021072.*");
     this.hoodieWriteConfig = HoodieWriteConfig
@@ -77,6 +83,44 @@ public class TestPartitionAwareClusteringPlanStrategy {
     assertTrue(list.contains("20210723"));
   }
 
+  @Test
+  public void testResolveEngineContextUsesLocalWhenEnabled() {
+    HoodieEngineContext engineContext = new HoodieLocalEngineContext(new HadoopStorageConfiguration(false));
+    HoodieWriteConfig config = HoodieWriteConfig.newBuilder()
+        .withPath("dummy_Table_Path")
+        .withClusteringConfig(HoodieClusteringConfig.newBuilder()
+            .useLocalEngineContextForPlanGeneration(true)
+            .build())
+        .build();
+
+    DummyPartitionAwareClusteringPlanStrategy strategy =
+        new DummyPartitionAwareClusteringPlanStrategy(table, engineContext, config);
+    HoodieEngineContext resolved = strategy.resolveEngineContextForPlanGeneration();
+
+    assertInstanceOf(HoodieLocalEngineContext.class, resolved,
+        "Expected HoodieLocalEngineContext but got " + resolved.getClass().getName());
+    assertNotSame(engineContext, resolved,
+        "Expected a new HoodieLocalEngineContext instance, but got the same instance");
+  }
+
+  @Test
+  public void testResolveEngineContextUsesDistributedWhenDisabled() {
+    HoodieEngineContext engineContext = new HoodieLocalEngineContext(new HadoopStorageConfiguration(false));
+    HoodieWriteConfig config = HoodieWriteConfig.newBuilder()
+        .withPath("dummy_Table_Path")
+        .withClusteringConfig(HoodieClusteringConfig.newBuilder()
+            .useLocalEngineContextForPlanGeneration(false)
+            .build())
+        .build();
+
+    DummyPartitionAwareClusteringPlanStrategy strategy =
+        new DummyPartitionAwareClusteringPlanStrategy(table, engineContext, config);
+    HoodieEngineContext resolved = strategy.resolveEngineContextForPlanGeneration();
+
+    assertSame(engineContext, resolved,
+        "Expected the original engine context to be returned when local engine context is disabled");
+  }
+
   class DummyPartitionAwareClusteringPlanStrategy extends PartitionAwareClusteringPlanStrategy {
 
     public DummyPartitionAwareClusteringPlanStrategy(HoodieTable table, HoodieEngineContext engineContext, HoodieWriteConfig writeConfig) {
@@ -84,13 +128,9 @@ public class TestPartitionAwareClusteringPlanStrategy {
     }
 
     @Override
-    protected Stream<HoodieClusteringGroup> buildClusteringGroupsForPartition(String partitionPath, List list) {
-      return null;
-    }
-
-    @Override
     protected Map<String, String> getStrategyParams() {
       return null;
     }
   }
+
 }

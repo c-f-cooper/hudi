@@ -18,7 +18,7 @@
 
 package org.apache.hudi.sink.bucket;
 
-import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.client.model.HoodieFlinkInternalRow;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.config.HoodieClusteringConfig;
 import org.apache.hudi.config.HoodieIndexConfig;
@@ -26,9 +26,8 @@ import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.configuration.OptionsInference;
 import org.apache.hudi.configuration.OptionsResolver;
 import org.apache.hudi.exception.HoodieException;
-import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.sink.utils.Pipelines;
-import org.apache.hudi.util.AvroSchemaConverter;
+import org.apache.hudi.util.HoodieSchemaConverter;
 import org.apache.hudi.util.JsonDeserializationFunction;
 import org.apache.hudi.util.StreamerUtil;
 import org.apache.hudi.utils.FlinkMiniCluster;
@@ -37,21 +36,15 @@ import org.apache.hudi.utils.TestData;
 import org.apache.hudi.utils.source.ContinuousFileSource;
 
 import org.apache.flink.api.common.JobStatus;
-import org.apache.flink.api.common.io.FilePathFilter;
-import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
-import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.java.io.TextInputFormat;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.source.FileProcessingMode;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.TestLogger;
-import org.apache.hadoop.fs.FileSystem;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
@@ -85,23 +78,23 @@ public class ITTestConsistentBucketStreamWrite extends TestLogger {
   @Test
   public void testWriteMOR() throws Exception {
     Configuration conf = TestConfigurations.getDefaultConf(tempFile.toURI().toString());
-    conf.setString(FlinkOptions.INDEX_TYPE, "BUCKET");
-    conf.setString(FlinkOptions.BUCKET_INDEX_ENGINE_TYPE, "CONSISTENT_HASHING");
-    conf.setInteger(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS, 4);
-    conf.setString(FlinkOptions.TABLE_TYPE, HoodieTableType.MERGE_ON_READ.name());
+    conf.set(FlinkOptions.INDEX_TYPE, "BUCKET");
+    conf.set(FlinkOptions.BUCKET_INDEX_ENGINE_TYPE, "CONSISTENT_HASHING");
+    conf.set(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS, 4);
+    conf.set(FlinkOptions.TABLE_TYPE, HoodieTableType.MERGE_ON_READ.name());
     testWriteToHoodie(conf, "mor_write", 1, EXPECTED);
   }
 
   @Test
   public void testWriteMORWithResizePlan() throws Exception {
     Configuration conf = TestConfigurations.getDefaultConf(tempFile.toURI().toString());
-    conf.setString(FlinkOptions.INDEX_TYPE, "BUCKET");
-    conf.setString(FlinkOptions.BUCKET_INDEX_ENGINE_TYPE, "CONSISTENT_HASHING");
-    conf.setInteger(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS, 4);
+    conf.set(FlinkOptions.INDEX_TYPE, "BUCKET");
+    conf.set(FlinkOptions.BUCKET_INDEX_ENGINE_TYPE, "CONSISTENT_HASHING");
+    conf.set(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS, 4);
     conf.setString(HoodieIndexConfig.BUCKET_INDEX_MAX_NUM_BUCKETS.key(), "8");
-    conf.setString(FlinkOptions.TABLE_TYPE, HoodieTableType.MERGE_ON_READ.name());
+    conf.set(FlinkOptions.TABLE_TYPE, HoodieTableType.MERGE_ON_READ.name());
     // Enable inline resize scheduling
-    conf.setBoolean(FlinkOptions.CLUSTERING_SCHEDULE_ENABLED, true);
+    conf.set(FlinkOptions.CLUSTERING_SCHEDULE_ENABLED, true);
     // Manually set the max commits to trigger clustering quickly
     conf.setString(HoodieClusteringConfig.ASYNC_CLUSTERING_MAX_COMMITS.key(), "1");
     // Manually set the split threshold to trigger split in the clustering
@@ -113,11 +106,11 @@ public class ITTestConsistentBucketStreamWrite extends TestLogger {
   @Test
   public void testBulkInsert() {
     Configuration conf = TestConfigurations.getDefaultConf(tempFile.toURI().toString());
-    conf.setString(FlinkOptions.INDEX_TYPE, "BUCKET");
-    conf.setString(FlinkOptions.BUCKET_INDEX_ENGINE_TYPE, "CONSISTENT_HASHING");
-    conf.setInteger(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS, 4);
-    conf.setString(FlinkOptions.TABLE_TYPE, HoodieTableType.MERGE_ON_READ.name());
-    conf.setString(FlinkOptions.OPERATION, "bulk_insert");
+    conf.set(FlinkOptions.INDEX_TYPE, "BUCKET");
+    conf.set(FlinkOptions.BUCKET_INDEX_ENGINE_TYPE, "CONSISTENT_HASHING");
+    conf.set(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS, 4);
+    conf.set(FlinkOptions.TABLE_TYPE, HoodieTableType.MERGE_ON_READ.name());
+    conf.set(FlinkOptions.OPERATION, "bulk_insert");
 
     // expect HoodieException for bulk insert
     assertThrows(
@@ -128,11 +121,11 @@ public class ITTestConsistentBucketStreamWrite extends TestLogger {
   @Test
   public void testOverwrite() {
     Configuration conf = TestConfigurations.getDefaultConf(tempFile.toURI().toString());
-    conf.setString(FlinkOptions.INDEX_TYPE, "BUCKET");
-    conf.setString(FlinkOptions.BUCKET_INDEX_ENGINE_TYPE, "CONSISTENT_HASHING");
-    conf.setInteger(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS, 4);
-    conf.setString(FlinkOptions.TABLE_TYPE, HoodieTableType.MERGE_ON_READ.name());
-    conf.setString(FlinkOptions.OPERATION, "INSERT_OVERWRITE");
+    conf.set(FlinkOptions.INDEX_TYPE, "BUCKET");
+    conf.set(FlinkOptions.BUCKET_INDEX_ENGINE_TYPE, "CONSISTENT_HASHING");
+    conf.set(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS, 4);
+    conf.set(FlinkOptions.TABLE_TYPE, HoodieTableType.MERGE_ON_READ.name());
+    conf.set(FlinkOptions.OPERATION, "INSERT_OVERWRITE");
 
     // expect HoodieException for overwrite
     assertThrows(
@@ -154,43 +147,28 @@ public class ITTestConsistentBucketStreamWrite extends TestLogger {
 
     // Read from file source
     RowType rowType =
-        (RowType) AvroSchemaConverter.convertToDataType(StreamerUtil.getSourceSchema(conf))
+        (RowType) HoodieSchemaConverter.convertToDataType(StreamerUtil.getSourceSchema(conf))
             .getLogicalType();
 
     String sourcePath = Objects.requireNonNull(Thread.currentThread()
         .getContextClassLoader().getResource("test_source.data")).toString();
 
-    boolean isMor = conf.getString(FlinkOptions.TABLE_TYPE).equals(HoodieTableType.MERGE_ON_READ.name());
-
-    DataStream<RowData> dataStream;
-    if (isMor) {
-      TextInputFormat format = new TextInputFormat(new Path(sourcePath));
-      format.setFilesFilter(FilePathFilter.createDefaultFilter());
-      TypeInformation<String> typeInfo = BasicTypeInfo.STRING_TYPE_INFO;
-      format.setCharsetName("UTF-8");
-
-      dataStream = execEnv
-          // use PROCESS_CONTINUOUSLY mode to trigger checkpoint
-          .readFile(format, sourcePath, FileProcessingMode.PROCESS_CONTINUOUSLY, 1000, typeInfo)
-          .map(JsonDeserializationFunction.getInstance(rowType))
-          .setParallelism(1);
-    } else {
-      dataStream = execEnv
-          // use continuous file source to trigger checkpoint
-          .addSource(new ContinuousFileSource.BoundedSourceFunction(new Path(sourcePath), checkpoints))
-          .name("continuous_file_source")
-          .setParallelism(1)
-          .map(JsonDeserializationFunction.getInstance(rowType))
-          .setParallelism(4);
-    }
+    DataStream<RowData> dataStream =
+        execEnv
+            // use continuous file source to trigger checkpoint
+            .addSource(new ContinuousFileSource.BoundedSourceFunction(new Path(sourcePath), checkpoints))
+            .name("continuous_file_source")
+            .setParallelism(1)
+            .map(JsonDeserializationFunction.getInstance(rowType))
+            .setParallelism(4);
 
     OptionsInference.setupSinkTasks(conf, execEnv.getParallelism());
-    DataStream<HoodieRecord> hoodieRecordDataStream = Pipelines.bootstrap(conf, rowType, dataStream);
     // bulk_insert mode
     if (OptionsResolver.isBulkInsertOperation(conf)) {
       Pipelines.bulkInsert(conf, rowType, dataStream);
     } else {
-      DataStream<Object> pipeline = Pipelines.hoodieStreamWrite(conf, hoodieRecordDataStream);
+      DataStream<HoodieFlinkInternalRow> hoodieRecordDataStream = Pipelines.bootstrap(conf, rowType, dataStream);
+      DataStream<RowData> pipeline = Pipelines.hoodieStreamWrite(conf, rowType, hoodieRecordDataStream);
       execEnv.addOperator(pipeline.getTransformation());
     }
     JobClient client = execEnv.executeAsync(jobName);
@@ -202,7 +180,6 @@ public class ITTestConsistentBucketStreamWrite extends TestLogger {
         // ignored
       }
     }
-    FileSystem fs = HadoopFSUtils.getFs(tempFile.getAbsolutePath(), new org.apache.hadoop.conf.Configuration());
-    TestData.checkWrittenDataMOR(fs, tempFile, expected, 4);
+    TestData.checkWrittenDataMOR(tempFile, expected, 4);
   }
 }

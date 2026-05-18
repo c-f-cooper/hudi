@@ -20,6 +20,7 @@
 package org.apache.hudi.testutils;
 
 import org.apache.hudi.avro.HoodieAvroUtils;
+import org.apache.hudi.client.common.HoodieFlinkEngineContext;
 import org.apache.hudi.common.bloom.BloomFilter;
 import org.apache.hudi.common.bloom.BloomFilterFactory;
 import org.apache.hudi.common.bloom.BloomFilterTypeCode;
@@ -28,19 +29,19 @@ import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieRecordLocation;
 import org.apache.hudi.common.model.HoodieRecordPayload;
+import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.log.HoodieLogFormat;
 import org.apache.hudi.common.table.log.block.HoodieAvroDataBlock;
 import org.apache.hudi.common.table.log.block.HoodieLogBlock.HeaderMetadataType;
 import org.apache.hudi.common.util.collection.Pair;
+import org.apache.hudi.storage.HoodieStorage;
+import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.table.HoodieTable;
 
-import org.apache.avro.Schema;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.IndexedRecord;
-import org.apache.hadoop.fs.Path;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -53,28 +54,33 @@ import java.util.stream.Collectors;
 /**
  * Flink hoodie writable table.
  */
+@Slf4j
 public class HoodieFlinkWriteableTestTable extends HoodieWriteableTestTable {
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieFlinkWriteableTestTable.class);
 
-  private HoodieFlinkWriteableTestTable(String basePath, org.apache.hadoop.fs.FileSystem fs, HoodieTableMetaClient metaClient, Schema schema, BloomFilter filter) {
-    super(basePath, fs, metaClient, schema, filter);
+  private HoodieFlinkWriteableTestTable(String basePath, HoodieStorage storage,
+                                        HoodieTableMetaClient metaClient, HoodieSchema schema,
+                                        BloomFilter filter) {
+    super(basePath, storage, metaClient, schema, filter);
   }
 
-  public static HoodieFlinkWriteableTestTable of(HoodieTableMetaClient metaClient, Schema schema, BloomFilter filter) {
-    return new HoodieFlinkWriteableTestTable(metaClient.getBasePathV2().toString(), metaClient.getRawFs(), metaClient, schema, filter);
+  public static HoodieFlinkWriteableTestTable of(HoodieTableMetaClient metaClient, HoodieSchema schema,
+                                                 BloomFilter filter) {
+    return new HoodieFlinkWriteableTestTable(metaClient.getBasePath().toString(),
+        metaClient.getRawStorage(), metaClient, schema, filter);
   }
 
-  public static HoodieFlinkWriteableTestTable of(HoodieTableMetaClient metaClient, Schema schema) {
-    BloomFilter filter = BloomFilterFactory.createBloomFilter(10000, 0.0000001, -1, BloomFilterTypeCode.SIMPLE.name());
+  public static HoodieFlinkWriteableTestTable of(HoodieTableMetaClient metaClient, HoodieSchema schema) {
+    BloomFilter filter = BloomFilterFactory.createBloomFilter(10000, 0.0000001, -1,
+        BloomFilterTypeCode.SIMPLE.name());
     return of(metaClient, schema, filter);
   }
 
-  public static HoodieFlinkWriteableTestTable of(HoodieTable hoodieTable, Schema schema) {
+  public static HoodieFlinkWriteableTestTable of(HoodieTable hoodieTable, HoodieSchema schema) {
     HoodieTableMetaClient metaClient = hoodieTable.getMetaClient();
     return of(metaClient, schema);
   }
 
-  public static HoodieFlinkWriteableTestTable of(HoodieTable hoodieTable, Schema schema, BloomFilter filter) {
+  public static HoodieFlinkWriteableTestTable of(HoodieTable hoodieTable, HoodieSchema schema, BloomFilter filter) {
     HoodieTableMetaClient metaClient = hoodieTable.getMetaClient();
     return of(metaClient, schema, filter);
   }
@@ -112,7 +118,7 @@ public class HoodieFlinkWriteableTestTable extends HoodieWriteableTestTable {
   }
 
   public HoodieFlinkWriteableTestTable withInserts(String partition, String fileId, List<HoodieRecord> records) throws Exception {
-    withInserts(partition, fileId, records, new org.apache.hudi.client.FlinkTaskContextSupplier(null));
+    withInserts(partition, fileId, records, new HoodieFlinkEngineContext.DefaultTaskContextSupplier());
     return this;
   }
 
@@ -130,22 +136,24 @@ public class HoodieFlinkWriteableTestTable extends HoodieWriteableTestTable {
   private Pair<String, HoodieLogFile> appendRecordsToLogFile(List<HoodieRecord> groupedRecords) throws Exception {
     String partitionPath = groupedRecords.get(0).getPartitionPath();
     HoodieRecordLocation location = groupedRecords.get(0).getCurrentLocation();
-    try (HoodieLogFormat.Writer logWriter = HoodieLogFormat.newWriterBuilder().onParentPath(new Path(basePath, partitionPath))
+    try (HoodieLogFormat.Writer logWriter = HoodieLogFormat.newWriterBuilder()
+        .onParentPath(new StoragePath(basePath, partitionPath))
         .withFileExtension(HoodieLogFile.DELTA_EXTENSION).withFileId(location.getFileId())
-        .withDeltaCommit(location.getInstantTime()).withFs(fs).build()) {
+        .withInstantTime(location.getInstantTime()).withStorage(storage).build()) {
       Map<HeaderMetadataType, String> header = new java.util.HashMap<>();
       header.put(HeaderMetadataType.INSTANT_TIME, location.getInstantTime());
       header.put(HeaderMetadataType.SCHEMA, schema.toString());
       logWriter.appendBlock(new HoodieAvroDataBlock(groupedRecords.stream().map(r -> {
         try {
-          GenericRecord val = (GenericRecord) ((HoodieRecordPayload) r.getData()).getInsertValue(schema).get();
+          GenericRecord val =
+              (GenericRecord) ((HoodieRecordPayload) r.getData()).getInsertValue(schema.toAvroSchema()).get();
           HoodieAvroUtils.addHoodieKeyToRecord(val, r.getRecordKey(), r.getPartitionPath(), "");
           return (IndexedRecord) val;
         } catch (IOException e) {
-          LOG.warn("Failed to convert record " + r.toString(), e);
+          log.warn("Failed to convert record " + r.toString(), e);
           return null;
         }
-      }).map(HoodieAvroIndexedRecord::new).collect(Collectors.toList()), false, header, HoodieRecord.RECORD_KEY_METADATA_FIELD));
+      }).map(HoodieAvroIndexedRecord::new).collect(Collectors.toList()), header, HoodieRecord.RECORD_KEY_METADATA_FIELD));
       return Pair.of(partitionPath, logWriter.getLogFile());
     }
   }

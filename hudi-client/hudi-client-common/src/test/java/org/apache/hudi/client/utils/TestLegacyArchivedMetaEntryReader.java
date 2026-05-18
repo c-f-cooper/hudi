@@ -30,7 +30,6 @@ import org.apache.hudi.common.table.log.HoodieLogFormat;
 import org.apache.hudi.common.table.log.block.HoodieAvroDataBlock;
 import org.apache.hudi.common.table.log.block.HoodieLogBlock;
 import org.apache.hudi.common.table.timeline.ActiveAction;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.MetadataConversionUtils;
 import org.apache.hudi.common.testutils.HoodieTestTable;
@@ -39,16 +38,13 @@ import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.ClosableIterator;
 import org.apache.hudi.exception.HoodieCommitException;
 import org.apache.hudi.exception.HoodieException;
-import org.apache.hudi.storage.HoodieLocation;
+import org.apache.hudi.storage.StoragePath;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.IndexedRecord;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
@@ -59,14 +55,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static org.apache.hudi.common.testutils.HoodieTestUtils.INSTANT_FILE_NAME_GENERATOR;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.TIMELINE_FACTORY;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
 
 /**
  * Test cases for {@link LegacyArchivedMetaEntryReader}.
  */
+@Slf4j
 public class TestLegacyArchivedMetaEntryReader {
-  private static final Logger LOG = LoggerFactory.getLogger(TestLegacyArchivedMetaEntryReader.class);
 
   @TempDir
   File tempFile;
@@ -74,8 +72,9 @@ public class TestLegacyArchivedMetaEntryReader {
   @Test
   void testReadLegacyArchivedTimeline() throws Exception {
     String tableName = "testTable";
-    String tablePath = tempFile.getAbsolutePath() + HoodieLocation.SEPARATOR + tableName;
-    HoodieTableMetaClient metaClient = HoodieTestUtils.init(new Configuration(), tablePath, HoodieTableType.COPY_ON_WRITE, tableName);
+    String tablePath = tempFile.getAbsolutePath() + StoragePath.SEPARATOR + tableName;
+    HoodieTableMetaClient metaClient = HoodieTestUtils.init(
+        HoodieTestUtils.getDefaultStorageConf(), tablePath, HoodieTableType.COPY_ON_WRITE, tableName);
     prepareLegacyArchivedTimeline(metaClient);
     LegacyArchivedMetaEntryReader reader = new LegacyArchivedMetaEntryReader(metaClient);
     ClosableIterator<ActiveAction> iterator = reader.getActiveActionsIterator();
@@ -94,7 +93,7 @@ public class TestLegacyArchivedMetaEntryReader {
       HoodieCommitMetadata metadata = testTable.createCommitMetadata(instantTime, WriteOperationType.INSERT, Arrays.asList("par1", "par2"), 10, false);
       testTable.addCommit(instantTime, Option.of(metadata));
     }
-    List<HoodieInstant> instants = new HoodieActiveTimeline(metaClient, false).getInstantsAsStream().sorted().collect(Collectors.toList());
+    List<HoodieInstant> instants = TIMELINE_FACTORY.createActiveTimeline(metaClient, false).getInstantsAsStream().sorted().collect(Collectors.toList());
     // archive 2 times to have 2 log files.
     archive(metaClient, instants.subList(0, instants.size() / 2));
     archive(metaClient, instants.subList(instants.size() / 2, instants.size()));
@@ -102,9 +101,10 @@ public class TestLegacyArchivedMetaEntryReader {
 
   private HoodieLogFormat.Writer openWriter(HoodieTableMetaClient metaClient) {
     try {
-      return HoodieLogFormat.newWriterBuilder().onParentPath(new Path(metaClient.getArchivePath()))
+      return HoodieLogFormat.newWriterBuilder()
+          .onParentPath(metaClient.getArchivePath())
           .withFileId("commits").withFileExtension(HoodieArchivedLogFile.ARCHIVE_EXTENSION)
-          .withFs(metaClient.getFs()).withDeltaCommit("").build();
+          .withStorage(metaClient.getStorage()).withInstantTime("").build();
     } catch (IOException e) {
       throw new HoodieException("Unable to initialize HoodieLogFormat writer", e);
     }
@@ -113,13 +113,13 @@ public class TestLegacyArchivedMetaEntryReader {
   public void archive(HoodieTableMetaClient metaClient, List<HoodieInstant> instants) throws HoodieCommitException {
     try (HoodieLogFormat.Writer writer = openWriter(metaClient)) {
       Schema wrapperSchema = HoodieArchivedMetaEntry.getClassSchema();
-      LOG.info("Wrapper schema " + wrapperSchema.toString());
+      log.info("Wrapper schema " + wrapperSchema.toString());
       List<IndexedRecord> records = new ArrayList<>();
       for (HoodieInstant hoodieInstant : instants) {
         try {
           records.add(convertToAvroRecord(hoodieInstant, metaClient));
         } catch (Exception e) {
-          LOG.error("Failed to archive commits, .commit file: " + hoodieInstant.getFileName(), e);
+          log.error("Failed to archive commits, .commit file: " + INSTANT_FILE_NAME_GENERATOR.getFileName(hoodieInstant), e);
           throw e;
         }
       }
@@ -135,7 +135,7 @@ public class TestLegacyArchivedMetaEntryReader {
       header.put(HoodieLogBlock.HeaderMetadataType.SCHEMA, wrapperSchema.toString());
       final String keyField = metaClient.getTableConfig().getRecordKeyFieldProp();
       List<HoodieRecord> indexRecords = records.stream().map(HoodieAvroIndexedRecord::new).collect(Collectors.toList());
-      HoodieAvroDataBlock block = new HoodieAvroDataBlock(indexRecords, false, header, keyField);
+      HoodieAvroDataBlock block = new HoodieAvroDataBlock(indexRecords, header, keyField);
       writer.appendBlock(block);
       records.clear();
     }

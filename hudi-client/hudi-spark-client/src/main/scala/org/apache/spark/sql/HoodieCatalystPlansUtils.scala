@@ -21,7 +21,8 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogStorageFormat
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.catalyst.plans.JoinType
-import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Join, LogicalPlan}
+import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.internal.SQLConf
 
 trait HoodieCatalystPlansUtils {
@@ -111,8 +112,10 @@ trait HoodieCatalystPlansUtils {
   /**
    * Decomposes [[InsertIntoStatement]] into its arguments allowing to accommodate for API
    * changes in Spark 3.3
+   * @return a option tuple with (table logical plan, userSpecifiedCols, partitionSpec, query, overwrite, ifPartitionNotExists)
+   *         userSpecifiedCols: only than the version of Spark32 will return, other is empty
    */
-  def unapplyInsertIntoStatement(plan: LogicalPlan): Option[(LogicalPlan, Map[String, Option[String]], LogicalPlan, Boolean, Boolean)]
+  def unapplyInsertIntoStatement(plan: LogicalPlan): Option[(LogicalPlan, Seq[String], Map[String, Option[String]], LogicalPlan, Boolean, Boolean)]
 
   /**
    * Decomposes [[CreateTableLikeCommand]] into its arguments allowing to accommodate for API
@@ -141,10 +144,39 @@ trait HoodieCatalystPlansUtils {
    */
   def failAnalysisForMIT(a: Attribute, cols: String): Unit = {}
 
+  /**
+   * Throws TABLE_OR_VIEW_NOT_FOUND error for non-existent table
+   */
+  def failTableNotFound(tableName: String): Unit = {}
+
   def createMITJoin(left: LogicalPlan, right: LogicalPlan, joinType: JoinType, condition: Option[Expression], hint: String): LogicalPlan
 
   /**
-   * true if both plans produce the same attributes in the the same order
+   * true if both plans produce the same attributes in the same order
    */
   def produceSameOutput(a: LogicalPlan, b: LogicalPlan): Boolean
+
+  /**
+   * Add a project to use the table column names for INSERT INTO BY NAME with specified cols
+   */
+  def createProjectForByNameQuery(lr: LogicalRelation, plan: LogicalPlan): Option[LogicalPlan]
+
+  /**
+   * Decomposes [[UpdateAction]] into its arguments with accommodation for
+   * case class changes in Spark 4.1 which added a third parameter `fromStar`.
+   *
+   * Before Spark 4.1 (two arguments):
+   *   case class UpdateAction(condition: Option[Expression], assignments: Seq[Assignment])
+   *
+   * Since Spark 4.1 (three arguments):
+   *   case class UpdateAction(condition: Option[Expression], assignments: Seq[Assignment], fromStar: Boolean)
+   */
+  def unapplyUpdateAction(mergeAction: Any): Option[(Option[Expression], Seq[Assignment])]
+
+  /**
+   * Extracts the JSON string from a [[SerializedOffset]] with accommodation for
+   * Spark 4.1 where [[SerializedOffset]] is moved to
+   * [[org.apache.spark.sql.execution.streaming.runtime]] package
+   */
+  def extractJsonFromSerializedOffset(offset: Any): Option[String]
 }

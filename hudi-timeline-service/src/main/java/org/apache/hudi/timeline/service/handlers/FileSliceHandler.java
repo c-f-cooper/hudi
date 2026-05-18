@@ -25,12 +25,9 @@ import org.apache.hudi.common.table.timeline.dto.DTOUtils;
 import org.apache.hudi.common.table.timeline.dto.FileGroupDTO;
 import org.apache.hudi.common.table.timeline.dto.FileSliceDTO;
 import org.apache.hudi.common.table.view.FileSystemViewManager;
+import org.apache.hudi.storage.StorageConfiguration;
 import org.apache.hudi.timeline.service.TimelineService;
 
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-
-import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -42,9 +39,9 @@ import java.util.stream.Collectors;
  */
 public class FileSliceHandler extends Handler {
 
-  public FileSliceHandler(Configuration conf, TimelineService.Config timelineServiceConfig,
-                          FileSystem fileSystem, FileSystemViewManager viewManager) throws IOException {
-    super(conf, timelineServiceConfig, fileSystem, viewManager);
+  public FileSliceHandler(StorageConfiguration<?> conf, TimelineService.Config timelineServiceConfig,
+                          FileSystemViewManager viewManager) {
+    super(conf, timelineServiceConfig, viewManager);
   }
 
   public List<FileSliceDTO> getAllFileSlices(String basePath, String partitionPath) {
@@ -61,6 +58,20 @@ public class FileSliceHandler extends Handler {
       String maxInstantTime) {
     return viewManager.getFileSystemView(basePath).getLatestMergedFileSlicesBeforeOrOn(partitionPath, maxInstantTime)
         .map(FileSliceDTO::fromFileSlice).collect(Collectors.toList());
+  }
+
+  public List<FileSliceDTO> getLatestMergedFileSlicesBeforeOrOnIncludingInflight(String basePath, String partitionPath,
+                                                                                 String maxInstantTime,
+                                                                                 String currentInstantTime) {
+    return viewManager.getFileSystemView(basePath)
+        .getLatestMergedFileSlicesBeforeOrOnIncludingInflight(partitionPath, maxInstantTime, currentInstantTime)
+        .map(FileSliceDTO::fromFileSlice).collect(Collectors.toList());
+  }
+
+  public List<FileSliceDTO> getLatestMergedFileSliceBeforeOrOn(String basePath, String partitionPath,
+                                                               String maxInstantTime, String fileId) {
+    return viewManager.getFileSystemView(basePath).getLatestMergedFileSliceBeforeOrOn(partitionPath, maxInstantTime, fileId)
+        .map(FileSliceDTO::fromFileSlice).map(Collections::singletonList).orElse(Collections.emptyList());
   }
 
   public List<FileSliceDTO> getLatestFileSlicesBeforeOrOn(String basePath, String partitionPath, String maxInstantTime,
@@ -87,6 +98,11 @@ public class FileSliceHandler extends Handler {
 
   public List<FileSliceDTO> getLatestFileSlices(String basePath, String partitionPath) {
     return viewManager.getFileSystemView(basePath).getLatestFileSlices(partitionPath).map(FileSliceDTO::fromFileSlice)
+        .collect(Collectors.toList());
+  }
+
+  public List<FileSliceDTO> getLatestFileSlicesIncludingInflight(String basePath, String partitionPath) {
+    return viewManager.getFileSystemView(basePath).getLatestFileSlicesIncludingInflight(partitionPath).map(FileSliceDTO::fromFileSlice)
         .collect(Collectors.toList());
   }
 
@@ -161,6 +177,11 @@ public class FileSliceHandler extends Handler {
 
   public boolean loadAllPartitions(String basePath) {
     viewManager.getFileSystemView(basePath).loadAllPartitions();
+    return true;
+  }
+
+  public boolean loadPartitions(String basePath, List<String> partitionPaths) {
+    viewManager.getFileSystemView(basePath).loadPartitions(partitionPaths);
     return true;
   }
 }

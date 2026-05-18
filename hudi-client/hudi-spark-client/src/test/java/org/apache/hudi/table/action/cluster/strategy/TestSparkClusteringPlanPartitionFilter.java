@@ -32,10 +32,10 @@ import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertSame;
 
 public class TestSparkClusteringPlanPartitionFilter {
   @Mock
@@ -63,15 +63,15 @@ public class TestSparkClusteringPlanPartitionFilter {
     fakeTimeBasedPartitionsPath.add("20210718");
     fakeTimeBasedPartitionsPath.add("20210716");
     fakeTimeBasedPartitionsPath.add("20210719");
-    List list = sg.filterPartitionPaths(fakeTimeBasedPartitionsPath);
+    List list = (List)sg.filterPartitionPaths(null, fakeTimeBasedPartitionsPath).getLeft();
     assertEquals(3, list.size());
   }
 
   @Test
   public void testFilterPartitionRecentDays() {
     HoodieWriteConfig config = hoodieWriteConfigBuilder.withClusteringConfig(HoodieClusteringConfig.newBuilder()
-            .withClusteringSkipPartitionsFromLatest(1)
-            .withClusteringTargetPartitions(1)
+            .withClusteringSkipPartitionsFromLatest(0)
+            .withClusteringTargetPartitions(2)
             .withClusteringPlanPartitionFilterMode(ClusteringPlanPartitionFilterMode.RECENT_DAYS)
             .build())
         .build();
@@ -80,16 +80,16 @@ public class TestSparkClusteringPlanPartitionFilter {
     ArrayList<String> fakeTimeBasedPartitionsPath = new ArrayList<>();
     fakeTimeBasedPartitionsPath.add("20210718");
     fakeTimeBasedPartitionsPath.add("20210716");
-    fakeTimeBasedPartitionsPath.add("20210719");
-    List list = sg.filterPartitionPaths(fakeTimeBasedPartitionsPath);
-    assertEquals(1, list.size());
-    assertSame("20210718", list.get(0));
+    fakeTimeBasedPartitionsPath.add("20210717");
+    List list = (List)sg.filterPartitionPaths(null, fakeTimeBasedPartitionsPath).getLeft();
+    assertEquals(2, list.size());
+    assertEquals(Arrays.asList("20210717", "20210718"), list);
   }
 
   @Test
   public void testFilterPartitionSelectedPartitions() {
     HoodieWriteConfig config = hoodieWriteConfigBuilder.withClusteringConfig(HoodieClusteringConfig.newBuilder()
-            .withClusteringPartitionFilterBeginPartition("20211222")
+            .withClusteringPartitionFilterBeginPartition("20211221")
             .withClusteringPartitionFilterEndPartition("20211223")
             .withClusteringPlanPartitionFilterMode(ClusteringPlanPartitionFilterMode.SELECTED_PARTITIONS)
             .build())
@@ -101,9 +101,9 @@ public class TestSparkClusteringPlanPartitionFilter {
     fakeTimeBasedPartitionsPath.add("20211221");
     fakeTimeBasedPartitionsPath.add("20211222");
     fakeTimeBasedPartitionsPath.add("20211224");
-    List list = sg.filterPartitionPaths(fakeTimeBasedPartitionsPath);
-    assertEquals(1, list.size());
-    assertSame("20211222", list.get(0));
+    List list = (List)sg.filterPartitionPaths(config, fakeTimeBasedPartitionsPath).getLeft();
+    assertEquals(2, list.size());
+    assertEquals(Arrays.asList("20211221", "20211222"), list);
   }
 
   @Test
@@ -117,7 +117,7 @@ public class TestSparkClusteringPlanPartitionFilter {
     for (int i = 0; i < 24; i++) {
       fakeTimeBasedPartitionsPath.add("20220301" + (i >= 10 ? String.valueOf(i) : "0" + i));
     }
-    List filterPartitions = sg.filterPartitionPaths(fakeTimeBasedPartitionsPath);
+    List filterPartitions = (List)sg.filterPartitionPaths(null, fakeTimeBasedPartitionsPath).getLeft();
     assertEquals(1, filterPartitions.size());
     assertEquals(fakeTimeBasedPartitionsPath.get(DateTime.now().getHourOfDay()), filterPartitions.get(0));
     fakeTimeBasedPartitionsPath = new ArrayList<>();
@@ -125,7 +125,7 @@ public class TestSparkClusteringPlanPartitionFilter {
       fakeTimeBasedPartitionsPath.add("20220301" + (i >= 10 ? String.valueOf(i) : "0" + i));
       fakeTimeBasedPartitionsPath.add("20220302" + (i >= 10 ? String.valueOf(i) : "0" + i));
     }
-    filterPartitions = sg.filterPartitionPaths(fakeTimeBasedPartitionsPath);
+    filterPartitions = (List)sg.filterPartitionPaths(null, fakeTimeBasedPartitionsPath).getLeft();
     assertEquals(2, filterPartitions.size());
 
     int hourOfDay = DateTime.now().getHourOfDay();

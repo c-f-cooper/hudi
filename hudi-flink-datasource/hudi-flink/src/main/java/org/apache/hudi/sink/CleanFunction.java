@@ -18,20 +18,21 @@
 
 package org.apache.hudi.sink;
 
+import org.apache.hudi.adapter.AbstractRichFunctionAdapter;
+import org.apache.hudi.adapter.SinkFunctionAdapter;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
+import org.apache.hudi.common.util.Option;
 import org.apache.hudi.configuration.FlinkOptions;
-import org.apache.hudi.sink.utils.NonThrownExecutor;
+import org.apache.hudi.sink.compact.handler.CleanHandler;
+import org.apache.hudi.sink.compact.handler.TableServiceHandlerFactory;
 import org.apache.hudi.util.FlinkWriteClients;
 
-import org.apache.flink.api.common.functions.AbstractRichFunction;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.api.common.state.CheckpointListener;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
-import org.apache.flink.streaming.api.functions.sink.SinkFunction;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Sink function that cleans the old commits.
@@ -40,17 +41,15 @@ import org.slf4j.LoggerFactory;
  * at a time, a new task can not be scheduled until the last task finished(fails or normally succeed).
  * The cleaning task never expects to throw but only log.
  */
-public class CleanFunction<T> extends AbstractRichFunction
-    implements SinkFunction<T>, CheckpointedFunction, CheckpointListener {
-  private static final Logger LOG = LoggerFactory.getLogger(CleanFunction.class);
+@Slf4j
+public class CleanFunction<T> extends AbstractRichFunctionAdapter
+    implements SinkFunctionAdapter<T>, CheckpointedFunction, CheckpointListener {
 
   private final Configuration conf;
 
   protected HoodieFlinkWriteClient writeClient;
 
-  private NonThrownExecutor executor;
-
-  protected volatile boolean isCleaning;
+  private transient Option<CleanHandler> cleanHandlerOpt;
 
   public CleanFunction(Configuration conf) {
     this.conf = conf;
@@ -60,46 +59,19 @@ public class CleanFunction<T> extends AbstractRichFunction
   public void open(Configuration parameters) throws Exception {
     super.open(parameters);
     this.writeClient = FlinkWriteClients.createWriteClient(conf, getRuntimeContext());
-    this.executor = NonThrownExecutor.builder(LOG).waitForTasksFinish(true).build();
-    String instantTime = writeClient.createNewInstantTime();
-    LOG.info(String.format("exec clean with instant time %s...", instantTime));
-    if (conf.getBoolean(FlinkOptions.CLEAN_ASYNC_ENABLED)) {
-      executor.execute(() -> {
-        this.isCleaning = true;
-        try {
-          this.writeClient.clean(instantTime);
-        } finally {
-          this.isCleaning = false;
-        }
-      }, "wait for cleaning finish");
-    }
+    this.cleanHandlerOpt = conf.get(FlinkOptions.CLEAN_ASYNC_ENABLED)
+        ? Option.of(TableServiceHandlerFactory.createCleanHandler(conf, writeClient)) : Option.empty();
+    this.cleanHandlerOpt.ifPresent(CleanHandler::clean);
   }
 
   @Override
   public void notifyCheckpointComplete(long l) throws Exception {
-    if (conf.getBoolean(FlinkOptions.CLEAN_ASYNC_ENABLED) && isCleaning) {
-      executor.execute(() -> {
-        try {
-          this.writeClient.waitForCleaningFinish();
-        } finally {
-          // ensure to switch the isCleaning flag
-          this.isCleaning = false;
-        }
-      }, "wait for cleaning finish");
-    }
+    this.cleanHandlerOpt.ifPresent(CleanHandler::waitForCleaningFinish);
   }
 
   @Override
   public void snapshotState(FunctionSnapshotContext context) throws Exception {
-    if (conf.getBoolean(FlinkOptions.CLEAN_ASYNC_ENABLED) && !isCleaning) {
-      try {
-        this.writeClient.startAsyncCleaning();
-        this.isCleaning = true;
-      } catch (Throwable throwable) {
-        // catch the exception to not affect the normal checkpointing
-        LOG.warn("Error while start async cleaning", throwable);
-      }
-    }
+    this.cleanHandlerOpt.ifPresent(CleanHandler::startAsyncCleaning);
   }
 
   @Override
@@ -109,12 +81,6 @@ public class CleanFunction<T> extends AbstractRichFunction
 
   @Override
   public void close() throws Exception {
-    if (executor != null) {
-      executor.close();
-    }
-
-    if (this.writeClient != null) {
-      this.writeClient.close();
-    }
+    this.cleanHandlerOpt.ifPresent(CleanHandler::close);
   }
 }

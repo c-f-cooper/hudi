@@ -18,11 +18,12 @@
 
 package org.apache.hudi.common.util.collection;
 
+import org.apache.hudi.common.serialization.CustomSerializer;
 import org.apache.hudi.common.util.SizeEstimator;
 import org.apache.hudi.exception.HoodieIOException;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
@@ -37,6 +38,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 /**
@@ -55,11 +57,11 @@ import java.util.stream.Stream;
  * frequently and incur unnecessary disk writes.
  */
 @NotThreadSafe
-public class ExternalSpillableMap<T extends Serializable, R extends Serializable> implements Map<T, R>, Serializable, Closeable {
+@Slf4j
+public class ExternalSpillableMap<T extends Serializable, R> implements Map<T, R>, Serializable, Closeable, KeyFilteringIterable<T, R> {
 
   // Find the actual estimated payload size after inserting N records
   private static final int NUMBER_OF_RECORDS_TO_ESTIMATE_PAYLOAD_SIZE = 100;
-  private static final Logger LOG = LoggerFactory.getLogger(ExternalSpillableMap.class);
   // maximum space allowed in-memory for this map
   private final long maxInMemorySizeInBytes;
   // Map to store key-values in memory until it hits maxInMemorySizeInBytes
@@ -78,24 +80,19 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
   // Enables compression of values stored in disc
   private final boolean isCompressionEnabled;
   // current space occupied by this map in-memory
+  @Getter
   private long currentInMemoryMapSize;
   // An estimate of the size of each payload written to this map
   private volatile long estimatedPayloadSize = 0;
   // Base File Path
   private final String baseFilePath;
+  // Serializer for the values
+  private final CustomSerializer<R> valueSerializer;
+  private final String loggingContext;
 
   public ExternalSpillableMap(long maxInMemorySizeInBytes, String baseFilePath, SizeEstimator<T> keySizeEstimator,
-                              SizeEstimator<R> valueSizeEstimator) throws IOException {
-    this(maxInMemorySizeInBytes, baseFilePath, keySizeEstimator, valueSizeEstimator, DiskMapType.BITCASK);
-  }
-
-  public ExternalSpillableMap(long maxInMemorySizeInBytes, String baseFilePath, SizeEstimator<T> keySizeEstimator,
-                              SizeEstimator<R> valueSizeEstimator, DiskMapType diskMapType) throws IOException {
-    this(maxInMemorySizeInBytes, baseFilePath, keySizeEstimator, valueSizeEstimator, diskMapType, false);
-  }
-
-  public ExternalSpillableMap(long maxInMemorySizeInBytes, String baseFilePath, SizeEstimator<T> keySizeEstimator,
-                              SizeEstimator<R> valueSizeEstimator, DiskMapType diskMapType, boolean isCompressionEnabled) throws IOException {
+                              SizeEstimator<R> valueSizeEstimator, DiskMapType diskMapType, CustomSerializer<R> valueSerializer,
+                              boolean isCompressionEnabled, String loggingContext) throws IOException {
     this.inMemoryMap = new HashMap<>();
     this.baseFilePath = baseFilePath;
     this.maxInMemorySizeInBytes = (long) Math.floor(maxInMemorySizeInBytes * SIZING_FACTOR_FOR_IN_MEMORY_MAP);
@@ -104,6 +101,9 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
     this.valueSizeEstimator = valueSizeEstimator;
     this.diskMapType = diskMapType;
     this.isCompressionEnabled = isCompressionEnabled;
+    this.valueSerializer = valueSerializer;
+    this.loggingContext = loggingContext;
+    log.debug("{} : Initializing ExternalSpillableMap with baseFilePath = {}, maxInMemorySizeInBytes = {}, diskMapType = {}", loggingContext, baseFilePath, maxInMemorySizeInBytes, diskMapType);
   }
 
   private void initDiskBasedMap() {
@@ -113,11 +113,11 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
           try {
             switch (diskMapType) {
               case ROCKS_DB:
-                diskBasedMap = new RocksDbDiskMap<>(baseFilePath);
+                diskBasedMap = new RocksDbDiskMap<>(baseFilePath, valueSerializer);
                 break;
               case BITCASK:
               default:
-                diskBasedMap = new BitCaskDiskMap<>(baseFilePath, isCompressionEnabled);
+                diskBasedMap = new BitCaskDiskMap<>(baseFilePath, valueSerializer, isCompressionEnabled);
             }
           } catch (IOException e) {
             throw new HoodieIOException(e.getMessage(), e);
@@ -130,9 +130,24 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
   /**
    * A custom iterator to wrap over iterating in-memory + disk spilled data.
    */
+  @Override
   public Iterator<R> iterator() {
-
     return diskBasedMap == null ? inMemoryMap.values().iterator() : new IteratorWrapper<>(inMemoryMap.values().iterator(), diskBasedMap.iterator());
+  }
+
+  /**
+   * A custom iterator to wrap over iterating in-memory + disk spilled data.
+   */
+  @Override
+  public Iterator<R> iterator(Predicate<T> filter) {
+    return diskBasedMap == null ? inMemoryMapIterator(filter) : new IteratorWrapper<>(inMemoryMapIterator(filter), diskBasedMap.iterator(filter));
+  }
+
+  /**
+   * In-memory map iterator with a key filter.
+   */
+  private Iterator<R> inMemoryMapIterator(Predicate<T> filter) {
+    return inMemoryMap.entrySet().stream().filter(entry -> filter.test(entry.getKey())).map(Map.Entry::getValue).iterator();
   }
 
   /**
@@ -154,13 +169,6 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
    */
   public int getInMemoryMapNumEntries() {
     return inMemoryMap.size();
-  }
-
-  /**
-   * Approximate memory footprint of the in-memory map.
-   */
-  public long getCurrentInMemoryMapSize() {
-    return currentInMemoryMapSize;
   }
 
   @Override
@@ -203,18 +211,20 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
 
   @Override
   public R put(T key, R value) {
-    if (this.estimatedPayloadSize == 0) {
-      // At first, use the sizeEstimate of a record being inserted into the spillable map.
-      // Note, the converter may over-estimate the size of a record in the JVM
-      this.estimatedPayloadSize = keySizeEstimator.sizeEstimate(key) + valueSizeEstimator.sizeEstimate(value);
-    } else if (this.inMemoryMap.size() % NUMBER_OF_RECORDS_TO_ESTIMATE_PAYLOAD_SIZE == 0) {
-      this.estimatedPayloadSize = (long) (this.estimatedPayloadSize * 0.9 + (keySizeEstimator.sizeEstimate(key) + valueSizeEstimator.sizeEstimate(value)) * 0.1);
-      this.currentInMemoryMapSize = this.inMemoryMap.size() * this.estimatedPayloadSize;
-    }
-
     if (this.inMemoryMap.containsKey(key)) {
       this.inMemoryMap.put(key, value);
     } else if (this.currentInMemoryMapSize < this.maxInMemorySizeInBytes) {
+      if (this.estimatedPayloadSize == 0) {
+        // At first, use the sizeEstimate of a record being inserted into the spillable map.
+        // Note, the converter may over-estimate the size of a record in the JVM
+        this.estimatedPayloadSize = keySizeEstimator.sizeEstimate(key) + valueSizeEstimator.sizeEstimate(value);
+      } else if (this.inMemoryMap.size() % NUMBER_OF_RECORDS_TO_ESTIMATE_PAYLOAD_SIZE == 0) {
+        this.estimatedPayloadSize = (long) (this.estimatedPayloadSize * 0.9 + (keySizeEstimator.sizeEstimate(key) + valueSizeEstimator.sizeEstimate(value)) * 0.1);
+        this.currentInMemoryMapSize = this.inMemoryMap.size() * this.estimatedPayloadSize;
+        if (this.inMemoryMap.size() / NUMBER_OF_RECORDS_TO_ESTIMATE_PAYLOAD_SIZE == 1) {
+          log.info("{} : Updated Estimated Payload size {}", loggingContext, this.estimatedPayloadSize);
+        }
+      }
       this.currentInMemoryMapSize += this.estimatedPayloadSize;
       // Remove the old version of the record from disk first to avoid data duplication.
       if (inDiskContainsKey(key)) {
@@ -223,6 +233,7 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
       this.inMemoryMap.put(key, value);
     } else {
       if (diskBasedMap == null) {
+        log.info("{} : Initializing disk based map as max memory threshold {} is reached", loggingContext, maxInMemorySizeInBytes);
         initDiskBasedMap();
       }
       diskBasedMap.put(key, value);
@@ -259,6 +270,12 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
   }
 
   public void close() {
+    if (!inMemoryMap.isEmpty()) {
+      String diskBasedMapLog = diskBasedMap == null ? "No entries were spilled to disk. " : String.format("Total entries in diskBasedMap %s and rough size spilled to disk %s",
+          diskBasedMap.size(), (estimatedPayloadSize * diskBasedMap.size()));
+      log.info("{} : Total entries in InMemory map {}, with average record size as {}, currentInMemoryMapSize {}. {}", loggingContext,
+          inMemoryMap.size(), estimatedPayloadSize, currentInMemoryMapSize, diskBasedMapLog);
+    }
     inMemoryMap.clear();
     if (diskBasedMap != null) {
       diskBasedMap.close();
@@ -284,7 +301,10 @@ public class ExternalSpillableMap<T extends Serializable, R extends Serializable
     }
     List<R> result = new ArrayList<>(inMemoryMap.size() + diskBasedMap.size());
     result.addAll(inMemoryMap.values());
-    result.addAll(diskBasedMap.values());
+    Iterator<R> iterator = diskBasedMap.iterator();
+    while (iterator.hasNext()) {
+      result.add(iterator.next());
+    }
     return result;
   }
 

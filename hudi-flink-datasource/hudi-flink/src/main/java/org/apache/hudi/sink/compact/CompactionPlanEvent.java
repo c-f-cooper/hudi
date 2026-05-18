@@ -20,11 +20,18 @@ package org.apache.hudi.sink.compact;
 
 import org.apache.hudi.common.model.CompactionOperation;
 
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
 import java.io.Serializable;
 
 /**
  * Represents a compact command from the compaction plan task {@link CompactionPlanOperator}.
  */
+@NoArgsConstructor
+@Getter
+@Setter
 public class CompactionPlanEvent implements Serializable {
   private static final long serialVersionUID = 1L;
 
@@ -32,27 +39,25 @@ public class CompactionPlanEvent implements Serializable {
 
   private CompactionOperation operation;
 
-  public CompactionPlanEvent() {
-  }
+  private int index;
+
+  private boolean isMetadataTable;
+
+  private boolean isLogCompaction;
 
   public CompactionPlanEvent(String instantTime, CompactionOperation operation) {
+    this(instantTime, operation, 0);
+  }
+
+  public CompactionPlanEvent(String instantTime, CompactionOperation operation, int index) {
+    this(instantTime, operation, index, false, false);
+  }
+
+  public CompactionPlanEvent(String instantTime, CompactionOperation operation, int index, boolean isMetadataTable, boolean isLogCompaction) {
     this.compactionInstantTime = instantTime;
     this.operation = operation;
-  }
-
-  public void setCompactionInstantTime(String compactionInstantTime) {
-    this.compactionInstantTime = compactionInstantTime;
-  }
-
-  public void setOperation(CompactionOperation operation) {
-    this.operation = operation;
-  }
-
-  public String getCompactionInstantTime() {
-    return compactionInstantTime;
-  }
-
-  public CompactionOperation getOperation() {
-    return operation;
+    this.index = index;
+    this.isMetadataTable = isMetadataTable;
+    this.isLogCompaction = isLogCompaction;
   }
 }

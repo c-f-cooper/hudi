@@ -45,6 +45,9 @@ public class LockConfiguration implements Serializable {
   public static final String LOCK_ACQUIRE_WAIT_TIMEOUT_MS_PROP_KEY = LOCK_PREFIX + "wait_time_ms";
   public static final int DEFAULT_LOCK_ACQUIRE_WAIT_TIMEOUT_MS = 60 * 1000;
 
+  public static final String LOCK_HEARTBEAT_INTERVAL_MS_KEY = LOCK_PREFIX + "heartbeat_interval_ms";
+  public static final int DEFAULT_LOCK_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+
   // configs for file system based locks. NOTE: This only works for DFS with atomic create/delete operation
   public static final String FILESYSTEM_BASED_LOCK_PROPERTY_PREFIX = LOCK_PREFIX + "filesystem.";
 
@@ -77,6 +80,8 @@ public class LockConfiguration implements Serializable {
   public static final String ZK_PORT_PROP_KEY = ZOOKEEPER_BASED_LOCK_PROPERTY_PREFIX + "port";
 
   public static final String ZK_LOCK_KEY_PROP_KEY = ZOOKEEPER_BASED_LOCK_PROPERTY_PREFIX + "lock_key";
+
+  public static final String LOCK_HOLDER_APP_ID_KEY = LOCK_PREFIX + "app_id";
 
   /** @deprecated Use {@link #LOCK_ACQUIRE_RETRY_WAIT_TIME_IN_MILLIS_PROP_KEY} */
   @Deprecated
@@ -131,7 +136,7 @@ public class LockConfiguration implements Serializable {
   private final TypedProperties props;
 
   public LockConfiguration(Properties props) {
-    this.props = new TypedProperties(props);
+    this.props = TypedProperties.copy(props);
   }
 
   public TypedProperties getConfig() {

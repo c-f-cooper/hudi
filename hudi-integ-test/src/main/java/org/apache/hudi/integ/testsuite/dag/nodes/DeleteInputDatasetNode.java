@@ -22,6 +22,7 @@ package org.apache.hudi.integ.testsuite.dag.nodes;
 import org.apache.hudi.integ.testsuite.configuration.DeltaConfig;
 import org.apache.hudi.integ.testsuite.dag.ExecutionContext;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -29,6 +30,7 @@ import org.apache.hadoop.fs.Path;
 /**
  * Deletes all input except latest batch. Mostly used in insert_overwrite operations.
  */
+@Slf4j
 public class DeleteInputDatasetNode extends DagNode<Boolean> {
 
   public DeleteInputDatasetNode(DeltaConfig.Config config) {
@@ -47,7 +49,7 @@ public class DeleteInputDatasetNode extends DagNode<Boolean> {
       FileStatus[] fileStatuses = fs.listStatus(new Path(inputPathStr));
       for (FileStatus fileStatus : fileStatuses) {
         if (!fileStatus.getPath().getName().equals(latestBatch)) {
-          log.debug("Micro batch to be deleted " + fileStatus.getPath().toString());
+          log.debug("Micro batch to be deleted {}", fileStatus.getPath());
           fs.delete(fileStatus.getPath(), true);
         }
       }

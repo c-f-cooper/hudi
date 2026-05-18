@@ -21,7 +21,6 @@ package org.apache.hudi.utilities;
 
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
-import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.engine.HoodieLocalEngineContext;
 import org.apache.hudi.common.model.HoodieBaseFile;
@@ -34,6 +33,8 @@ import org.apache.hudi.exception.HoodieIOException;
 import org.apache.hudi.exception.TableNotFoundException;
 import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.metadata.HoodieTableMetadata;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.storage.HoodieStorageUtils;
 
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
@@ -43,7 +44,6 @@ import com.codahale.metrics.UniformReservoir;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,18 +54,22 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
+ * TODO: [HUDI-8294]
  * This class provides file size updates for the latest files that hudi is consuming. These stats are at table level by default, but
  * specifying --enable-partition-stats will also show stats at the partition level. If a start date (--start-date parameter) and/or
  * end date (--end-date parameter) are specified, stats are based on files that were modified in the half-open interval
@@ -95,6 +99,7 @@ import java.util.stream.Collectors;
  */
 public class TableSizeStats implements Serializable {
 
+  private static final long serialVersionUID = 1L;
   private static final Logger LOG = LoggerFactory.getLogger(TableSizeStats.class);
 
   // Date formatter for parsing partition dates (example: 2023/5/5/ or 2023-5-5).
@@ -107,9 +112,9 @@ public class TableSizeStats implements Serializable {
   // Spark context
   private transient JavaSparkContext jsc;
   // config
-  private Config cfg;
+  private final Config cfg;
   // Properties with source, hoodie client, key generator etc.
-  private TypedProperties props;
+  private final TypedProperties props;
 
   public TableSizeStats(JavaSparkContext jsc, Config cfg) {
     this.jsc = jsc;
@@ -162,6 +167,9 @@ public class TableSizeStats implements Serializable {
 
     @Parameter(names = {"--spark-memory", "-sm"}, description = "spark memory to use", required = false)
     public String sparkMemory = "1g";
+
+    @Parameter(names = {"--enable-hive-support", "-ehs"}, description = "Enables hive support during spark context initialization.", required = false)
+    public Boolean enableHiveSupport = false;
 
     @Parameter(names = {"--hoodie-conf"}, description = "Any configuration that can be set in the properties file "
         + "(using the CLI parameter \"--props\") can also be passed command line using this parameter. This can be repeated",
@@ -225,17 +233,17 @@ public class TableSizeStats implements Serializable {
       System.exit(1);
     }
 
-    SparkConf sparkConf = UtilHelpers.buildSparkConf("Table-Size-Stats", cfg.sparkMaster);
-    sparkConf.set("spark.executor.memory", cfg.sparkMemory);
-    JavaSparkContext jsc = new JavaSparkContext(sparkConf);
+    Map<String, String> sparkConfigMap = new HashMap<>();
+    sparkConfigMap.put("spark.executor.memory", cfg.sparkMemory);
+    JavaSparkContext jsc = UtilHelpers.buildSparkContext("Table-Size-Stats", cfg.sparkMaster, cfg.enableHiveSupport, sparkConfigMap);
 
     try {
       TableSizeStats tableSizeStats = new TableSizeStats(jsc, cfg);
       tableSizeStats.run();
     } catch (TableNotFoundException e) {
-      LOG.warn(String.format("The Hudi data table is not found: [%s].", cfg.basePath), e);
+      LOG.warn("The Hudi data table is not found: [{}].", cfg.basePath, e);
     } catch (Throwable throwable) {
-      LOG.error("Failed to get table size stats for " + cfg, throwable);
+      LOG.error("Failed to get table size stats for {}", cfg, throwable);
     } finally {
       jsc.stop();
     }
@@ -268,13 +276,17 @@ public class TableSizeStats implements Serializable {
 
   private void logTableStats(String basePath, LocalDate[] dateInterval) throws IOException {
 
-    LOG.warn("Processing table " + basePath);
+    LOG.info("Processing table {}", basePath);
     HoodieMetadataConfig metadataConfig = HoodieMetadataConfig.newBuilder()
         .enable(isMetadataEnabled(basePath, jsc))
         .build();
     HoodieSparkEngineContext engineContext = new HoodieSparkEngineContext(jsc);
-    HoodieTableMetadata tableMetadata = HoodieTableMetadata.create(engineContext, metadataConfig, basePath);
-    SerializableConfiguration serializableConfiguration = new SerializableConfiguration(jsc.hadoopConfiguration());
+    StorageConfiguration<?> storageConf = HadoopFSUtils.getStorageConfWithCopy(jsc.hadoopConfiguration());
+    HoodieTableMetaClient metaClientLocal = HoodieTableMetaClient.builder()
+        .setBasePath(basePath)
+        .setConf(storageConf.newInstance()).build();
+    HoodieTableMetadata tableMetadata = metaClientLocal.getTableFormat().getMetadataFactory().create(
+        engineContext, HoodieStorageUtils.getStorage(basePath, storageConf), metadataConfig, basePath);
 
     List<String> allPartitions = tableMetadata.getAllPartitionPaths();
 
@@ -308,14 +320,11 @@ public class TableSizeStats implements Serializable {
           || (endDate == null && (partitionDate.isEqual(startDate) || partitionDate.isAfter(startDate)))
           || (startDate == null && partitionDate.isBefore(endDate))
           || (startDate != null && endDate != null && ((partitionDate.isEqual(startDate) || partitionDate.isAfter(startDate)) && partitionDate.isBefore(endDate)))) {
-        HoodieTableMetaClient metaClientLocal = HoodieTableMetaClient.builder()
-            .setBasePath(basePath)
-            .setConf(serializableConfiguration.get()).build();
         HoodieMetadataConfig metadataConfig1 = HoodieMetadataConfig.newBuilder()
             .enable(false)
             .build();
         HoodieTableFileSystemView fileSystemView = FileSystemViewManager
-            .createInMemoryFileSystemView(new HoodieLocalEngineContext(serializableConfiguration.get()),
+            .createInMemoryFileSystemView(new HoodieLocalEngineContext(storageConf),
                 metaClientLocal, metadataConfig1);
         List<HoodieBaseFile> baseFiles = fileSystemView.getLatestBaseFiles(partition).collect(Collectors.toList());
 
@@ -349,7 +358,7 @@ public class TableSizeStats implements Serializable {
   private static boolean isMetadataEnabled(String basePath, JavaSparkContext jsc) {
     HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder()
         .setBasePath(basePath)
-        .setConf(jsc.hadoopConfiguration()).build();
+        .setConf(HadoopFSUtils.getStorageConfWithCopy(jsc.hadoopConfiguration())).build();
 
     Set<String> partitions = metaClient.getTableConfig().getMetadataPartitions();
     return !partitions.isEmpty() && partitions.contains("files");
@@ -362,7 +371,7 @@ public class TableSizeStats implements Serializable {
         Option.ofNullable(hadoopConf).orElseGet(Configuration::new)
     );
 
-    try (BufferedReader reader = new BufferedReader(new InputStreamReader(fs.open(new Path(propsPath))))) {
+    try (BufferedReader reader = new BufferedReader(new InputStreamReader(fs.open(new Path(propsPath)), StandardCharsets.UTF_8))) {
       String line = reader.readLine();
       while (line != null) {
         filePaths.add(line);

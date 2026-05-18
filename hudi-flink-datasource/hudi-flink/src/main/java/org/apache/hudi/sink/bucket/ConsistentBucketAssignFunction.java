@@ -18,13 +18,12 @@
 
 package org.apache.hudi.sink.bucket;
 
+import org.apache.hudi.adapter.ProcessFunctionAdapter;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
+import org.apache.hudi.client.model.HoodieFlinkInternalRow;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.ConsistentHashingNode;
 import org.apache.hudi.common.model.HoodieConsistentHashingMetadata;
-import org.apache.hudi.common.model.HoodieKey;
-import org.apache.hudi.common.model.HoodieRecord;
-import org.apache.hudi.common.model.HoodieRecordLocation;
 import org.apache.hudi.common.model.HoodieReplaceCommitMetadata;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
@@ -37,15 +36,13 @@ import org.apache.hudi.index.bucket.ConsistentBucketIdentifier;
 import org.apache.hudi.index.bucket.ConsistentBucketIndexUtils;
 import org.apache.hudi.util.FlinkWriteClients;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
-import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.Preconditions;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
 import java.util.HashMap;
@@ -57,51 +54,52 @@ import java.util.concurrent.TimeUnit;
 /**
  * The function to tag each incoming record with a location of a file based on consistent bucket index.
  */
-public class ConsistentBucketAssignFunction extends ProcessFunction<HoodieRecord, HoodieRecord> implements CheckpointedFunction {
-
-  private static final Logger LOG = LoggerFactory.getLogger(ConsistentBucketAssignFunction.class);
+@Slf4j
+public class ConsistentBucketAssignFunction extends ProcessFunctionAdapter<HoodieFlinkInternalRow, HoodieFlinkInternalRow> implements CheckpointedFunction {
 
   private final Configuration config;
   private final List<String> indexKeyFields;
   private final int bucketNum;
   private transient HoodieFlinkWriteClient writeClient;
   private transient Map<String, ConsistentBucketIdentifier> partitionToIdentifier;
-  private transient String lastRefreshInstant = HoodieTimeline.INIT_INSTANT_TS;
+  private transient String lastRefreshInstant;
   private final int maxRetries = 10;
   private final long maxWaitTimeInMs = 1000;
 
   public ConsistentBucketAssignFunction(Configuration conf) {
     this.config = conf;
     this.indexKeyFields = Arrays.asList(OptionsResolver.getIndexKeyField(conf).split(","));
-    this.bucketNum = conf.getInteger(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS);
+    this.bucketNum = conf.get(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS);
   }
 
   @Override
   public void open(Configuration parameters) throws Exception {
     try {
-      this.writeClient = FlinkWriteClients.createWriteClient(this.config, getRuntimeContext());
+      // not load fs view storage config for incremental job graph, since embedded timeline server
+      // is started in write coordinator which is started after bucket assigner operator finished
+      this.writeClient = FlinkWriteClients.createWriteClient(this.config, getRuntimeContext(), !OptionsResolver.isIncrementalJobGraph(config));
       this.partitionToIdentifier = new HashMap<>();
+      this.lastRefreshInstant = HoodieTimeline.INIT_INSTANT_TS;
     } catch (Throwable e) {
-      LOG.error("Fail to initialize consistent bucket assigner", e);
+      log.error("Fail to initialize consistent bucket assigner", e);
       throw new RuntimeException(e);
     }
   }
 
   @Override
-  public void processElement(HoodieRecord record, Context context, Collector<HoodieRecord> collector) throws Exception {
-    final HoodieKey hoodieKey = record.getKey();
-    final String partition = hoodieKey.getPartitionPath();
+  public void processElement(HoodieFlinkInternalRow income, Context context, Collector<HoodieFlinkInternalRow> collector) throws Exception {
+    String recordKey = income.getRecordKey();
+    String partition = income.getPartitionPath();
 
-    final ConsistentHashingNode node = getBucketIdentifier(partition).getBucket(hoodieKey, indexKeyFields);
+    final ConsistentHashingNode node = getBucketIdentifier(partition).getBucket(recordKey, indexKeyFields);
     Preconditions.checkArgument(
         StringUtils.nonEmpty(node.getFileIdPrefix()),
         "Consistent hashing node has no file group, partition: " + partition + ", meta: "
-            + partitionToIdentifier.get(partition).getMetadata().getFilename() + ", record_key: " + hoodieKey);
+            + partitionToIdentifier.get(partition).getMetadata().getFilename() + ", record_key: " + recordKey);
 
-    record.unseal();
-    record.setCurrentLocation(new HoodieRecordLocation("U", FSUtils.createNewFileId(node.getFileIdPrefix(), 0)));
-    record.seal();
-    collector.collect(record);
+    income.setInstantTime("U");
+    income.setFileId(FSUtils.createNewFileId(node.getFileIdPrefix(), 0));
+    collector.collect(income);
   }
 
   private ConsistentBucketIdentifier getBucketIdentifier(String partition) {
@@ -112,7 +110,7 @@ public class ConsistentBucketAssignFunction extends ProcessFunction<HoodieRecord
       HoodieConsistentHashingMetadata metadata = null;
       while (retryCount <= maxRetries) {
         try {
-          metadata = ConsistentBucketIndexUtils.loadOrCreateMetadata(this.writeClient.getHoodieTable(), p, bucketNum);
+          metadata = ConsistentBucketIndexUtils.loadOrCreateMetadata(this.writeClient.getHoodieTable(false), p, bucketNum);
           break;
         } catch (Exception e) {
           if (retryCount >= maxRetries) {
@@ -123,7 +121,7 @@ public class ConsistentBucketAssignFunction extends ProcessFunction<HoodieRecord
           } catch (InterruptedException ex) {
             // ignore InterruptedException here
           }
-          LOG.info("Retrying to load or create metadata for partition {} for {} times", partition, retryCount + 1);
+          log.info("Retrying to load or create metadata for partition {} for {} times", partition, retryCount + 1);
         } finally {
           retryCount++;
         }
@@ -138,13 +136,12 @@ public class ConsistentBucketAssignFunction extends ProcessFunction<HoodieRecord
     HoodieTimeline timeline = writeClient.getHoodieTable().getActiveTimeline().getCompletedReplaceTimeline().findInstantsAfter(lastRefreshInstant);
     if (!timeline.empty()) {
       for (HoodieInstant instant : timeline.getInstants()) {
-        HoodieReplaceCommitMetadata commitMetadata = HoodieReplaceCommitMetadata.fromBytes(
-            timeline.getInstantDetails(instant).get(), HoodieReplaceCommitMetadata.class);
+        HoodieReplaceCommitMetadata commitMetadata = timeline.readReplaceCommitMetadata(instant);
         Set<String> affectedPartitions = commitMetadata.getPartitionToReplaceFileIds().keySet();
-        LOG.info("Clear up cached hashing metadata because find a new replace commit.\n Instant: {}.\n Effected Partitions: {}.",  lastRefreshInstant, affectedPartitions);
+        log.info("Clear up cached hashing metadata because find a new replace commit.\n Instant: {}.\n Effected Partitions: {}.",  lastRefreshInstant, affectedPartitions);
         affectedPartitions.forEach(this.partitionToIdentifier::remove);
       }
-      this.lastRefreshInstant = timeline.lastInstant().get().getTimestamp();
+      this.lastRefreshInstant = timeline.lastInstant().get().requestedTime();
     }
   }
 

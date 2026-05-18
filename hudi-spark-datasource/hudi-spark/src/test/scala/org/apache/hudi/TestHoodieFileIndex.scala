@@ -31,39 +31,42 @@ import org.apache.hudi.common.model.{HoodieBaseFile, HoodieRecord, HoodieTableTy
 import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient}
 import org.apache.hudi.common.table.view.HoodieTableFileSystemView
 import org.apache.hudi.common.testutils.{HoodieTestDataGenerator, HoodieTestUtils}
-import org.apache.hudi.common.testutils.HoodieTestTable.makeNewCommitTime
-import org.apache.hudi.common.testutils.RawTripTestPayload.recordsToStrings
+import org.apache.hudi.common.testutils.HoodieTestDataGenerator.recordsToStrings
 import org.apache.hudi.common.util.PartitionPathEncodeUtils
 import org.apache.hudi.common.util.StringUtils.isNullOrEmpty
 import org.apache.hudi.config.HoodieWriteConfig
 import org.apache.hudi.exception.HoodieException
 import org.apache.hudi.keygen.TimestampBasedAvroKeyGenerator.TimestampType
-import org.apache.hudi.metadata.HoodieTableMetadata
-import org.apache.hudi.storage.HoodieLocation
+import org.apache.hudi.keygen.constant.KeyGeneratorType
+import org.apache.hudi.storage.StoragePath
+import org.apache.hudi.storage.hadoop.HadoopStorageConfiguration
 import org.apache.hudi.testutils.HoodieSparkClientTestBase
 import org.apache.hudi.util.JFunction
 
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference, EqualTo, GreaterThanOrEqual, LessThan, Literal}
+import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference, EqualTo, Expression, GetStructField, GreaterThanOrEqual, LessThan, Literal, Or}
 import org.apache.spark.sql.execution.datasources.{NoopCache, PartitionDirectory}
 import org.apache.spark.sql.functions.{lit, struct}
 import org.apache.spark.sql.hudi.HoodieSparkSessionExtension
-import org.apache.spark.sql.types.{IntegerType, StringType}
+import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 import org.junit.jupiter.api.{BeforeEach, Test}
-import org.junit.jupiter.api.Assertions.{assertEquals, assertTrue}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows, assertTrue}
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.{Arguments, CsvSource, MethodSource, ValueSource}
 
 import java.util.Properties
 import java.util.function.Consumer
 
-import scala.collection.JavaConversions._
 import scala.collection.JavaConverters._
 import scala.util.Random
 
 class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionSupport {
+  protected def withRDDPersistenceValidation(f: => Unit): Unit = {
+    org.apache.hudi.testutils.SparkRDDValidationUtils.withRDDPersistenceValidation(spark, new org.apache.hudi.testutils.SparkRDDValidationUtils.ThrowingRunnable {
+      override def run(): Unit = f
+    })
+  }
 
   var spark: SparkSession = _
   val commonOpts = Map(
@@ -71,16 +74,15 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     "hoodie.upsert.shuffle.parallelism" -> "4",
     DataSourceWriteOptions.RECORDKEY_FIELD.key -> "_row_key",
     DataSourceWriteOptions.PARTITIONPATH_FIELD.key -> "partition",
-    DataSourceWriteOptions.PRECOMBINE_FIELD.key -> "timestamp",
+    HoodieTableConfig.ORDERING_FIELDS.key() -> "timestamp",
     HoodieWriteConfig.TBL_NAME.key -> "hoodie_test"
   )
 
   var queryOpts = Map(
-    DataSourceReadOptions.ENABLE_HOODIE_FILE_INDEX.key -> "true",
     DataSourceReadOptions.QUERY_TYPE.key -> DataSourceReadOptions.QUERY_TYPE_SNAPSHOT_OPT_VAL
   )
 
-  override def getSparkSessionExtensionsInjector: org.apache.hudi.common.util.Option[Consumer[SparkSessionExtensions]] =
+  override def getSparkSessionExtensionsInjector: common.util.Option[Consumer[SparkSessionExtensions]] =
     toJavaOption(
       Some(
         JFunction.toJavaConsumer((receiver: SparkSessionExtensions) =>
@@ -102,7 +104,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     props.setProperty(DataSourceWriteOptions.URL_ENCODE_PARTITIONING.key, String.valueOf(partitionEncode))
     initMetaClient(props)
     val records1 = dataGen.generateInsertsContainsAllPartitions("000", 100)
-    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
+    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1).asScala.toSeq, 2))
     inputDF1.write.format("hudi")
       .options(commonOpts)
       .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
@@ -114,11 +116,41 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     assertEquals("partition", fileIndex.partitionSchema.fields.map(_.name).mkString(","))
   }
 
+  /**
+   * Unit test for `parsePartitionColumnValues` method in `SparkHoodieTableFileIndex`.
+   *
+   * This test verifies that the `parsePartitionColumnValues` method correctly returns
+   * partition values when the `propsMap` in the table configuration does not contain the
+   * expected timestamp configuration key, simulating a `null` scenario. Specifically,
+   * this test validates the behavior for the `TIMESTAMP` key generator type, ensuring
+   * that the partition path string is passed as `UTF8String` in the result array.
+   */
+  @Test
+  def testParsePartitionValues(): Unit = {
+    // Set up table configuration and schema to use TIMESTAMP key generator
+    val tableConfig = metaClient.getTableConfig
+    tableConfig.setValue(HoodieTableConfig.KEY_GENERATOR_TYPE, KeyGeneratorType.TIMESTAMP.name())
+    tableConfig.setValue(HoodieTableConfig.PARTITION_FIELDS, "col1")
+    // Define schema with one partition column (col1)
+    val fields = List(
+      StructField.apply("f1", DataTypes.DoubleType, nullable = true),
+      StructField.apply("col1", DataTypes.LongType, nullable = true))
+    val schema = StructType.apply(fields)
+    // Set partition column and partition path for testing
+    val partitionColumns = Array("col1")
+    val partitionPath = "2023/10/28"
+    val fileIndex = HoodieFileIndex(spark, metaClient, Some(schema), queryOpts)
+    // Create file index and validate the result
+    val result = fileIndex.parsePartitionColumnValues(partitionColumns, partitionPath)
+    assertEquals(1, result.length)
+    assertEquals(UTF8String.fromString(partitionPath), result(0))
+  }
+
   @ParameterizedTest
   @MethodSource(Array("keyGeneratorParameters"))
   def testPartitionSchemaForBuiltInKeyGenerator(keyGenerator: String): Unit = {
     val records1 = dataGen.generateInsertsContainsAllPartitions("000", 100)
-    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
+    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1).asScala.toSeq, 2))
     val writer: DataFrameWriter[Row] = inputDF1.write.format("hudi")
       .options(commonOpts)
       .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
@@ -145,7 +177,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     "org.apache.hudi.keygen.CustomAvroKeyGenerator"))
   def testPartitionSchemaForCustomKeyGenerator(keyGenerator: String): Unit = {
     val records1 = dataGen.generateInsertsContainsAllPartitions("000", 100)
-    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
+    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1).asScala.toSeq, 2))
     inputDF1.write.format("hudi")
       .options(commonOpts)
       .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
@@ -161,17 +193,18 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
   @Test
   def testPartitionSchemaWithoutKeyGenerator(): Unit = {
     val metaClient = HoodieTestUtils.init(
-      hadoopConf, basePath, HoodieTableType.COPY_ON_WRITE, HoodieTableMetaClient.withPropertyBuilder()
+      storageConf, basePath, HoodieTableType.COPY_ON_WRITE, HoodieTableMetaClient.newTableBuilder()
         .fromMetaClient(this.metaClient)
         .setRecordKeyFields("_row_key")
         .setPartitionFields("partition_path")
-        .setTableName("hoodie_test").build())
+        .setTableName("hoodie_test")
+        .build())
     val props = Map(
       "hoodie.insert.shuffle.parallelism" -> "4",
       "hoodie.upsert.shuffle.parallelism" -> "4",
       DataSourceWriteOptions.RECORDKEY_FIELD.key -> "_row_key",
       DataSourceWriteOptions.PARTITIONPATH_FIELD.key -> "partition_path",
-      DataSourceWriteOptions.PRECOMBINE_FIELD.key -> "timestamp",
+      HoodieTableConfig.ORDERING_FIELDS.key() -> "timestamp",
       HoodieWriteConfig.TBL_NAME.key -> "hoodie_test",
       DataSourceWriteOptions.OPERATION.key -> DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL
     )
@@ -179,17 +212,16 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
       .withEngineType(EngineType.JAVA)
       .withPath(basePath)
       .withSchema(HoodieTestDataGenerator.TRIP_EXAMPLE_SCHEMA)
-      .withProps(props)
+      .withProps(props.asJava)
       .build()
-    val context = new HoodieJavaEngineContext(new Configuration())
+    val context = new HoodieJavaEngineContext(HoodieTestUtils.getDefaultStorageConf)
     val writeClient = new HoodieJavaWriteClient(context, writeConfig)
-    val instantTime = makeNewCommitTime()
+    val instantTime = writeClient.startCommit()
 
     val records: java.util.List[HoodieRecord[Nothing]] =
       dataGen.generateInsertsContainsAllPartitions(instantTime, 100)
         .asInstanceOf[java.util.List[HoodieRecord[Nothing]]]
-    writeClient.startCommitWithTime(instantTime)
-    writeClient.insert(records, instantTime)
+    writeClient.commit(instantTime, writeClient.insert(records, instantTime))
     metaClient.reloadActiveTimeline()
 
     val fileIndex = HoodieFileIndex(spark, metaClient, None, queryOpts)
@@ -200,47 +232,49 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
   @ParameterizedTest
   @CsvSource(Array("true,true", "true,false", "false,true", "false,false"))
   def testPartitionPruneWithPartitionEncode(partitionEncode: Boolean, listLazily: Boolean): Unit = {
-    val props = new Properties()
-    props.setProperty(DataSourceWriteOptions.URL_ENCODE_PARTITIONING.key, String.valueOf(partitionEncode))
-    initMetaClient(props)
-    val partitions = Array("2021/03/08", "2021/03/09", "2021/03/10", "2021/03/11", "2021/03/12")
-    val newDataGen = new HoodieTestDataGenerator(partitions)
-    val records1 = newDataGen.generateInsertsContainsAllPartitions("000", 100)
-    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1), 2))
-    inputDF1.write.format("hudi")
-      .options(commonOpts)
-      .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
-      .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING.key, partitionEncode)
-      .mode(SaveMode.Overwrite)
-      .save(basePath)
-    metaClient = HoodieTableMetaClient.reload(metaClient)
+    withRDDPersistenceValidation {
+      val props = new Properties()
+      props.setProperty(DataSourceWriteOptions.URL_ENCODE_PARTITIONING.key, String.valueOf(partitionEncode))
+      initMetaClient(props)
+      val partitions = Array("2021/03/08", "2021/03/09", "2021/03/10", "2021/03/11", "2021/03/12")
+      val newDataGen = new HoodieTestDataGenerator(partitions)
+      val records1 = newDataGen.generateInsertsContainsAllPartitions("000", 100)
+      val inputDF1 = spark.read.json(spark.sparkContext.parallelize(recordsToStrings(records1).asScala.toSeq, 2))
+      inputDF1.write.format("hudi")
+        .options(commonOpts)
+        .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
+        .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING.key, partitionEncode)
+        .mode(SaveMode.Overwrite)
+        .save(basePath)
+      metaClient = HoodieTableMetaClient.reload(metaClient)
 
-    val listingMode = if (listLazily) FILE_INDEX_LISTING_MODE_LAZY else FILE_INDEX_LISTING_MODE_EAGER
+      val listingMode = if (listLazily) FILE_INDEX_LISTING_MODE_LAZY else FILE_INDEX_LISTING_MODE_EAGER
 
-    val opts = queryOpts + (DataSourceReadOptions.FILE_INDEX_LISTING_MODE_OVERRIDE.key -> listingMode)
-    val fileIndex = HoodieFileIndex(spark, metaClient, None, opts)
+      val opts = queryOpts + (DataSourceReadOptions.FILE_INDEX_LISTING_MODE_OVERRIDE.key -> listingMode)
+      val fileIndex = HoodieFileIndex(spark, metaClient, None, opts)
 
-    val partitionFilter1 = EqualTo(attribute("partition"), literal("2021/03/08"))
-    val partitionName = if (partitionEncode) PartitionPathEncodeUtils.escapePathName("2021/03/08")
-    else "2021/03/08"
-    val partitionAndFilesAfterPrune = fileIndex.listFiles(Seq(partitionFilter1), Seq.empty)
-    assertEquals(1, partitionAndFilesAfterPrune.size)
+      val partitionFilter1 = EqualTo(attribute("partition"), literal("2021/03/08"))
+      val partitionName = if (partitionEncode) PartitionPathEncodeUtils.escapePathName("2021/03/08")
+      else "2021/03/08"
+      val partitionAndFilesAfterPrune = fileIndex.listFiles(Seq(partitionFilter1), Seq.empty)
+      assertEquals(1, partitionAndFilesAfterPrune.size)
 
-    val PartitionDirectory(partitionValues, filesInPartition) = partitionAndFilesAfterPrune(0)
-    assertEquals(partitionValues.toSeq(Seq(StringType)).mkString(","), "2021/03/08")
-    assertEquals(getFileCountInPartitionPath(partitionName), filesInPartition.size)
+      val PartitionDirectory(partitionValues, filesInPartition) = partitionAndFilesAfterPrune(0)
+      assertEquals(partitionValues.toSeq(Seq(StringType)).mkString(","), "2021/03/08")
+      assertEquals(getFileCountInPartitionPath(partitionName), filesInPartition.size)
 
-    val partitionFilter2 = And(
-      GreaterThanOrEqual(attribute("partition"), literal("2021/03/08")),
-      LessThan(attribute("partition"), literal("2021/03/10"))
-    )
-    val prunedPartitions = fileIndex.listFiles(Seq(partitionFilter2), Seq.empty)
-      .map(_.values.toSeq(Seq(StringType))
-        .mkString(","))
-      .toList
-      .sorted
+      val partitionFilter2 = And(
+        GreaterThanOrEqual(attribute("partition"), literal("2021/03/08")),
+        LessThan(attribute("partition"), literal("2021/03/10"))
+      )
+      val prunedPartitions = fileIndex.listFiles(Seq(partitionFilter2), Seq.empty)
+        .map(_.values.toSeq(Seq(StringType))
+          .mkString(","))
+        .toList
+        .sorted
 
-    assertEquals(List("2021/03/08", "2021/03/09"), prunedPartitions)
+      assertEquals(List("2021/03/08", "2021/03/09"), prunedPartitions)
+    }
   }
 
   @ParameterizedTest
@@ -278,13 +312,13 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
 
     val listFilesAfterFirstWrite = fileIndexFirstWrite.listFiles(Nil, Nil)
     val distinctListOfCommitTimesAfterFirstWrite = getDistinctCommitTimeFromAllFilesInIndex(listFilesAfterFirstWrite)
-    val firstWriteCommitTime = metaClient.getActiveTimeline.filterCompletedInstants().lastInstant().get().getTimestamp
+    val firstWriteCommitTime = metaClient.getActiveTimeline.filterCompletedInstants().lastInstant().get().requestedTime
     assertEquals(1, distinctListOfCommitTimesAfterFirstWrite.size, "Should have only one commit")
     assertEquals(firstWriteCommitTime, distinctListOfCommitTimesAfterFirstWrite.head, "All files should belong to the first existing commit")
 
     val nextBatch = for (
       i <- 0 to 4
-    ) yield(r.nextString(1000), i, r.nextString(1000))
+    ) yield (r.nextString(1000), i, r.nextString(1000))
 
     nextBatch.toDF("_row_key", "partition", "timestamp")
       .write
@@ -298,7 +332,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     val fileSlicesAfterSecondWrite = fileIndexFirstWrite.listFiles(Nil, Nil)
     val distinctListOfCommitTimesAfterSecondWrite = getDistinctCommitTimeFromAllFilesInIndex(fileSlicesAfterSecondWrite)
     metaClient = HoodieTableMetaClient.reload(metaClient)
-    val lastCommitTime = metaClient.getActiveTimeline.filterCompletedInstants().lastInstant().get().getTimestamp
+    val lastCommitTime = metaClient.getActiveTimeline.filterCompletedInstants().lastInstant().get().requestedTime
 
     assertEquals(1, distinctListOfCommitTimesAfterSecondWrite.size, "All basefiles affected so all have same commit time")
     assertEquals(lastCommitTime, distinctListOfCommitTimesAfterSecondWrite.head, "All files should be of second commit after index refresh")
@@ -316,7 +350,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     val writerOpts: Map[String, String] = commonOpts ++ Map(
       DataSourceWriteOptions.OPERATION.key -> DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL,
       RECORDKEY_FIELD.key -> "id",
-      PRECOMBINE_FIELD.key -> "version",
+      HoodieTableConfig.ORDERING_FIELDS.key() -> "version",
       PARTITIONPATH_FIELD.key -> "dt,hh",
       HoodieMetadataConfig.ENABLE.key -> useMetadataTable.toString
     )
@@ -459,7 +493,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     val writerOpts: Map[String, String] = commonOpts ++ Map(
       DataSourceWriteOptions.OPERATION.key -> DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL,
       RECORDKEY_FIELD.key -> "id",
-      PRECOMBINE_FIELD.key -> "version",
+      HoodieTableConfig.ORDERING_FIELDS.key() -> "version",
       PARTITIONPATH_FIELD.key -> partitionNames.mkString(","),
       HoodieMetadataConfig.ENABLE.key -> useMetadataTable.toString
     )
@@ -510,56 +544,57 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
   def testFileListingPartitionPrefixAnalysis(enablePartitionPathPrefixAnalysis: Boolean): Unit = {
     val _spark = spark
     import _spark.implicits._
+    withRDDPersistenceValidation {
+      val writerOpts: Map[String, String] = commonOpts ++ Map(
+        DataSourceWriteOptions.OPERATION.key -> DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL,
+        RECORDKEY_FIELD.key -> "id",
+        HoodieTableConfig.ORDERING_FIELDS.key() -> "version",
+        PARTITIONPATH_FIELD.key -> "dt,hh"
+      )
 
-    val writerOpts: Map[String, String] = commonOpts ++ Map(
-      DataSourceWriteOptions.OPERATION.key -> DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL,
-      RECORDKEY_FIELD.key -> "id",
-      PRECOMBINE_FIELD.key -> "version",
-      PARTITIONPATH_FIELD.key -> "dt,hh"
-    )
+      val readerOpts: Map[String, String] = queryOpts ++ Map(
+        DataSourceReadOptions.FILE_INDEX_LISTING_MODE_OVERRIDE.key -> "eager",
+        DataSourceReadOptions.FILE_INDEX_LISTING_PARTITION_PATH_PREFIX_ANALYSIS_ENABLED.key -> enablePartitionPathPrefixAnalysis.toString
+      )
 
-    val readerOpts: Map[String, String] = queryOpts ++ Map(
-      DataSourceReadOptions.FILE_INDEX_LISTING_MODE_OVERRIDE.key -> "eager",
-      DataSourceReadOptions.FILE_INDEX_LISTING_PARTITION_PATH_PREFIX_ANALYSIS_ENABLED.key -> enablePartitionPathPrefixAnalysis.toString
-    )
+      // Test the case the partition column size is equal to the partition directory level.
+      val inputDF1 = (for (i <- 0 until 10) yield (i, s"a$i", 10 + i, 10000,
+        s"2021/03/0${i % 2 + 1}", s"${i % 3}")).toDF("id", "name", "price", "version", "dt", "hh")
 
-    // Test the case the partition column size is equal to the partition directory level.
-    val inputDF1 = (for (i <- 0 until 10) yield (i, s"a$i", 10 + i, 10000,
-      s"2021/03/0${i % 2 + 1}", s"${i % 3}")).toDF("id", "name", "price", "version", "dt", "hh")
+      inputDF1.write.format("hudi")
+        .options(writerOpts)
+        .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING.key, "false")
+        .mode(SaveMode.Overwrite)
+        .save(basePath)
 
-    inputDF1.write.format("hudi")
-      .options(writerOpts)
-      .option(DataSourceWriteOptions.URL_ENCODE_PARTITIONING.key, "false")
-      .mode(SaveMode.Overwrite)
-      .save(basePath)
+      metaClient = HoodieTableMetaClient.reload(metaClient)
+      val fileIndex = HoodieFileIndex(spark, metaClient, None, readerOpts)
 
-    metaClient = HoodieTableMetaClient.reload(metaClient)
-    val fileIndex = HoodieFileIndex(spark, metaClient, None, readerOpts)
+      val partitionFilters = EqualTo(attribute("dt"), literal("2021/03/01"))
+      val partitionAndFilesAfterPrune = fileIndex.listFiles(Seq(partitionFilters), Seq.empty)
 
-    val partitionFilters = EqualTo(attribute("dt"), literal("2021/03/01"))
-    val partitionAndFilesAfterPrune = fileIndex.listFiles(Seq(partitionFilters), Seq.empty)
+      // In this case only partitions nested under `2021-03-01` folder should be listed
+      assertEquals(1, partitionAndFilesAfterPrune.size)
 
-    // In this case only partitions nested under `2021-03-01` folder should be listed
-    assertEquals(1, partitionAndFilesAfterPrune.size)
+      val (partitionValuesSeq, perPartitionFilesSeq) = partitionAndFilesAfterPrune.map {
+        case PartitionDirectory(values, files) => (values.toSeq(Seq(StringType)), files)
+      }.unzip
 
-    val (partitionValuesSeq, perPartitionFilesSeq) = partitionAndFilesAfterPrune.map {
-      case PartitionDirectory(values, files) => (values.toSeq(Seq(StringType)), files)
-    }.unzip
+      val expectedListedFiles = if (enablePartitionPathPrefixAnalysis) {
+        getFileCountInPartitionPaths("2021/03/01/0", "2021/03/01/1", "2021/03/01/2")
+      } else {
+        fileIndex.allBaseFiles.length
+      }
 
-    val expectedListedFiles = if (enablePartitionPathPrefixAnalysis) {
-      getFileCountInPartitionPaths("2021/03/01/0", "2021/03/01/1", "2021/03/01/2")
-    } else {
-      fileIndex.allBaseFiles.length
+      assertEquals(expectedListedFiles, perPartitionFilesSeq.map(_.size).sum)
+
+      val readDF = spark.read.format("hudi").options(readerOpts).load()
+
+      assertEquals(10, readDF.count())
+      assertEquals(3, readDF.filter("hh = '1'").count())
+      assertEquals(5, readDF.filter("dt = '2021/03/01'").count())
+      assertEquals(1, readDF.filter("dt = '2021/03/01' and hh = '1'").count())
     }
-
-    assertEquals(expectedListedFiles, perPartitionFilesSeq.map(_.size).sum)
-
-    val readDF = spark.read.format("hudi").options(readerOpts).load()
-
-    assertEquals(10, readDF.count())
-    assertEquals(3, readDF.filter("hh = '1'").count())
-    assertEquals(5, readDF.filter("dt = '2021/03/01'").count())
-    assertEquals(1, readDF.filter("dt = '2021/03/01' and hh = '1'").count())
   }
 
   @ParameterizedTest
@@ -575,7 +610,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
       HoodieMetadataConfig.ENABLE.key -> enableMetadataTable.toString,
       RECORDKEY_FIELD.key -> "id",
       PARTITIONPATH_FIELD.key -> "region_code,dt",
-      DataSourceWriteOptions.PRECOMBINE_FIELD.key -> "price"
+      HoodieTableConfig.ORDERING_FIELDS.key() -> "price"
     )
 
     val readerOpts: Map[String, String] = queryOpts ++ Map(
@@ -604,20 +639,21 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     metaClient = HoodieTableMetaClient.reload(metaClient)
 
     // Test getting partition paths in a subset of directories
-    val metadata = HoodieTableMetadata.create(context,
+    val metadata = metaClient.getTableFormat.getMetadataFactory.create(context,
+      metaClient.getStorage,
       HoodieMetadataConfig.newBuilder().enable(enableMetadataTable).build(),
-      metaClient.getBasePathV2.toString)
+      metaClient.getBasePath.toString)
     assertEquals(
       Seq("1/2023/01/01", "1/2023/01/02"),
-      metadata.getPartitionPathWithPathPrefixes(Seq("1")).sorted)
+      metadata.getPartitionPathWithPathPrefixes(Seq("1").asJava).asScala.sorted)
     assertEquals(
       Seq("1/2023/01/01", "1/2023/01/02", "10/2023/01/01", "10/2023/01/02",
         "100/2023/01/01", "100/2023/01/02", "2/2023/01/01", "2/2023/01/02",
         "20/2023/01/01", "20/2023/01/02", "200/2023/01/01", "200/2023/01/02"),
-      metadata.getPartitionPathWithPathPrefixes(Seq("")).sorted)
+      metadata.getPartitionPathWithPathPrefixes(Seq("").asJava).asScala.sorted)
     assertEquals(
       Seq("1/2023/01/01"),
-      metadata.getPartitionPathWithPathPrefixes(Seq("1/2023/01/01")).sorted)
+      metadata.getPartitionPathWithPathPrefixes(Seq("1/2023/01/01").asJava).asScala.sorted)
 
     val fileIndex = HoodieFileIndex(spark, metaClient, None, readerOpts)
     val readDF = spark.read.format("hudi").options(readerOpts).load()
@@ -657,7 +693,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
           (values.toSeq(Seq(StringType)), files)
       }.unzip
       val partitionPaths = perPartitionFilesSeq.flatten
-        .map(file => extractPartitionPathFromFilePath(file.getPath))
+        .map(file => extractPartitionPathFromFilePath(new StoragePath(file.getPath.toUri)))
         .distinct
         .sorted
       val expectedPartitionPaths = if (testCase._3) {
@@ -677,8 +713,8 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     })
   }
 
-  private def extractPartitionPathFromFilePath(filePath: Path): String = {
-    val relativeFilePath = FSUtils.getRelativePartitionPath(metaClient.getBasePathV2, filePath)
+  private def extractPartitionPathFromFilePath(filePath: StoragePath): String = {
+    val relativeFilePath = FSUtils.getRelativePartitionPath(metaClient.getBasePath, filePath)
     val names = relativeFilePath.split("/")
     val fileName = names(names.length - 1)
     relativeFilePath.stripSuffix(fileName).stripSuffix("/")
@@ -695,7 +731,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
       .options(commonOpts)
       .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.INSERT_OPERATION_OPT_VAL)
       .option(RECORDKEY_FIELD.key, "id")
-      .option(PRECOMBINE_FIELD.key, "id")
+      .option(HoodieTableConfig.ORDERING_FIELDS.key, "id")
       .option(PARTITIONPATH_FIELD.key, partitionBy)
       .option(HoodieMetadataConfig.ENABLE.key(), useMetaFileList)
       .mode(SaveMode.Overwrite)
@@ -704,7 +740,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     val fileIndex = HoodieFileIndex(spark, metaClient, None,
       queryOpts ++ Map(HoodieMetadataConfig.ENABLE.key -> useMetaFileList.toString))
     // test if table is partitioned on nested columns, getAllQueryPartitionPaths does not break
-    assert(fileIndex.getAllQueryPartitionPaths.get(0).path.equals("c"))
+    assert(fileIndex.getAllQueryPartitionPaths.get(0).getPath.equals("c"))
   }
 
   @Test
@@ -726,7 +762,7 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
       "hoodie.upsert.shuffle.parallelism" -> "4",
       HoodieWriteConfig.TBL_NAME.key -> "hoodie_test",
       RECORDKEY_FIELD.key -> "id",
-      PRECOMBINE_FIELD.key -> "id",
+      HoodieTableConfig.ORDERING_FIELDS.key() -> "id",
       HoodieTableConfig.POPULATE_META_FIELDS.key -> "true"
     ) ++ writeMetadataOpts
 
@@ -751,13 +787,13 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
 
     val testCases: Seq[TestCase] =
       TestCase(enableMetadata = false, enableColumnStats = false, enableDataSkipping = false) ::
-      TestCase(enableMetadata = false, enableColumnStats = false, enableDataSkipping = true) ::
-      TestCase(enableMetadata = true, enableColumnStats = false, enableDataSkipping = true) ::
-      TestCase(enableMetadata = false, enableColumnStats = true, enableDataSkipping = true) ::
-      TestCase(enableMetadata = true, enableColumnStats = true, enableDataSkipping = true) ::
-      TestCase(enableMetadata = true, enableColumnStats = true, enableDataSkipping = true, columnStatsProcessingModeOverride = HoodieMetadataConfig.COLUMN_STATS_INDEX_PROCESSING_MODE_IN_MEMORY) ::
-      TestCase(enableMetadata = true, enableColumnStats = true, enableDataSkipping = true, columnStatsProcessingModeOverride = HoodieMetadataConfig.COLUMN_STATS_INDEX_PROCESSING_MODE_ENGINE) ::
-      Nil
+        TestCase(enableMetadata = false, enableColumnStats = false, enableDataSkipping = true) ::
+        TestCase(enableMetadata = true, enableColumnStats = false, enableDataSkipping = true) ::
+        TestCase(enableMetadata = false, enableColumnStats = true, enableDataSkipping = true) ::
+        TestCase(enableMetadata = true, enableColumnStats = true, enableDataSkipping = true) ::
+        TestCase(enableMetadata = true, enableColumnStats = true, enableDataSkipping = true, columnStatsProcessingModeOverride = HoodieMetadataConfig.COLUMN_STATS_INDEX_PROCESSING_MODE_IN_MEMORY) ::
+        TestCase(enableMetadata = true, enableColumnStats = true, enableDataSkipping = true, columnStatsProcessingModeOverride = HoodieMetadataConfig.COLUMN_STATS_INDEX_PROCESSING_MODE_ENGINE) ::
+        Nil
 
     for (testCase <- testCases) {
       val readMetadataOpts = Map(
@@ -802,7 +838,8 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
   private def getFileCountInPartitionPath(partitionPath: String): Int = {
     metaClient.reloadActiveTimeline()
     val activeInstants = metaClient.getActiveTimeline.getCommitsTimeline.filterCompletedInstants
-    val fileSystemView = new HoodieTableFileSystemView(metaClient, activeInstants)
+    val fileSystemView = HoodieTableFileSystemView.fileListingBasedFileSystemView(
+      new HoodieJavaEngineContext(new HadoopStorageConfiguration(false)), metaClient, activeInstants)
     fileSystemView.getAllBaseFiles(partitionPath).iterator().asScala.toSeq.length
   }
 
@@ -816,11 +853,40 @@ class TestHoodieFileIndex extends HoodieSparkClientTestBase with ScalaAssertionS
     if (hiveStylePartitioning) {
       partitionNames.zip(partitionValues).map {
         case (name, value) => s"$name=$value"
-      }.mkString(HoodieLocation.SEPARATOR)
+      }.mkString(StoragePath.SEPARATOR)
     } else {
-      partitionValues.mkString(HoodieLocation.SEPARATOR)
+      partitionValues.mkString(StoragePath.SEPARATOR)
     }
   }
+
+  // ---- buildNestedPartitionSchema tests ----
+
+  @ParameterizedTest
+  @MethodSource(Array("buildNestedPartitionSchemaCases"))
+  def testBuildNestedPartitionSchema(name: String, flat: StructType, expected: StructType): Unit = {
+    assertEquals(expected, SparkHoodieTableFileIndex.buildNestedPartitionSchema(flat))
+  }
+
+  @Test
+  def testBuildNestedPartitionSchemaConflictThrows(): Unit = {
+    // "a" as leaf and "a.b" as nested — conflict
+    val flat = StructType(Seq(StructField("a", StringType), StructField("a.b", IntegerType)))
+    assertThrows(classOf[IllegalStateException]) {
+      SparkHoodieTableFileIndex.buildNestedPartitionSchema(flat)
+    }
+  }
+
+  // ---- extractNestedPartitionFilters tests ----
+
+  @ParameterizedTest
+  @MethodSource(Array("extractNestedPartitionFiltersCases"))
+  def testExtractNestedPartitionFilters(name: String,
+                                        filters: Seq[Expression],
+                                        partitionColumns: Set[String],
+                                        expected: Seq[Expression]): Unit = {
+    assertEquals(expected, HoodieFileIndex.extractNestedPartitionFilters(filters, partitionColumns))
+  }
+
 }
 
 object TestHoodieFileIndex {
@@ -831,6 +897,67 @@ object TestHoodieFileIndex {
       Arguments.arguments("org.apache.hudi.keygen.ComplexKeyGenerator"),
       Arguments.arguments("org.apache.hudi.keygen.SimpleKeyGenerator"),
       Arguments.arguments("org.apache.hudi.keygen.TimestampBasedKeyGenerator")
+    )
+  }
+
+  def buildNestedPartitionSchemaCases(): java.util.stream.Stream[Arguments] = {
+    val nested = StructType(Seq(
+      StructField("nested_record", StructType(Seq(StructField("level", StringType, nullable = true))), nullable = true)))
+    val twoLevel = StructType(Seq(
+      StructField("a", StructType(Seq(
+        StructField("b", StructType(Seq(StructField("c", IntegerType, nullable = true))), nullable = true))), nullable = true)))
+    val siblings = StructType(Seq(
+      StructField("a", StructType(Seq(
+        StructField("b", StringType, nullable = true),
+        StructField("c", IntegerType, nullable = true))), nullable = true)))
+    val mixed = StructType(Seq(
+      StructField("country", StringType, nullable = true),
+      StructField("nested_record", StructType(Seq(StructField("level", StringType, nullable = true))), nullable = true)))
+    java.util.stream.Stream.of(
+      Arguments.of("empty",
+        new StructType(),
+        new StructType()),
+      Arguments.of("flat",
+        StructType(Seq(StructField("country", StringType))),
+        StructType(Seq(StructField("country", StringType, nullable = true)))),
+      Arguments.of("singleNested",
+        StructType(Seq(StructField("nested_record.level", StringType))),
+        nested),
+      Arguments.of("twoLevelNesting",
+        StructType(Seq(StructField("a.b.c", IntegerType))),
+        twoLevel),
+      Arguments.of("siblingFields",
+        StructType(Seq(StructField("a.b", StringType), StructField("a.c", IntegerType))),
+        siblings),
+      Arguments.of("mixedFlatAndNested",
+        StructType(Seq(StructField("country", StringType), StructField("nested_record.level", StringType))),
+        mixed)
+    )
+  }
+
+  def extractNestedPartitionFiltersCases(): java.util.stream.Stream[Arguments] = {
+    val levelStruct = StructType(Seq(StructField("level", StringType)))
+    val multiFieldStruct = StructType(Seq(
+      StructField("nested_int", IntegerType), StructField("level", StringType)))
+
+    val partFilter = EqualTo(
+      GetStructField(AttributeReference("nested_record", levelStruct)(), 0, Some("level")),
+      Literal("INFO"))
+    val dataFilter = EqualTo(AttributeReference("int_field", IntegerType)(), Literal(5))
+    val siblingFilter = EqualTo(
+      GetStructField(AttributeReference("nested_record", multiFieldStruct)(), 0, Some("nested_int")),
+      Literal(10))
+    val orFilter = Or(
+      EqualTo(GetStructField(AttributeReference("nested_record", levelStruct)(), 0, Some("level")), Literal("INFO")),
+      EqualTo(GetStructField(AttributeReference("nested_record", levelStruct)(), 0, Some("level")), Literal("ERROR")))
+
+    java.util.stream.Stream.of(
+      Arguments.of("partitionFilterExtractedDataFilterDropped",
+        Seq(partFilter, dataFilter), Set("nested_record.level"), Seq(partFilter)),
+      Arguments.of("siblingFieldExcluded",
+        Seq(siblingFilter), Set("nested_record.level"), Seq.empty[Expression]),
+      Arguments.of("orWithOnlyPartitionColumnsExtracted",
+        Seq(orFilter), Set("nested_record.level"), Seq(orFilter))
     )
   }
 }

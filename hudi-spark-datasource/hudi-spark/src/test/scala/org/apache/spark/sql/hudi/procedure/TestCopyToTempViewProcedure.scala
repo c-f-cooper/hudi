@@ -18,7 +18,8 @@
 package org.apache.spark.sql.hudi.procedure
 
 import org.apache.hudi.HoodieSparkUtils
-import org.apache.spark.sql.hudi.HoodieSparkSqlTestBase
+
+import org.apache.spark.sql.hudi.common.HoodieSparkSqlTestBase
 
 class TestCopyToTempViewProcedure extends HoodieSparkSqlTestBase {
 
@@ -38,7 +39,7 @@ class TestCopyToTempViewProcedure extends HoodieSparkSqlTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 
@@ -75,7 +76,7 @@ class TestCopyToTempViewProcedure extends HoodieSparkSqlTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 

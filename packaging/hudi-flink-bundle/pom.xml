@@ -21,7 +21,7 @@
   <parent>
     <artifactId>hudi</artifactId>
     <groupId>org.apache.hudi</groupId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>1.3.0-SNAPSHOT</version>
     <relativePath>../../pom.xml</relativePath>
   </parent>
   <modelVersion>4.0.0</modelVersion>
@@ -37,7 +37,7 @@
     <javax.servlet.version>3.1.0</javax.servlet.version>
     <!-- override to be same with flink 1.15.x -->
     <parquet.version>${flink.format.parquet.version}</parquet.version>
-    <hive.version>2.3.1</hive.version>
+    <hive.version>2.3.4</hive.version>
     <thrift.version>0.9.3</thrift.version>
   </properties>
 
@@ -127,6 +127,8 @@
                   <include>io.prometheus:simpleclient_dropwizard</include>
                   <include>io.prometheus:simpleclient_pushgateway</include>
                   <include>io.prometheus:simpleclient_common</include>
+                  <include>com.uber.m3:tally-m3</include>
+                  <include>com.uber.m3:tally-core</include>
 
                   <!-- Used for HUDI TimelineService -->
                   <include>org.eclipse.jetty:*</include>
@@ -191,12 +193,12 @@
                   <shadedPattern>${flink.bundle.shade.prefix}com.yammer.metrics.</shadedPattern>
                 </relocation>
                 <relocation>
-                  <pattern>com.beust.jcommander.</pattern>
-                  <shadedPattern>${flink.bundle.shade.prefix}com.beust.jcommander.</shadedPattern>
+                  <pattern>com.codahale.metrics.</pattern>
+                  <shadedPattern>org.apache.hudi.com.codahale.metrics.</shadedPattern>
                 </relocation>
                 <relocation>
-                  <pattern>com.codahale.metrics.</pattern>
-                  <shadedPattern>${flink.bundle.shade.prefix}com.codahale.metrics.</shadedPattern>
+                  <pattern>com.beust.jcommander.</pattern>
+                  <shadedPattern>${flink.bundle.shade.prefix}com.beust.jcommander.</shadedPattern>
                 </relocation>
                 <relocation>
                   <pattern>org.apache.commons.codec.</pattern>
@@ -214,6 +216,10 @@
                   <pattern>org.openjdk.jol.</pattern>
                   <shadedPattern>org.apache.hudi.org.openjdk.jol.</shadedPattern>
                 </relocation>
+                <relocation>
+                  <pattern>com.uber.m3.</pattern>
+                  <shadedPattern>org.apache.hudi.com.uber.m3.</shadedPattern>
+                </relocation>
               </relocations>
               <filters>
                 <filter>
@@ -224,10 +230,6 @@
                     <exclude>META-INF/*.RSA</exclude>
                     <exclude>META-INF/services/javax.*</exclude>
                     <exclude>**/*.proto</exclude>
-                    <exclude>hbase-webapps/**</exclude>
-                    <!-- hbase-default.xml comes from hbase-common, hbase related classes used in hudi are in shaded
-                    pattern, the default classes in hbase-default.xml can cause ClassNotFoundException. -->
-                    <exclude>hbase-default.xml</exclude>
                   </excludes>
                 </filter>
               </filters>
@@ -240,9 +242,6 @@
     <resources>
       <resource>
         <directory>src/main/resources</directory>
-      </resource>
-      <resource>
-        <directory>src/test/resources</directory>
       </resource>
     </resources>
   </build>
@@ -478,6 +477,10 @@
           <groupId>org.pentaho</groupId>
           <artifactId>*</artifactId>
         </exclusion>
+        <exclusion>
+          <groupId>ch.qos.logback</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
       </exclusions>
     </dependency>
     <dependency>
@@ -520,6 +523,10 @@
         </exclusion>
         <exclusion>
           <groupId>org.eclipse.jetty</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>ch.qos.logback</groupId>
           <artifactId>*</artifactId>
         </exclusion>
       </exclusions>

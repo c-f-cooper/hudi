@@ -17,16 +17,19 @@
 
 package org.apache.spark.sql.avro
 
+import org.apache.hudi.common.schema.HoodieSchema
+import org.apache.hudi.common.schema.HoodieSchema.VectorLogicalType
+
+import org.apache.avro.{LogicalTypes, Schema}
 import org.apache.avro.Conversions.DecimalConversion
 import org.apache.avro.LogicalTypes.{LocalTimestampMicros, LocalTimestampMillis, TimestampMicros, TimestampMillis}
-import org.apache.avro.{LogicalTypes, Schema}
 import org.apache.avro.Schema.Type
 import org.apache.avro.Schema.Type._
 import org.apache.avro.generic.GenericData.{EnumSymbol, Fixed, Record}
 import org.apache.avro.util.Utf8
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.avro.AvroSerializer.{createDateRebaseFuncInWrite, createTimestampRebaseFuncInWrite}
-import org.apache.spark.sql.avro.AvroUtils.{AvroMatchedField, toFieldStr}
+import org.apache.spark.sql.avro.AvroUtils.{toFieldStr, AvroMatchedField}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{SpecializedGetters, SpecificInternalRow}
 import org.apache.spark.sql.catalyst.util.{DateTimeUtils, RebaseDateTime}
@@ -36,7 +39,9 @@ import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
 import org.apache.spark.sql.types._
 
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.TimeZone
+
 import scala.collection.JavaConverters._
 
 /**
@@ -143,6 +148,40 @@ private[sql] class AvroSerializer(rootCatalystType: DataType,
           val decimal = getter.getDecimal(ordinal, d.precision, d.scale)
           decimalConversions.toBytes(decimal.toJavaBigDecimal, avroType,
             LogicalTypes.decimal(d.precision, d.scale))
+
+      // Handle VECTOR logical type (FLOAT, DOUBLE, INT8)
+      case (ArrayType(elementType, false), FIXED) => avroType.getLogicalType match {
+        case vectorLogicalType: VectorLogicalType =>
+          val dimension = vectorLogicalType.getDimension
+          val vecElementType = HoodieSchema.Vector.VectorElementType.fromString(vectorLogicalType.getElementType)
+          val bufferSize = Math.multiplyExact(dimension, vecElementType.getElementSize)
+          (getter, ordinal) => {
+            val arrayData = getter.getArray(ordinal)
+            if (arrayData.numElements() != dimension) {
+              throw new IncompatibleSchemaException(
+                s"VECTOR dimension mismatch at ${toFieldStr(catalystPath)}: " +
+                s"expected=$dimension, actual=${arrayData.numElements()}")
+            }
+            elementType match {
+              case FloatType =>
+                val buffer = ByteBuffer.allocate(bufferSize).order(VectorLogicalType.VECTOR_BYTE_ORDER)
+                var i = 0; while (i < dimension) { buffer.putFloat(arrayData.getFloat(i)); i += 1 }
+                new Fixed(avroType, buffer.array())
+              case DoubleType =>
+                val buffer = ByteBuffer.allocate(bufferSize).order(VectorLogicalType.VECTOR_BYTE_ORDER)
+                var i = 0; while (i < dimension) { buffer.putDouble(arrayData.getDouble(i)); i += 1 }
+                new Fixed(avroType, buffer.array())
+              case ByteType =>
+                val bytes = new Array[Byte](dimension)
+                var i = 0; while (i < dimension) { bytes(i) = arrayData.getByte(i); i += 1 }
+                new Fixed(avroType, bytes)
+              case _ => throw new IncompatibleSchemaException(errorPrefix +
+                s"schema is incompatible (sqlType = ${catalystType.sql}, avroType = $avroType)")
+            }
+          }
+        case _ => throw new IncompatibleSchemaException(errorPrefix +
+          s"schema is incompatible (sqlType = ${catalystType.sql}, avroType = $avroType)")
+      }
 
       case (StringType, ENUM) =>
         val enumSymbols: Set[String] = avroType.getEnumSymbols.asScala.toSet

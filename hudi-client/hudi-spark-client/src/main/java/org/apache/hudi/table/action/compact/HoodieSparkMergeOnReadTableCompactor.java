@@ -45,16 +45,21 @@ public class HoodieSparkMergeOnReadTableCompactor<T>
   public void preCompact(
       HoodieTable table, HoodieTimeline pendingCompactionTimeline, WriteOperationType operationType, String instantTime) {
     HoodieInstant requestedCompactionInstantTime = WriteOperationType.COMPACT.equals(operationType)
-        ? HoodieTimeline.getCompactionRequestedInstant(instantTime)
-        : HoodieTimeline.getLogCompactionRequestedInstant(instantTime);
+        ? table.getInstantGenerator().getCompactionRequestedInstant(instantTime)
+        : table.getInstantGenerator().getLogCompactionRequestedInstant(instantTime);
     if (!pendingCompactionTimeline.containsInstant(requestedCompactionInstantTime)) {
       throw new IllegalStateException(
-          "No Compaction request available at " + requestedCompactionInstantTime.getTimestamp() + " to run compaction");
+          "No Compaction request available at " + requestedCompactionInstantTime.requestedTime() + " to run compaction");
     }
   }
 
   @Override
   public void maybePersist(HoodieData<WriteStatus> writeStatus, HoodieEngineContext context, HoodieWriteConfig config, String instantTime) {
     writeStatus.persist(config.getString(WRITE_STATUS_STORAGE_LEVEL_VALUE), context, HoodieDataCacheKey.of(config.getBasePath(), instantTime));
+  }
+
+  @Override
+  protected HoodieRecord.HoodieRecordType getEngineRecordType() {
+    return HoodieRecord.HoodieRecordType.SPARK;
   }
 }

@@ -18,21 +18,17 @@
 
 package org.apache.hudi.common.table.log;
 
+import org.apache.hudi.common.engine.HoodieEngineContext;
+import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.log.HoodieLogFormat.Reader;
-import org.apache.hudi.common.table.log.block.HoodieDataBlock;
 import org.apache.hudi.common.table.log.block.HoodieLogBlock;
 import org.apache.hudi.common.table.log.block.HoodieLogBlock.HeaderMetadataType;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.table.view.AbstractTableFileSystemView;
 import org.apache.hudi.common.util.Base64CodecUtil;
 import org.apache.hudi.common.util.collection.Pair;
-import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 
-import org.apache.avro.Schema;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
 import org.roaringbitmap.longlong.Roaring64NavigableMap;
 
 import java.io.ByteArrayInputStream;
@@ -40,54 +36,81 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
+
+import static org.apache.hudi.common.table.log.block.HoodieLogBlock.HeaderMetadataType.INSTANT_TIME;
 
 /**
  * Utils class for performing various log file reading operations.
  */
 public class LogReaderUtils {
 
-  private static Schema readSchemaFromLogFileInReverse(FileSystem fs, HoodieActiveTimeline activeTimeline, HoodieLogFile hoodieLogFile)
-      throws IOException {
-    // set length for the HoodieLogFile as it will be leveraged by HoodieLogFormat.Reader with reverseReading enabled
-    Reader reader = HoodieLogFormat.newReader(fs, hoodieLogFile, null, true, true);
-    Schema writerSchema = null;
-    HoodieTimeline completedTimeline = activeTimeline.getCommitsTimeline().filterCompletedInstants();
-    while (reader.hasPrev()) {
-      HoodieLogBlock block = reader.prev();
-      if (block instanceof HoodieDataBlock) {
-        HoodieDataBlock lastBlock = (HoodieDataBlock) block;
-        if (completedTimeline
-            .containsOrBeforeTimelineStarts(lastBlock.getLogBlockHeader().get(HeaderMetadataType.INSTANT_TIME))) {
-          writerSchema = new Schema.Parser().parse(lastBlock.getLogBlockHeader().get(HeaderMetadataType.SCHEMA));
-          break;
-        }
-      }
-    }
-    reader.close();
-    return writerSchema;
-  }
+  /**
+   * Gets a map of log files which were created by commits with instant timestamps that are less than or equal to the
+   * maxCommitInstantTime. All other log files will be filtered out. For each log file maps to a list of commit instant
+   * times that are associated with each block that is found in the log file.
+   *
+   * @param metaClient Hoodie table meta client
+   * @param fsView Hoodie file system view
+   * @param partitionPaths list of partition paths to fetch log files from. for MDT, this should be "files" or
+   *                      MetadataPartitionType.FILES.partitionPath()
+   * @param maxCommitInstantTime the max commit which created the log files returned
+   * @param engineContext Engine context
+   * @return map of log file -> associated commit time for each block in the log file
+   */
+  public static Map<HoodieLogFile, List<String>> getAllLogFilesWithMaxCommit(HoodieTableMetaClient metaClient,
+                                                                             AbstractTableFileSystemView fsView,
+                                                                             List<String> partitionPaths,
+                                                                             String maxCommitInstantTime,
+                                                                             HoodieEngineContext engineContext) {
+    engineContext.setJobStatus("LogReaderUtils",
+        String.format("Getting list of log files in %s partition(s)", partitionPaths.size()));
 
-  public static Schema readLatestSchemaFromLogFiles(String basePath, List<HoodieLogFile> logFiles, Configuration config)
-      throws IOException {
-    HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder().setConf(config).setBasePath(basePath).build();
-    List<String> deltaPaths = logFiles.stream().sorted(HoodieLogFile.getReverseLogFileComparator()).map(s -> s.getPath().toString())
-        .collect(Collectors.toList());
-    if (deltaPaths.size() > 0) {
-      Map<String, HoodieLogFile> deltaFilePathToFileStatus = logFiles.stream().map(entry -> Pair.of(entry.getPath().toString(), entry))
-          .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
-      for (String logPath : deltaPaths) {
-        FileSystem fs = HadoopFSUtils.getFs(logPath, config);
-        Schema schemaFromLogFile = readSchemaFromLogFileInReverse(fs, metaClient.getActiveTimeline(), deltaFilePathToFileStatus.get(logPath));
-        if (schemaFromLogFile != null) {
-          return schemaFromLogFile;
+    List<HoodieLogFile> logFiles = engineContext.flatMap(partitionPaths, partitionPath -> fsView
+        .getLatestMergedFileSlicesBeforeOrOn(partitionPath, maxCommitInstantTime)
+        .flatMap(FileSlice::getLogFiles),
+        Math.max(partitionPaths.size(), 1));
+
+    // get completion time of the max commit instant
+    String maxCommitCompletionTime = metaClient.getActiveTimeline().filterCompletedInstants()
+        .findInstantsAfterOrEquals(maxCommitInstantTime, 1)
+        .filter(instant -> instant.requestedTime().equals(maxCommitInstantTime))
+        .getInstants()
+        .stream()
+        .map(instant -> instant.getCompletionTime())
+        .findFirst().orElse(maxCommitInstantTime);
+
+    // filter out all commits completed after the max commit completion time
+    HoodieTimeline filteredTimeline = fsView.getTimeline()
+        .findInstantsModifiedBeforeOrEqualsByCompletionTime(maxCommitCompletionTime);
+
+
+    engineContext.setJobStatus("LogReaderUtils",
+        String.format("Getting log file map for %s partition(s)", partitionPaths.size()));
+    Map<HoodieLogFile, List<String>> logFilesWithMaxCommit = engineContext.mapToPair(logFiles, logFile -> {
+      // read all blocks within the log file and find the commit associated with each log block
+      List<String> blocksWithinLogFile = new ArrayList<>();
+      try (HoodieLogFormat.Reader reader = HoodieLogFormat.newReader(metaClient.getStorage(), logFile, null)) {
+        while (reader.hasNext()) {
+          HoodieLogBlock block = reader.next();
+          String logBlockInstantTime = block.getLogBlockHeader().get(INSTANT_TIME);
+          // check if the log file contains a block created by a commit that is older than or equal to max commit
+          // use containsOrBeforeTimelineStarts to handle cases where the log block's instant time is in archived timeline
+          if (filteredTimeline.containsOrBeforeTimelineStarts(logBlockInstantTime)) {
+            blocksWithinLogFile.add(logBlockInstantTime);
+          }
         }
       }
-    }
-    return null;
+
+      return Pair.of(logFile, blocksWithinLogFile);
+    }, Math.max(logFiles.size(), 1));
+
+    logFilesWithMaxCommit.values().removeIf(List::isEmpty);
+
+    return logFilesWithMaxCommit;
   }
 
   /**

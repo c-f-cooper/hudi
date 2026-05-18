@@ -28,13 +28,13 @@ import org.apache.hudi.keygen.BuiltinKeyGenerator;
 import org.apache.hudi.keygen.SimpleKeyGenerator;
 import org.apache.hudi.keygen.factory.HoodieSparkKeyGeneratorFactory;
 import org.apache.hudi.table.HoodieTable;
+import org.apache.hudi.util.JavaScalaConverters;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -46,15 +46,11 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
-import scala.collection.JavaConversions;
-import scala.collection.JavaConverters;
-
 /**
  * Helper class for HoodieBulkInsertDataInternalWriter used by Spark datasource v2.
  */
+@Slf4j
 public class BulkInsertDataInternalWriterHelper {
-
-  private static final Logger LOG = LoggerFactory.getLogger(BulkInsertDataInternalWriterHelper.class);
 
   protected final String instantTime;
   protected final int taskPartitionId;
@@ -133,32 +129,29 @@ public class BulkInsertDataInternalWriterHelper {
       boolean shouldDropPartitionColumns = writeConfig.shouldDropPartitionColumns();
       if (shouldDropPartitionColumns) {
         // Drop the partition columns from the row
-        // Using the deprecated JavaConversions to be compatible with scala versions < 2.12. Once hudi support for scala versions < 2.12 is
-        // stopped, can move this to JavaConverters.seqAsJavaList(...)
-        List<String> partitionCols = JavaConversions.<String>seqAsJavaList(HoodieDatasetBulkInsertHelper.getPartitionPathCols(this.writeConfig));
-        Set<Integer> partitionIdx = new HashSet<Integer>();
+        List<String> partitionCols = JavaScalaConverters.convertScalaListToJavaList(HoodieDatasetBulkInsertHelper.getPartitionPathCols(this.writeConfig));
+        Set<Integer> partitionIdx = new HashSet<>();
         for (String col : partitionCols) {
           partitionIdx.add(this.structType.fieldIndex(col));
         }
 
         // Relies on InternalRow::toSeq(...) preserving the column ordering based on the supplied schema
-        // Using the deprecated JavaConversions to be compatible with scala versions < 2.12.
-        List<Object> cols = JavaConversions.<Object>seqAsJavaList(row.toSeq(structType));
+        List<Object> cols = JavaScalaConverters.convertScalaListToJavaList(row.toSeq(structType));
         int idx = 0;
-        List<Object> newCols = new ArrayList<Object>();
+        List<Object> newCols = new ArrayList<>();
         for (Object o : cols) {
           if (!partitionIdx.contains(idx)) {
             newCols.add(o);
           }
           idx += 1;
         }
-        InternalRow newRow = InternalRow.fromSeq(JavaConverters.<Object>asScalaIteratorConverter(newCols.iterator()).asScala().toSeq());
+        InternalRow newRow = InternalRow.fromSeq(JavaScalaConverters.convertJavaListToScalaSeq(newCols));
         handle.write(newRow);
       } else {
         handle.write(row);
       }
     } catch (Throwable t) {
-      LOG.error("Global error thrown while trying to write records in HoodieRowCreateHandle ", t);
+      log.error("Global error thrown while trying to write records in HoodieRowCreateHandle ", t);
       throw t;
     }
   }
@@ -168,11 +161,12 @@ public class BulkInsertDataInternalWriterHelper {
     return writeStatusList;
   }
 
-  public void abort() {}
+  public void abort() {
+  }
 
   public void close() throws IOException {
     for (HoodieRowCreateHandle rowCreateHandle : handles.values()) {
-      LOG.info("Closing bulk insert file " + rowCreateHandle.getFileName());
+      log.info("Closing bulk insert file {}", rowCreateHandle.getFileName());
       writeStatusList.add(rowCreateHandle.close());
     }
     handles.clear();
@@ -201,13 +195,13 @@ public class BulkInsertDataInternalWriterHelper {
         close();
       }
 
-      LOG.info("Creating new file for partition path " + partitionPath);
+      log.info("Creating new file for partition path {}", partitionPath);
       HoodieRowCreateHandle rowCreateHandle = createHandle(partitionPath);
       handles.put(partitionPath, rowCreateHandle);
     } else if (!handles.get(partitionPath).canWrite()) {
       // even if there is a handle to the partition path, it could have reached its max size threshold. So, we close the handle here and
       // create a new one.
-      LOG.info("Rolling max-size file for partition path " + partitionPath);
+      log.info("Rolling max-size file for partition path {}", partitionPath);
       writeStatusList.add(handles.remove(partitionPath).close());
       HoodieRowCreateHandle rowCreateHandle = createHandle(partitionPath);
       handles.put(partitionPath, rowCreateHandle);

@@ -25,11 +25,12 @@ import org.apache.spark.sql.catalyst.planning.ScanOperation
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.connector.catalog.{Identifier, Table, TableCatalog}
 import org.apache.spark.sql.execution.command.RepairTableCommand
-import org.apache.spark.sql.execution.datasources.parquet.{HoodieFormatTrait, ParquetFileFormat}
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.execution.datasources.parquet.{HoodieFormatTrait, ParquetFileFormat}
+import org.apache.spark.sql.execution.streaming.SerializedOffset
 import org.apache.spark.sql.types.StructType
 
-object HoodieSpark35CatalystPlanUtils extends HoodieSpark3CatalystPlanUtils {
+object HoodieSpark35CatalystPlanUtils extends BaseHoodieCatalystPlanUtils {
 
   def unapplyResolvedTable(plan: LogicalPlan): Option[(TableCatalog, Identifier, Table)] =
     plan match {
@@ -74,10 +75,16 @@ object HoodieSpark35CatalystPlanUtils extends HoodieSpark3CatalystPlanUtils {
 
   override def failAnalysisForMIT(a: Attribute, cols: String): Unit = {
     a.failAnalysis(
-      errorClass = "_LEGACY_ERROR_TEMP_2309",
+      errorClass = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
       messageParameters = Map(
-        "sqlExpr" -> a.sql,
-        "cols" -> cols))
+        "objectName" -> a.sql,
+        "proposal" -> cols))
+  }
+
+  override def failTableNotFound(tableName: String): Unit = {
+    throw new AnalysisException(
+      errorClass = "TABLE_OR_VIEW_NOT_FOUND",
+      messageParameters = Map("relationName" -> s"`$tableName`"))
   }
 
   override def unapplyCreateIndex(plan: LogicalPlan): Option[(LogicalPlan, String, String, Boolean, Seq[(Seq[String], Map[String, String])], Map[String, String])] = {
@@ -100,7 +107,7 @@ object HoodieSpark35CatalystPlanUtils extends HoodieSpark3CatalystPlanUtils {
 
   override def unapplyShowIndexes(plan: LogicalPlan): Option[(LogicalPlan, Seq[Attribute])] = {
     plan match {
-      case ci@ShowIndexes(table, output) =>
+      case ci@HoodieShowIndexes(table, output) =>
         Some((table, output))
       case _ =>
         None
@@ -113,6 +120,38 @@ object HoodieSpark35CatalystPlanUtils extends HoodieSpark3CatalystPlanUtils {
         Some((table, indexName))
       case _ =>
         None
+    }
+  }
+
+  override def unapplyInsertIntoStatement(plan: LogicalPlan): Option[(LogicalPlan, Seq[String], Map[String, Option[String]], LogicalPlan, Boolean, Boolean)] = {
+    plan match {
+      case insert: InsertIntoStatement =>
+        Some((insert.table, insert.userSpecifiedCols, insert.partitionSpec, insert.query, insert.overwrite, insert.ifPartitionNotExists))
+      case _ =>
+        None
+    }
+  }
+
+  override def createProjectForByNameQuery(lr: LogicalRelation, plan: LogicalPlan): Option[LogicalPlan] = {
+    plan match {
+      case insert: InsertIntoStatement =>
+        Some(ResolveInsertionBase.createProjectForByNameQuery(lr.catalogTable.get.qualifiedName, insert))
+      case _ =>
+        None
+    }
+  }
+
+  override def unapplyUpdateAction(mergeAction: Any): Option[(Option[Expression], Seq[Assignment])] = {
+    mergeAction match {
+      case UpdateAction(condition, assignments) => Some((condition, assignments))
+      case _ => None
+    }
+  }
+
+  override def extractJsonFromSerializedOffset(offset: Any): Option[String] = {
+    offset match {
+      case SerializedOffset(json) => Some(json)
+      case _ => None
     }
   }
 }

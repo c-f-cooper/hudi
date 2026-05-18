@@ -18,50 +18,43 @@
 
 package org.apache.hudi.utilities.sources.helpers;
 
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
 import org.apache.hudi.common.util.Option;
 
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
 import static org.apache.hudi.common.util.StringUtils.isNullOrEmpty;
-import static org.apache.hudi.utilities.sources.helpers.IncrSourceHelper.DEFAULT_BEGIN_TIMESTAMP;
+import static org.apache.hudi.utilities.sources.helpers.IncrSourceHelper.DEFAULT_START_TIMESTAMP;
 
 /**
  * This POJO is used to craft checkpoints that supports size based batching
  * This object will be use by object based Hudi incr sources (s3/gcs)
  */
+@AllArgsConstructor
+@Getter
 public class CloudObjectIncrCheckpoint {
 
   private final String commit;
   private final String key;
 
-  public CloudObjectIncrCheckpoint(String commit, String key) {
-    this.commit = commit;
-    this.key = key;
-  }
-
-  public String getCommit() {
-    return commit;
-  }
-
-  public String getKey() {
-    return key;
-  }
-
-  public static CloudObjectIncrCheckpoint fromString(Option<String> lastCheckpoint) {
+  public static CloudObjectIncrCheckpoint fromString(Option<Checkpoint> lastCheckpoint) {
     if (lastCheckpoint.isPresent()) {
-      Option<String[]> splitResult = lastCheckpoint.map(str -> str.split("#", 2));
+      Option<String[]> splitResult = lastCheckpoint.map(str -> str.getCheckpointKey().split("#", 2));
       if (splitResult.isPresent() && splitResult.get().length == 2) {
         String[] split = splitResult.get();
         return new CloudObjectIncrCheckpoint(split[0], split[1]);
       } else {
-        return new CloudObjectIncrCheckpoint(lastCheckpoint.get(), null);
+        return new CloudObjectIncrCheckpoint(lastCheckpoint.get().getCheckpointKey(), null);
       }
     }
-    return new CloudObjectIncrCheckpoint(DEFAULT_BEGIN_TIMESTAMP, null);
+    return new CloudObjectIncrCheckpoint(DEFAULT_START_TIMESTAMP, null);
   }
 
   @Override
   public String toString() {
     if (isNullOrEmpty(commit) && isNullOrEmpty(key)) {
-      return DEFAULT_BEGIN_TIMESTAMP;
+      return DEFAULT_START_TIMESTAMP;
     } else if (isNullOrEmpty(key)) {
       return commit;
     }

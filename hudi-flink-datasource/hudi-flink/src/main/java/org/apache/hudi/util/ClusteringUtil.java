@@ -19,34 +19,28 @@
 package org.apache.hudi.util;
 
 import org.apache.hudi.client.HoodieFlinkWriteClient;
-import org.apache.hudi.common.model.WriteOperationType;
+import org.apache.hudi.client.clustering.plan.strategy.FlinkConsistentBucketClusteringPlanStrategy;
+import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
-import org.apache.hudi.common.table.timeline.HoodieTimeline;
-import org.apache.hudi.common.table.timeline.TimelineUtils;
 import org.apache.hudi.common.util.ClusteringUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.configuration.OptionsResolver;
-import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieNotSupportedException;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.table.HoodieFlinkTable;
-import org.apache.hudi.client.clustering.plan.strategy.FlinkConsistentBucketClusteringPlanStrategy;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.configuration.Configuration;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.util.List;
 import java.util.stream.Collectors;
 
 /**
  * Utilities for flink hudi clustering.
  */
+@Slf4j
 public class ClusteringUtil {
-
-  private static final Logger LOG = LoggerFactory.getLogger(ClusteringUtil.class);
 
   public static void validateClusteringScheduling(Configuration conf) {
     if (!OptionsResolver.isAppendMode(conf) && OptionsResolver.isBucketIndexType(conf)) {
@@ -55,7 +49,7 @@ public class ClusteringUtil {
         case SIMPLE:
           throw new HoodieNotSupportedException("Clustering is not supported for simple bucket index.");
         case CONSISTENT_HASHING:
-          String clusteringPlanStrategyClass = conf.getString(FlinkOptions.CLUSTERING_PLAN_STRATEGY_CLASS, OptionsResolver.getDefaultPlanStrategyClassName(conf));
+          String clusteringPlanStrategyClass = conf.getString(FlinkOptions.CLUSTERING_PLAN_STRATEGY_CLASS.key(), OptionsResolver.getDefaultPlanStrategyClassName(conf));
           if (!clusteringPlanStrategyClass.equalsIgnoreCase(FlinkConsistentBucketClusteringPlanStrategy.class.getName())) {
             throw new HoodieNotSupportedException(
                 "CLUSTERING_PLAN_STRATEGY_CLASS should be set to " + FlinkConsistentBucketClusteringPlanStrategy.class.getName() + " in order to work with Consistent Hashing Bucket Index.");
@@ -93,9 +87,10 @@ public class ClusteringUtil {
         .filter(instant -> instant.getState() == HoodieInstant.State.INFLIGHT)
         .collect(Collectors.toList());
     inflightInstants.forEach(inflightInstant -> {
-      LOG.info("Rollback the inflight clustering instant: " + inflightInstant + " for failover");
+      log.info("Rollback the inflight clustering instant: " + inflightInstant + " for failover");
       table.rollbackInflightClustering(inflightInstant,
-          commitToRollback -> writeClient.getTableServiceClient().getPendingRollbackInfo(table.getMetaClient(), commitToRollback, false));
+          commitToRollback -> writeClient.getTableServiceClient().getPendingRollbackInfo(table.getMetaClient(), commitToRollback, false),
+          writeClient.getTransactionManager());
       table.getMetaClient().reloadActiveTimeline();
     });
   }
@@ -108,25 +103,13 @@ public class ClusteringUtil {
    * @param instantTime The instant time
    */
   public static void rollbackClustering(HoodieFlinkTable<?> table, HoodieFlinkWriteClient<?> writeClient, String instantTime) {
-    HoodieInstant inflightInstant = HoodieTimeline.getReplaceCommitInflightInstant(instantTime);
-    if (table.getMetaClient().reloadActiveTimeline().filterPendingReplaceTimeline().containsInstant(inflightInstant)) {
-      LOG.warn("Rollback failed clustering instant: [" + instantTime + "]");
-      table.rollbackInflightClustering(inflightInstant,
-          commitToRollback -> writeClient.getTableServiceClient().getPendingRollbackInfo(table.getMetaClient(), commitToRollback, false));
-    }
-  }
-
-  /**
-   * Returns whether the given instant {@code instant} is with clustering operation.
-   */
-  public static boolean isClusteringInstant(HoodieInstant instant, HoodieTimeline timeline) {
-    if (!instant.getAction().equals(HoodieTimeline.REPLACE_COMMIT_ACTION)) {
-      return false;
-    }
-    try {
-      return TimelineUtils.getCommitMetadata(instant, timeline).getOperationType().equals(WriteOperationType.CLUSTER);
-    } catch (IOException e) {
-      throw new HoodieException("Resolve replace commit metadata error for instant: " + instant, e);
+    HoodieActiveTimeline activeTimeline = table.getMetaClient().reloadActiveTimeline();
+    Option<HoodieInstant> inflightInstantOpt = ClusteringUtils.getInflightClusteringInstant(instantTime, activeTimeline, table.getInstantGenerator());
+    if (inflightInstantOpt.isPresent() && ClusteringUtils.isClusteringInstant(activeTimeline, inflightInstantOpt.get(), table.getInstantGenerator())) {
+      log.warn("Failed to rollback clustering instant: [{}]", instantTime);
+      table.rollbackInflightClustering(inflightInstantOpt.get(),
+          commitToRollback -> writeClient.getTableServiceClient().getPendingRollbackInfo(table.getMetaClient(), commitToRollback, false),
+          writeClient.getTransactionManager());
     }
   }
 }

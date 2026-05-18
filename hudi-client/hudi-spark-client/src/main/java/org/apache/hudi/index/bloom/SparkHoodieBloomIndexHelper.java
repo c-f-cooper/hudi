@@ -20,16 +20,15 @@
 package org.apache.hudi.index.bloom;
 
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
-import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.data.HoodiePairData;
 import org.apache.hudi.common.engine.HoodieEngineContext;
+import org.apache.hudi.common.function.SerializableBiFunction;
 import org.apache.hudi.common.model.BaseFile;
 import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecordLocation;
 import org.apache.hudi.common.table.view.HoodieTableFileSystemView;
-import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.common.util.hash.FileIndexID;
 import org.apache.hudi.common.util.hash.PartitionIndexID;
 import org.apache.hudi.config.HoodieWriteConfig;
@@ -39,20 +38,24 @@ import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieIOException;
 import org.apache.hudi.io.HoodieKeyLookupResult;
 import org.apache.hudi.metadata.HoodieTableMetadataUtil;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.storage.StoragePathInfo;
 import org.apache.hudi.table.HoodieTable;
 
-import org.apache.hadoop.fs.FileStatus;
+import lombok.AccessLevel;
+import lombok.NoArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.spark.Partitioner;
+import org.apache.spark.TaskContext;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.broadcast.Broadcast;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.util.Arrays;
+import java.io.Serializable;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -62,20 +65,17 @@ import java.util.stream.Collectors;
 import scala.Tuple2;
 
 import static org.apache.hudi.metadata.HoodieMetadataPayload.getBloomFilterIndexKey;
-import static org.apache.hudi.metadata.HoodieTableMetadataUtil.mapRecordKeyToFileGroupIndex;
 import static org.apache.hudi.metadata.MetadataPartitionType.BLOOM_FILTERS;
 
 /**
  * Helper for {@link HoodieBloomIndex} containing Spark-specific logic.
  */
+@NoArgsConstructor(access = AccessLevel.PRIVATE)
+@Slf4j
 public class SparkHoodieBloomIndexHelper extends BaseHoodieBloomIndexHelper {
-
-  private static final Logger LOG = LoggerFactory.getLogger(SparkHoodieBloomIndexHelper.class);
 
   private static final SparkHoodieBloomIndexHelper SINGLETON_INSTANCE =
       new SparkHoodieBloomIndexHelper();
-
-  private SparkHoodieBloomIndexHelper() {}
 
   public static SparkHoodieBloomIndexHelper getInstance() {
     return SINGLETON_INSTANCE;
@@ -89,22 +89,23 @@ public class SparkHoodieBloomIndexHelper extends BaseHoodieBloomIndexHelper {
       Map<String, List<BloomIndexFileInfo>> partitionToFileInfo,
       Map<String, Long> recordsPerPartition) {
 
-    int inputParallelism = HoodieJavaPairRDD.getJavaPairRDD(partitionRecordKeyPairs).getNumPartitions();
+    int inputParallelism = partitionRecordKeyPairs.deduceNumPartitions();
     int configuredBloomIndexParallelism = config.getBloomIndexParallelism();
 
     // NOTE: Target parallelism could be overridden by the config
+    // Otherwise, default to minimum of 10
     int targetParallelism =
-        configuredBloomIndexParallelism > 0 ? configuredBloomIndexParallelism : inputParallelism;
+        configuredBloomIndexParallelism > 0 ? configuredBloomIndexParallelism : Math.max(inputParallelism, 10);
 
-    LOG.info(String.format("Input parallelism: %d, Index parallelism: %d", inputParallelism, targetParallelism));
+    log.info("Input parallelism: {}, Index parallelism: {}", inputParallelism, targetParallelism);
 
     JavaPairRDD<HoodieFileGroupId, String> fileComparisonsRDD = HoodieJavaRDD.getJavaRDD(fileComparisonPairs);
-    JavaRDD<List<HoodieKeyLookupResult>> keyLookupResultRDD;
+    JavaRDD<HoodieKeyLookupResult> keyLookupResultRDD;
 
     if (config.getBloomIndexUseMetadata()
         && hoodieTable.getMetaClient().getTableConfig().getMetadataPartitions()
         .contains(BLOOM_FILTERS.getPartitionPath())) {
-      SerializableConfiguration hadoopConf = new SerializableConfiguration(hoodieTable.getHadoopConf());
+      StorageConfiguration<?> storageConf = hoodieTable.getStorageConf();
 
       HoodieTableFileSystemView baseFileOnlyView =
           getBaseFileOnlyView(hoodieTable, partitionToFileInfo.keySet());
@@ -156,31 +157,56 @@ public class SparkHoodieBloomIndexHelper extends BaseHoodieBloomIndexHelper {
           .mapPartitionsToPair(new HoodieMetadataBloomFilterProbingFunction(baseFileOnlyViewBroadcast, hoodieTable))
           // Second, we use [[HoodieFileProbingFunction]] to open actual file and check whether it
           // contains the records with candidate keys that were filtered in by the Bloom Filter
-          .mapPartitions(new HoodieFileProbingFunction(baseFileOnlyViewBroadcast, hadoopConf), true);
+          .mapPartitions(new HoodieFileProbingFunction(baseFileOnlyViewBroadcast, storageConf), true);
 
     } else if (config.useBloomIndexBucketizedChecking()) {
       Map<HoodieFileGroupId, Long> comparisonsPerFileGroup = computeComparisonsPerFileGroup(
           config, recordsPerPartition, partitionToFileInfo, fileComparisonsRDD, context);
-      Partitioner partitioner = new BucketizedBloomCheckPartitioner(targetParallelism, comparisonsPerFileGroup,
-          config.getBloomIndexKeysPerBucket());
+      Partitioner partitioner = new BucketizedBloomCheckPartitioner(
+          configuredBloomIndexParallelism, inputParallelism, comparisonsPerFileGroup,
+          config.getBloomIndexKeysPerBucket(),
+          config.useBloomIndexBucketizedCheckingWithDynamicParallelism());
 
-      keyLookupResultRDD = fileComparisonsRDD.mapToPair(t -> new Tuple2<>(Pair.of(t._1, t._2), t))
-          .repartitionAndSortWithinPartitions(partitioner)
-          .map(Tuple2::_2)
+      keyLookupResultRDD = fileComparisonsRDD.mapToPair(fileGroupAndRecordKey -> new Tuple2<>(fileGroupAndRecordKey, false))
+          .repartitionAndSortWithinPartitions(partitioner, new FileGroupIdComparator())
+          .map(Tuple2::_1)
+          .mapPartitions(new HoodieSparkBloomIndexCheckFunction(hoodieTable, config), true);
+    } else if (config.isBloomIndexFileGroupIdKeySortingEnabled()) {
+      keyLookupResultRDD = fileComparisonsRDD.mapToPair(fileGroupAndRecordKey -> new Tuple2<>(fileGroupAndRecordKey, false))
+          .sortByKey(new FileGroupIdAndRecordKeyComparator(), true, targetParallelism)
+          .map(Tuple2::_1)
           .mapPartitions(new HoodieSparkBloomIndexCheckFunction(hoodieTable, config), true);
     } else {
       keyLookupResultRDD = fileComparisonsRDD.sortByKey(true, targetParallelism)
           .mapPartitions(new HoodieSparkBloomIndexCheckFunction(hoodieTable, config), true);
     }
 
-    return HoodieJavaPairRDD.of(keyLookupResultRDD.flatMap(List::iterator)
-        .filter(lr -> lr.getMatchingRecordKeysAndPositions().size() > 0)
+    return HoodieJavaPairRDD.of(keyLookupResultRDD
+        .filter(lr -> !lr.getMatchingRecordKeysAndPositions().isEmpty())
         .flatMapToPair(lookupResult -> lookupResult.getMatchingRecordKeysAndPositions().stream()
             .map(recordKeyAndPosition -> new Tuple2<>(
                 new HoodieKey(recordKeyAndPosition.getLeft(), lookupResult.getPartitionPath()),
                 new HoodieRecordLocation(lookupResult.getBaseInstantTime(), lookupResult.getFileId(),
                     recordKeyAndPosition.getRight())))
-            .collect(Collectors.toList()).iterator()));
+            .iterator()));
+  }
+
+  private static class FileGroupIdComparator implements Comparator<Tuple2<HoodieFileGroupId, String>>, Serializable {
+    @Override
+    public int compare(Tuple2<HoodieFileGroupId, String> o1, Tuple2<HoodieFileGroupId, String> o2) {
+      return o1._1().compareTo(o2._1());
+    }
+  }
+
+  private static class FileGroupIdAndRecordKeyComparator implements Comparator<Tuple2<HoodieFileGroupId, String>>, Serializable {
+    @Override
+    public int compare(Tuple2<HoodieFileGroupId, String> o1, Tuple2<HoodieFileGroupId, String> o2) {
+      int fileGroupIdComparison = o1._1.compareTo(o2._1);
+      if (fileGroupIdComparison != 0) {
+        return fileGroupIdComparison;
+      }
+      return o1._2.compareTo(o2._2);
+    }
   }
 
   /**
@@ -215,17 +241,18 @@ public class SparkHoodieBloomIndexHelper extends BaseHoodieBloomIndexHelper {
     try {
       List<String> fullPartitionPaths = partitionPaths.stream()
           .map(partitionPath ->
-              String.format("%s/%s", hoodieTable.getMetaClient().getBasePathV2(), partitionPath))
+              String.format("%s/%s", hoodieTable.getMetaClient().getBasePath(), partitionPath))
           .collect(Collectors.toList());
 
-      FileStatus[] allFiles =
-          hoodieTable.getMetadataTable().getAllFilesInPartitions(fullPartitionPaths).values().stream()
-              .flatMap(Arrays::stream)
-              .toArray(FileStatus[]::new);
+      List<StoragePathInfo> allFiles =
+          hoodieTable.getTableMetadata().getAllFilesInPartitions(fullPartitionPaths).values()
+              .stream()
+              .flatMap(e -> e.stream())
+              .collect(Collectors.toList());
 
       return new HoodieTableFileSystemView(hoodieTable.getMetaClient(), hoodieTable.getActiveTimeline(), allFiles);
     } catch (IOException e) {
-      LOG.error(String.format("Failed to fetch all files for partitions (%s)", partitionPaths));
+      log.error(String.format("Failed to fetch all files for partitions (%s)", partitionPaths));
       throw new HoodieIOException("Failed to fetch all files for partitions", e);
     }
   }
@@ -289,12 +316,17 @@ public class SparkHoodieBloomIndexHelper extends BaseHoodieBloomIndexHelper {
 
       // NOTE: It's crucial that [[targetPartitions]] be congruent w/ the number of
       //       actual file-groups in the Bloom Index in MT
-      return mapRecordKeyToFileGroupIndex(bloomIndexEncodedKey, targetPartitions);
+      SerializableBiFunction<String, Integer, Integer> mappingFunction = HoodieTableMetadataUtil::mapRecordKeyToFileGroupIndex;
+      try {
+        return mappingFunction.apply(bloomIndexEncodedKey, targetPartitions);
+      } catch (Exception e) {
+        throw new HoodieException("Error apply bloom index partitioner mapping function", e);
+      }
     }
   }
 
   public static class HoodieSparkBloomIndexCheckFunction extends HoodieBloomIndexCheckFunction<Tuple2<HoodieFileGroupId, String>>
-      implements FlatMapFunction<Iterator<Tuple2<HoodieFileGroupId, String>>, List<HoodieKeyLookupResult>> {
+      implements FlatMapFunction<Iterator<Tuple2<HoodieFileGroupId, String>>, HoodieKeyLookupResult> {
 
     public HoodieSparkBloomIndexCheckFunction(HoodieTable hoodieTable,
                                               HoodieWriteConfig config) {
@@ -302,7 +334,11 @@ public class SparkHoodieBloomIndexHelper extends BaseHoodieBloomIndexHelper {
     }
 
     @Override
-    public Iterator<List<HoodieKeyLookupResult>> call(Iterator<Tuple2<HoodieFileGroupId, String>> fileGroupIdRecordKeyPairIterator) {
+    public Iterator<HoodieKeyLookupResult> call(Iterator<Tuple2<HoodieFileGroupId, String>> fileGroupIdRecordKeyPairIterator) {
+      TaskContext taskContext = TaskContext.get();
+      log.info("HoodieSparkBloomIndexCheckFunction with stageId : {}, stage attempt no: {}, taskId : {}, task attempt no : {}, task attempt id : {} ",
+          taskContext.stageId(), taskContext.stageAttemptNumber(), taskContext.partitionId(), taskContext.attemptNumber(),
+          taskContext.taskAttemptId());
       return new LazyKeyCheckIterator(fileGroupIdRecordKeyPairIterator);
     }
   }

@@ -27,7 +27,11 @@ import org.apache.hudi.utilities.config.KafkaSourceConfig;
 import org.apache.hudi.utilities.exception.HoodieStreamerException;
 import org.apache.hudi.utilities.ingestion.HoodieIngestionMetrics;
 import org.apache.hudi.utilities.schema.SchemaProvider;
+import org.apache.hudi.utilities.sources.helpers.KafkaOffsetGen;
 import org.apache.hudi.utilities.streamer.SourceFormatAdapter;
+import org.apache.hudi.utilities.streamer.SourceProfile;
+import org.apache.hudi.utilities.streamer.SourceProfileSupplier;
+import org.apache.hudi.utilities.testutils.KafkaTestUtils;
 
 import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -37,8 +41,8 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
-import org.apache.spark.streaming.kafka010.KafkaTestUtils;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -49,37 +53,60 @@ import java.util.Properties;
 
 import static org.apache.hudi.utilities.config.KafkaSourceConfig.ENABLE_KAFKA_COMMIT_OFFSET;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Generic tests for all {@link KafkaSource} to ensure all implementations properly handle offsets, fetch limits, failure modes, etc.
  */
-abstract class BaseTestKafkaSource extends SparkClientFunctionalTestHarness {
+public abstract class BaseTestKafkaSource extends SparkClientFunctionalTestHarness {
   protected static final String TEST_TOPIC_PREFIX = "hoodie_test_";
-  protected static KafkaTestUtils testUtils;
 
   protected final HoodieIngestionMetrics metrics = mock(HoodieIngestionMetrics.class);
+  protected final Option<SourceProfileSupplier> sourceProfile = Option.of(mock(SourceProfileSupplier.class));
 
   protected SchemaProvider schemaProvider;
+  protected static KafkaTestUtils testUtils;
 
   @BeforeAll
-  public static void initClass() {
+  public static void setupKafka() {
     testUtils = new KafkaTestUtils();
     testUtils.setup();
   }
 
   @AfterAll
-  public static void cleanupClass() {
+  public static void teardownKafka() {
     testUtils.teardown();
   }
 
-  abstract TypedProperties createPropsForKafkaSource(String topic, Long maxEventsToReadFromKafkaSource, String resetStrategy);
+  @AfterEach
+  void cleanupTopics() {
+    testUtils.deleteTopics();
+  }
 
-  abstract SourceFormatAdapter createSource(TypedProperties props);
+  protected abstract TypedProperties createPropsForKafkaSource(String topic, Long maxEventsToReadFromKafkaSource, String resetStrategy);
 
-  abstract void sendMessagesToKafka(String topic, int count, int numPartitions);
+  protected abstract SourceFormatAdapter createSource(TypedProperties props);
+
+  protected abstract void sendMessagesToKafka(String topic, int count, int numPartitions);
+  
+  protected void verifyRddsArePersisted(Source source, String sparkPlan, boolean persistSourceRdd) {
+    if (persistSourceRdd) {
+      assertTrue(sparkPlan.contains("CachedPartitions"));
+      assertEquals(1, jsc().getPersistentRDDs().size());
+    } else {
+      assertFalse(sparkPlan.contains("CachedPartitions"));
+      assertEquals(0, jsc().getPersistentRDDs().size());
+    }
+    source.releaseResources();
+    assertEquals(0, jsc().getPersistentRDDs().size());
+  }
 
   @Test
   public void testKafkaSource() {
@@ -97,7 +124,7 @@ abstract class BaseTestKafkaSource extends SparkClientFunctionalTestHarness {
     assertEquals(900, fetch1.getBatch().get().count());
     // Test Avro To DataFrame<Row> path
     Dataset<Row> fetch1AsRows = AvroConversionUtils.createDataFrame(JavaRDD.toRDD(fetch1.getBatch().get()),
-        schemaProvider.getSourceSchema().toString(), kafkaSource.getSource().getSparkSession());
+        schemaProvider.getSourceHoodieSchema().toString(), kafkaSource.getSource().getSparkSession());
     assertEquals(900, fetch1AsRows.count());
 
     // 2. Produce new data, extract new data
@@ -165,7 +192,7 @@ abstract class BaseTestKafkaSource extends SparkClientFunctionalTestHarness {
     testUtils.createTopic(topic, 2);
     TypedProperties props = createPropsForKafkaSource(topic, Long.MAX_VALUE, "earliest");
     SourceFormatAdapter kafkaSource = createSource(props);
-    props.setProperty("hoodie.deltastreamer.kafka.source.maxEvents", "500");
+    props.setProperty("hoodie.streamer.kafka.source.maxEvents", "500");
 
     /*
      1. maxEventsFromKafkaSourceProp set to more than generated insert records
@@ -206,8 +233,8 @@ abstract class BaseTestKafkaSource extends SparkClientFunctionalTestHarness {
 
     InputBatch<JavaRDD<GenericRecord>> fetch1 = kafkaSource.fetchNewDataInAvroFormat(Option.empty(), 599);
     // commit to kafka after first batch
-    kafkaSource.getSource().onCommit(fetch1.getCheckpointForNextBatch());
-    try (KafkaConsumer consumer = new KafkaConsumer(props)) {
+    kafkaSource.getSource().onCommit(fetch1.getCheckpointForNextBatch().getCheckpointKey());
+    try (KafkaConsumer consumer = new HoodieRetryingKafkaConsumer(props, KafkaOffsetGen.excludeHoodieConfigs(props))) {
       consumer.assign(topicPartitions);
 
       OffsetAndMetadata offsetAndMetadata = consumer.committed(topicPartition0);
@@ -226,7 +253,7 @@ abstract class BaseTestKafkaSource extends SparkClientFunctionalTestHarness {
           kafkaSource.fetchNewDataInRowFormat(Option.of(fetch1.getCheckpointForNextBatch()), Long.MAX_VALUE);
 
       // commit to Kafka after second batch is processed completely
-      kafkaSource.getSource().onCommit(fetch2.getCheckpointForNextBatch());
+      kafkaSource.getSource().onCommit(fetch2.getCheckpointForNextBatch().getCheckpointKey());
 
       offsetAndMetadata = consumer.committed(topicPartition0);
       assertNotNull(offsetAndMetadata);
@@ -250,7 +277,7 @@ abstract class BaseTestKafkaSource extends SparkClientFunctionalTestHarness {
     final String topic = TEST_TOPIC_PREFIX + "testFailOnDataLoss";
     Properties topicConfig = new Properties();
     topicConfig.setProperty("retention.ms", "8000");
-    testUtils.createTopic(topic, 1, topicConfig);
+    testUtils.createTopic(topic, 2, topicConfig);
 
     TypedProperties failOnDataLossProps = createPropsForKafkaSource(topic, null, "earliest");
     failOnDataLossProps.setProperty(KafkaSourceConfig.ENABLE_FAIL_ON_DATA_LOSS.key(), Boolean.toString(true));
@@ -265,16 +292,62 @@ abstract class BaseTestKafkaSource extends SparkClientFunctionalTestHarness {
     Throwable t = assertThrows(HoodieStreamerException.class, () -> {
       kafkaSource.fetchNewDataInAvroFormat(Option.of(fetch1.getCheckpointForNextBatch()), Long.MAX_VALUE);
     });
-    assertEquals(
-        "Some data may have been lost because they are not available in Kafka any more;"
-            + " either the data was aged out by Kafka or the topic may have been deleted before all the data in the topic was processed.",
-        t.getMessage());
+    String errorMessagePrefix = "Some data may have been lost because they are not available in Kafka any more;"
+        + " either the data was aged out by Kafka or the topic may have been deleted before all the data in the topic was processed. "
+        + "Kafka partitions that have out-of-bound checkpoints:";
+    assertTrue(t.getMessage().startsWith(errorMessagePrefix));
     t = assertThrows(HoodieStreamerException.class, () -> {
       kafkaSource.fetchNewDataInRowFormat(Option.of(fetch1.getCheckpointForNextBatch()), Long.MAX_VALUE);
     });
-    assertEquals(
-        "Some data may have been lost because they are not available in Kafka any more;"
-            + " either the data was aged out by Kafka or the topic may have been deleted before all the data in the topic was processed.",
-        t.getMessage());
+    assertTrue(t.getMessage().startsWith(errorMessagePrefix));
+  }
+
+  @Test
+  public void testKafkaSourceWithOffsetsFromSourceProfile() {
+    // topic setup.
+    final String topic = TEST_TOPIC_PREFIX + "testKafkaSourceWithOffsetRanges";
+    testUtils.createTopic(topic, 2);
+    TypedProperties props = createPropsForKafkaSource(topic, null, "earliest");
+
+    when(sourceProfile.get().getSourceProfile()).thenReturn(new TestSourceProfile(Long.MAX_VALUE, 4, 500));
+    SourceFormatAdapter kafkaSource = createSource(props);
+
+    // Test for empty data.
+    assertEquals(Option.empty(), kafkaSource.fetchNewDataInAvroFormat(Option.empty(), Long.MAX_VALUE).getBatch());
+
+    // Publish messages and assert source has picked up all messages in offsetRanges supplied by input batch profile.
+    sendMessagesToKafka(topic, 1000, 2);
+    InputBatch<JavaRDD<GenericRecord>> fetch1 = kafkaSource.fetchNewDataInAvroFormat(Option.empty(), 900);
+    assertEquals(500, fetch1.getBatch().get().count());
+    verify(metrics, times(2)).updateStreamerSourceParallelism(4);
+    verify(metrics, times(2)).updateStreamerSourceBytesToBeIngestedInSyncRound(Long.MAX_VALUE);
+  }
+
+  static class TestSourceProfile implements SourceProfile<Long> {
+
+    private final long maxSourceBytes;
+    private final int sourcePartitions;
+    private final long numEvents;
+
+    public TestSourceProfile(long maxSourceBytes, int sourcePartitions, long numEvents) {
+      this.maxSourceBytes = maxSourceBytes;
+      this.sourcePartitions = sourcePartitions;
+      this.numEvents = numEvents;
+    }
+
+    @Override
+    public long getMaxSourceBytes() {
+      return maxSourceBytes;
+    }
+
+    @Override
+    public int getSourcePartitions() {
+      return sourcePartitions;
+    }
+
+    @Override
+    public Long getSourceSpecificContext() {
+      return numEvents;
+    }
   }
 }

@@ -132,4 +132,23 @@ public class HoodieStreamerConfig extends HoodieConfig {
       .sinceVersion("0.14.0")
       .withDocumentation("Number of records to sample from the first write. To improve the estimation's accuracy, "
           + "for smaller or more compressable record size, set the sample size bigger. For bigger or less compressable record size, set smaller.");
+
+  public static final ConfigProperty<Boolean> ROW_THROW_EXPLICIT_EXCEPTIONS = ConfigProperty
+      .key(STREAMER_CONFIG_PREFIX + "row.throw.explicit.exceptions")
+      .defaultValue(false)
+      .markAdvanced()
+      .sinceVersion("0.15.0")
+      .withDocumentation("When enabled, the dataframe generated from reading source data is wrapped with an exception handler to explicitly surface exceptions.");
+
+  public static final ConfigProperty<Boolean> SCHEMA_MAKE_COLUMNS_NULLABLE = ConfigProperty
+      .key(STREAMER_CONFIG_PREFIX + "schema.make.columns.nullable")
+      .defaultValue(false)
+      .withAlternatives(DELTA_STREAMER_CONFIG_PREFIX + "schema.make.columns.nullable")
+      .markAdvanced()
+      .withDocumentation("When set to true, all columns in the incoming dataset schema are made nullable. "
+          + "This applies to every column in the incoming batch, not just newly added ones. "
+          + "Hudi's schema evolution supports widening nullability (non-nullable to nullable), so enabling this "
+          + "config on an existing table with non-nullable columns is safe - existing data retains its values "
+          + "while the schema is updated to allow nulls. "
+          + "This is useful for maintaining backwards compatibility when new columns are added via SQL queries.");
 }

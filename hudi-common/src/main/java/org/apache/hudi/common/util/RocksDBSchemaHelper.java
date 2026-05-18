@@ -23,6 +23,8 @@ import org.apache.hudi.common.model.HoodieFileGroup;
 import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 
+import lombok.Getter;
+
 import java.util.Arrays;
 import java.util.List;
 
@@ -41,6 +43,7 @@ import java.util.List;
  *
  * Pending Compactions Key = "part=<PartitionPath>,id=<FileId>" Value = Pair<CompactionTime, CompactionOperation>
  */
+@Getter
 public class RocksDBSchemaHelper {
 
   private final String colFamilyForView;
@@ -49,16 +52,17 @@ public class RocksDBSchemaHelper {
   private final String colFamilyForBootstrapBaseFile;
   private final String colFamilyForStoredPartitions;
   private final String colFamilyForReplacedFileGroups;
-  private final String colFamilyForPendingClusteringFileGroups;
+  private final String colFamilyForFileGroupsInPendingClustering;
 
   public RocksDBSchemaHelper(HoodieTableMetaClient metaClient) {
-    this.colFamilyForBootstrapBaseFile = "hudi_bootstrap_basefile_" + metaClient.getBasePath().replace("/", "_");
-    this.colFamilyForPendingCompaction = "hudi_pending_compaction_" + metaClient.getBasePath().replace("/", "_");
-    this.colFamilyForPendingLogCompaction = "hudi_pending_log_compaction_" + metaClient.getBasePath().replace("/", "_");
-    this.colFamilyForStoredPartitions = "hudi_partitions_" + metaClient.getBasePath().replace("/", "_");
-    this.colFamilyForView = "hudi_view_" + metaClient.getBasePath().replace("/", "_");
-    this.colFamilyForReplacedFileGroups = "hudi_replaced_fg" + metaClient.getBasePath().replace("/", "_");
-    this.colFamilyForPendingClusteringFileGroups = "hudi_pending_clustering_fg" + metaClient.getBasePath().replace("/", "_");
+    String fixedBasePathString = metaClient.getBasePath().toString().replace("/", "_");
+    this.colFamilyForBootstrapBaseFile = "hudi_bootstrap_basefile_" + fixedBasePathString;
+    this.colFamilyForPendingCompaction = "hudi_pending_compaction_" + fixedBasePathString;
+    this.colFamilyForPendingLogCompaction = "hudi_pending_log_compaction_" + fixedBasePathString;
+    this.colFamilyForStoredPartitions = "hudi_partitions_" + fixedBasePathString;
+    this.colFamilyForView = "hudi_view_" + fixedBasePathString;
+    this.colFamilyForReplacedFileGroups = "hudi_replaced_fg" + fixedBasePathString;
+    this.colFamilyForFileGroupsInPendingClustering = "hudi_pending_clustering_fg" + fixedBasePathString;
   }
 
   public List<String> getAllColumnFamilies() {
@@ -131,33 +135,5 @@ public class RocksDBSchemaHelper {
 
   private String getPartitionFileIdBasedLookup(HoodieFileGroupId fgId) {
     return String.format("part=%s,id=%s", fgId.getPartitionPath(), fgId.getFileId());
-  }
-
-  public String getColFamilyForView() {
-    return colFamilyForView;
-  }
-
-  public String getColFamilyForPendingCompaction() {
-    return colFamilyForPendingCompaction;
-  }
-
-  public String getColFamilyForPendingLogCompaction() {
-    return colFamilyForPendingLogCompaction;
-  }
-
-  public String getColFamilyForBootstrapBaseFile() {
-    return colFamilyForBootstrapBaseFile;
-  }
-
-  public String getColFamilyForStoredPartitions() {
-    return colFamilyForStoredPartitions;
-  }
-
-  public String getColFamilyForReplacedFileGroups() {
-    return colFamilyForReplacedFileGroups;
-  }
-
-  public String getColFamilyForFileGroupsInPendingClustering() {
-    return colFamilyForPendingClusteringFileGroups;
   }
 }

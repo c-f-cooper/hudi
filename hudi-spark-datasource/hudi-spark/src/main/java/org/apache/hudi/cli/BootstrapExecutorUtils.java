@@ -18,14 +18,14 @@
 
 package org.apache.hudi.cli;
 
-import org.apache.hudi.DataSourceWriteOptions;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
-import org.apache.hudi.common.config.HoodieConfig;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.model.HoodieTimelineTimeZone;
 import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.HoodieTableVersion;
+import org.apache.hudi.common.util.ConfigUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.common.util.StringUtils;
@@ -33,8 +33,10 @@ import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.config.HoodieCompactionConfig;
 import org.apache.hudi.config.HoodieIndexConfig;
+import org.apache.hudi.config.HoodiePayloadConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.hive.HiveSyncConfig;
 import org.apache.hudi.hive.HiveSyncTool;
 import org.apache.hudi.index.HoodieIndex;
@@ -46,12 +48,11 @@ import org.apache.hudi.keygen.constant.KeyGeneratorType;
 import org.apache.hudi.keygen.factory.HoodieSparkKeyGeneratorFactory;
 import org.apache.hudi.util.SparkKeyGenUtils;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.Serializable;
@@ -59,14 +60,13 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
-import static org.apache.hudi.common.table.HoodieTableConfig.ARCHIVELOG_FOLDER;
 import static org.apache.hudi.common.table.HoodieTableConfig.PARTITION_METAFILE_USE_BASE_FORMAT;
 import static org.apache.hudi.common.table.HoodieTableConfig.POPULATE_META_FIELDS;
+import static org.apache.hudi.common.table.HoodieTableConfig.TIMELINE_HISTORY_PATH;
 import static org.apache.hudi.common.table.HoodieTableConfig.TIMELINE_TIMEZONE;
 import static org.apache.hudi.common.util.ConfigUtils.filterProperties;
 import static org.apache.hudi.config.HoodieIndexConfig.BUCKET_INDEX_HASH_FIELD;
 import static org.apache.hudi.config.HoodieIndexConfig.BUCKET_INDEX_NUM_BUCKETS;
-import static org.apache.hudi.config.HoodieWriteConfig.PRECOMBINE_FIELD_NAME;
 import static org.apache.hudi.hive.HiveSyncConfigHolder.HIVE_SYNC_BUCKET_SYNC;
 import static org.apache.hudi.hive.HiveSyncConfigHolder.HIVE_SYNC_BUCKET_SYNC_SPEC;
 import static org.apache.hudi.keygen.constant.KeyGeneratorOptions.HIVE_STYLE_PARTITIONING_ENABLE;
@@ -81,9 +81,8 @@ import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_TABLE_NAME;
  * Performs bootstrap from a non-hudi source.
  * import static org.apache.hudi.common.util.ConfigUtils.filterProperties;
  */
+@Slf4j
 public class BootstrapExecutorUtils implements Serializable {
-
-  private static final Logger LOG = LoggerFactory.getLogger(BootstrapExecutorUtils.class);
 
   /**
    * Config.
@@ -140,29 +139,25 @@ public class BootstrapExecutorUtils implements Serializable {
             .key()),
         HoodieTableConfig.BOOTSTRAP_BASE_PATH.key() + " must be specified.");
     this.bootstrapBasePath = properties.getString(HoodieTableConfig.BOOTSTRAP_BASE_PATH.key());
-
-    // Add more defaults if full bootstrap requested
-    this.props.putIfAbsent(DataSourceWriteOptions.PAYLOAD_CLASS_NAME().key(),
-        DataSourceWriteOptions.PAYLOAD_CLASS_NAME().defaultValue());
     /*
      * Schema provider that supplies the command for reading the input and writing out the target table.
      */
     SchemaProvider schemaProvider = createSchemaProvider(cfg.schemaProviderClass, props, jssc);
-    String keyGenClass = genKeyGenClassAndPartitionColumns().getLeft();
+    String keyGenClass = genKeyGenClassAndPartitionColumnsForKeyGenerator().getLeft();
     HoodieWriteConfig.Builder builder =
         HoodieWriteConfig.newBuilder().withPath(cfg.basePath)
             .withCompactionConfig(HoodieCompactionConfig.newBuilder().withInlineCompaction(false).build())
             .forTable(cfg.tableName)
             .withIndexConfig(HoodieIndexConfig.newBuilder().withIndexType(HoodieIndex.IndexType.BLOOM).build())
-            .withAutoCommit(true)
             .withKeyGenerator(keyGenClass)
+            .withPayloadConfig(HoodiePayloadConfig.newBuilder().withPayloadClass(cfg.payloadClass).build())
             .withProps(props);
 
     if (null != schemaProvider && null != schemaProvider.getTargetSchema()) {
       builder = builder.withSchema(schemaProvider.getTargetSchema().toString());
     }
     this.bootstrapConfig = builder.build();
-    LOG.info("Created bootstrap executor with configs : " + bootstrapConfig.getProps());
+    log.info("Created bootstrap executor with configs : {}", bootstrapConfig.getProps());
   }
 
   public static SchemaProvider createSchemaProvider(String schemaProviderClass, TypedProperties cfg,
@@ -188,7 +183,7 @@ public class BootstrapExecutorUtils implements Serializable {
     } catch (Exception e) {
       Path basePath = new Path(cfg.basePath);
       if (fs.exists(basePath)) {
-        LOG.warn("deleted target base path " + cfg.basePath);
+        log.info("deleted target base path {}", cfg.basePath);
         fs.delete(basePath, true);
       }
       throw new HoodieException("Failed to bootstrap table", e);
@@ -222,30 +217,33 @@ public class BootstrapExecutorUtils implements Serializable {
     Path basePath = new Path(cfg.basePath);
     if (fs.exists(basePath)) {
       if (cfg.bootstrapOverwrite) {
-        LOG.warn("Target base path already exists, overwrite it");
+        log.info("Target base path already exists, overwrite it");
         fs.delete(basePath, true);
       } else {
         throw new HoodieException("target base path already exists at " + cfg.basePath
             + ". Cannot bootstrap data on top of an existing table");
       }
     }
-    Pair<String, String> keyGenClassAndParCols = genKeyGenClassAndPartitionColumns();
+    Pair<String, String> keyGenClassAndParColsForKeyGenerator = genKeyGenClassAndPartitionColumnsForKeyGenerator();
     Map<String, Object> timestampKeyGeneratorConfigs =
-        extractConfigsRelatedToTimestampBasedKeyGenerator(keyGenClassAndParCols.getLeft(), props);
+        extractConfigsRelatedToTimestampBasedKeyGenerator(keyGenClassAndParColsForKeyGenerator.getLeft(), props);
 
-    HoodieTableMetaClient.PropertyBuilder builder = HoodieTableMetaClient.withPropertyBuilder()
+    HoodieTableMetaClient.TableBuilder builder = HoodieTableMetaClient.newTableBuilder()
         .fromProperties(props)
         .setTableType(cfg.tableType)
         .setDatabaseName(cfg.database)
         .setTableName(cfg.tableName)
+        .setTableVersion(bootstrapConfig.getWriteVersion())
         .setRecordKeyFields(props.getString(RECORDKEY_FIELD_NAME.key()))
-        .setPreCombineField(props.getString(PRECOMBINE_FIELD_NAME.key(), null))
+        .setOrderingFields(ConfigUtils.getOrderingFieldsStrDuringWrite(props))
         .setPopulateMetaFields(props.getBoolean(
             POPULATE_META_FIELDS.key(), POPULATE_META_FIELDS.defaultValue()))
         .setArchiveLogFolder(props.getString(
-            ARCHIVELOG_FOLDER.key(), ARCHIVELOG_FOLDER.defaultValue()))
+            TIMELINE_HISTORY_PATH.key(), TIMELINE_HISTORY_PATH.defaultValue()))
         .setPayloadClassName(cfg.payloadClass)
         .setBaseFileFormat(cfg.baseFileFormat)
+        .setTableFormat(props.getString(HoodieTableConfig.TABLE_FORMAT.key(),
+                HoodieTableConfig.TABLE_FORMAT.defaultValue()))
         .setBootstrapIndexClass(cfg.bootstrapIndexClass)
         .setBootstrapBasePath(bootstrapBasePath)
         .setCDCEnabled(props.getBoolean(HoodieTableConfig.CDC_ENABLED.key(),
@@ -266,31 +264,32 @@ public class BootstrapExecutorUtils implements Serializable {
             PARTITION_METAFILE_USE_BASE_FORMAT.key(),
             PARTITION_METAFILE_USE_BASE_FORMAT.defaultValue()))
         .set(timestampKeyGeneratorConfigs)
-        .setKeyGeneratorClassProp(keyGenClassAndParCols.getLeft())
-        .setPartitionFields(keyGenClassAndParCols.getRight());
+        .setKeyGeneratorClassProp(keyGenClassAndParColsForKeyGenerator.getLeft())
+        .setPartitionFields(keyGenClassAndParColsForKeyGenerator.getRight());
 
-    builder.initTable(new Configuration(jssc.hadoopConfiguration()), cfg.basePath);
+    builder.initTable(HadoopFSUtils.getStorageConfWithCopy(jssc.hadoopConfiguration()), cfg.basePath);
   }
 
-  private Pair<String, String> genKeyGenClassAndPartitionColumns() {
+  private Pair<String, String> genKeyGenClassAndPartitionColumnsForKeyGenerator() {
     String keyGenClass;
     if (StringUtils.nonEmpty(props.getString(HoodieWriteConfig.KEYGENERATOR_CLASS_NAME.key(), null))) {
       keyGenClass = props.getString(HoodieWriteConfig.KEYGENERATOR_CLASS_NAME.key());
     } else if (StringUtils.nonEmpty(props.getString(HoodieWriteConfig.KEYGENERATOR_TYPE.key(), null))) {
       keyGenClass = HoodieSparkKeyGeneratorFactory.getKeyGeneratorClassName(props);
     } else {
-      keyGenClass = KeyGeneratorType.getKeyGeneratorClassName(new HoodieConfig(props));
+      keyGenClass = KeyGeneratorType.getKeyGeneratorClassName(props);
     }
     props.put(HoodieWriteConfig.KEYGENERATOR_CLASS_NAME.key(), keyGenClass);
-    String partitionColumns = SparkKeyGenUtils.getPartitionColumns(props);
+    HoodieTableVersion tableVersion = HoodieTableVersion.fromVersionCode(props.getInteger(HoodieWriteConfig.WRITE_TABLE_VERSION.key(), HoodieTableVersion.current().versionCode()));
+    String partitionColumnsForKeyGenerator = SparkKeyGenUtils.getPartitionColumnsForKeyGenerator(props, tableVersion);
 
-    if (StringUtils.isNullOrEmpty(partitionColumns)) {
-      partitionColumns = null;
+    if (StringUtils.isNullOrEmpty(partitionColumnsForKeyGenerator)) {
+      partitionColumnsForKeyGenerator = null;
       if (keyGenClass.equals(SimpleKeyGenerator.class.getName())) {
         keyGenClass = NonpartitionedKeyGenerator.class.getName();
       }
     }
-    return Pair.of(keyGenClass, partitionColumns);
+    return Pair.of(keyGenClass, partitionColumnsForKeyGenerator);
   }
 
   private Map<String, Object> extractConfigsRelatedToTimestampBasedKeyGenerator(String keyGenerator, TypedProperties params) {
@@ -301,7 +300,14 @@ public class BootstrapExecutorUtils implements Serializable {
     return Collections.emptyMap();
   }
 
+  /**
+   * Configuration class for Bootstrap operations.
+   * Note: Explicit setters are used instead of Lombok's @Setter annotation because this class is accessed from Scala code
+   * (RunBootstrapProcedure.scala). Since Scala compilation happens before Java compilation in the Maven build lifecycle,
+   * Lombok-generated methods would not be visible to the Scala compiler, causing compilation errors.
+   */
   public static class Config {
+
     private String database;
 
     private String tableName;

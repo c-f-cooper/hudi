@@ -18,6 +18,7 @@
 
 package org.apache.hudi.client;
 
+import org.apache.hudi.avro.model.HoodieCleanMetadata;
 import org.apache.hudi.callback.HoodieClientInitCallback;
 import org.apache.hudi.client.embedded.EmbeddedTimelineServerHelper;
 import org.apache.hudi.client.embedded.EmbeddedTimelineService;
@@ -28,58 +29,70 @@ import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
+import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.table.timeline.TimeGenerator;
 import org.apache.hudi.common.table.timeline.TimeGenerators;
-import org.apache.hudi.common.table.timeline.versioning.TimelineLayoutVersion;
+import org.apache.hudi.common.table.timeline.TimelineUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.common.util.StringUtils;
+import org.apache.hudi.common.util.VisibleForTesting;
 import org.apache.hudi.config.HoodieWriteConfig;
+
+import static org.apache.hudi.config.HoodieWriteConfig.APPLICATION_ID;
 import org.apache.hudi.exception.HoodieCommitException;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieIOException;
 import org.apache.hudi.exception.HoodieWriteConflictException;
-import org.apache.hudi.hadoop.fs.HadoopFSUtils;
+import org.apache.hudi.metadata.HoodieTableMetadataWriter;
 import org.apache.hudi.metrics.HoodieMetrics;
+import org.apache.hudi.storage.HoodieStorage;
+import org.apache.hudi.storage.HoodieStorageUtils;
+import org.apache.hudi.storage.StorageConfiguration;
 import org.apache.hudi.table.HoodieTable;
 
 import com.codahale.metrics.Timer;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Abstract class taking care of holding common member variables (FileSystem, SparkContext, HoodieConfigs) Also, manages
  * embedded timeline-server if enabled.
  */
+@Slf4j
 public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
 
-  private static final Logger LOG = LoggerFactory.getLogger(BaseHoodieClient.class);
-
-  protected final transient FileSystem fs;
+  private static final long serialVersionUID = 1L;
+  protected final transient HoodieStorage storage;
   protected final transient HoodieEngineContext context;
-  protected final transient Configuration hadoopConf;
+  protected final transient StorageConfiguration<?> storageConf;
   protected final transient HoodieMetrics metrics;
+  @Getter
   protected final HoodieWriteConfig config;
   protected final String basePath;
+  @Getter
   protected final HoodieHeartbeatClient heartbeatClient;
   protected final TransactionManager txnManager;
-  private final TimeGenerator timeGenerator;
+  protected final TimeGenerator timeGenerator;
 
   /**
    * Timeline Server has the same lifetime as that of Client. Any operations done on the same timeline service will be
    * able to take advantage of the cached file-system view. New completed actions will be synced automatically in an
    * incremental fashion.
    */
-  private transient Option<EmbeddedTimelineService> timelineServer;
+  @Getter private transient Option<EmbeddedTimelineService> timelineServer;
   private final boolean shouldStopTimelineServer;
 
   protected BaseHoodieClient(HoodieEngineContext context, HoodieWriteConfig clientConfig) {
@@ -87,21 +100,36 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
   }
 
   protected BaseHoodieClient(HoodieEngineContext context, HoodieWriteConfig clientConfig,
-      Option<EmbeddedTimelineService> timelineServer) {
-    this.hadoopConf = context.getHadoopConf().get();
-    this.fs = HadoopFSUtils.getFs(clientConfig.getBasePath(), hadoopConf);
+                             Option<EmbeddedTimelineService> timelineServer) {
+    this(context, clientConfig, timelineServer, buildTransactionManager(context, clientConfig), buildTimeGenerator(context, clientConfig));
+  }
+
+  private static TimeGenerator buildTimeGenerator(HoodieEngineContext context, HoodieWriteConfig clientConfig) {
+    return TimeGenerators.getTimeGenerator(clientConfig.getTimeGeneratorConfig(), context.getStorageConf());
+  }
+
+  private static TransactionManager buildTransactionManager(HoodieEngineContext context, HoodieWriteConfig clientConfig) {
+    return new TransactionManager(clientConfig, HoodieStorageUtils.getStorage(clientConfig.getBasePath(), context.getStorageConf()));
+  }
+
+  @VisibleForTesting
+  BaseHoodieClient(HoodieEngineContext context, HoodieWriteConfig clientConfig,
+                   Option<EmbeddedTimelineService> timelineServer, TransactionManager transactionManager, TimeGenerator timeGenerator) {
+    this.storageConf = context.getStorageConf();
+    this.storage = HoodieStorageUtils.getStorage(clientConfig.getBasePath(), storageConf);
     this.context = context;
     this.basePath = clientConfig.getBasePath();
     this.config = clientConfig;
+    this.config.setValue(APPLICATION_ID, context.getApplicationId());
     this.timelineServer = timelineServer;
     shouldStopTimelineServer = !timelineServer.isPresent();
-    this.heartbeatClient = new HoodieHeartbeatClient(this.fs, this.basePath,
-        clientConfig.getHoodieClientHeartbeatIntervalInMs(), clientConfig.getHoodieClientHeartbeatTolerableMisses());
-    this.metrics = new HoodieMetrics(config);
-    this.txnManager = new TransactionManager(config, fs);
-    this.timeGenerator = TimeGenerators.getTimeGenerator(config.getTimeGeneratorConfig(), hadoopConf);
+    this.heartbeatClient = new HoodieHeartbeatClient(storage, this.basePath,
+        clientConfig.getHoodieClientHeartbeatIntervalInMs(),
+        clientConfig.getHoodieClientHeartbeatTolerableMisses());
+    this.metrics = new HoodieMetrics(config, storage);
+    this.txnManager = transactionManager;
+    this.timeGenerator = timeGenerator;
     startEmbeddedServerView();
-    initWrapperFSMetrics();
     runClientInitCallbacks();
   }
 
@@ -119,7 +147,7 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
   private synchronized void stopEmbeddedServerView(boolean resetViewStorageConfig) {
     if (timelineServer.isPresent() && shouldStopTimelineServer) {
       // Stop only if owner
-      LOG.info("Stopping Timeline service !!");
+      log.info("Stopping Timeline service !!");
       timelineServer.get().stopForBasePath(basePath);
     }
 
@@ -135,16 +163,16 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
       if (!timelineServer.isPresent()) {
         // Run Embedded Timeline Server
         try {
-          timelineServer = EmbeddedTimelineServerHelper.createEmbeddedTimelineService(context, config);
+          timelineServer = Option.of(EmbeddedTimelineServerHelper.createEmbeddedTimelineService(context, config));
         } catch (IOException e) {
-          LOG.warn("Unable to start timeline service. Proceeding as if embedded server is disabled", e);
+          log.warn("Unable to start timeline service. Proceeding as if embedded server is disabled", e);
           stopEmbeddedServerView(false);
         }
       } else {
-        LOG.info("Timeline Server already running. Not restarting the service");
+        log.debug("Timeline Server already running. Not restarting the service");
       }
     } else {
-      LOG.info("Embedded Timeline Server is disabled. Not starting timeline service");
+      log.info("Embedded Timeline Server is disabled. Not starting timeline service");
     }
   }
 
@@ -163,41 +191,19 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
     });
   }
 
-  public HoodieWriteConfig getConfig() {
-    return config;
-  }
-
   public HoodieEngineContext getEngineContext() {
     return context;
   }
 
-  protected void initWrapperFSMetrics() {
-    // no-op.
-  }
-
   protected HoodieTableMetaClient createMetaClient(boolean loadActiveTimelineOnLoad) {
-    return HoodieTableMetaClient.builder().setConf(hadoopConf).setBasePath(config.getBasePath())
-        .setLoadActiveTimelineOnLoad(loadActiveTimelineOnLoad).setConsistencyGuardConfig(config.getConsistencyGuardConfig())
-        .setLayoutVersion(Option.of(new TimelineLayoutVersion(config.getTimelineLayoutVersion())))
+    return HoodieTableMetaClient.builder()
+        .setConf(storageConf.newInstance())
+        .setBasePath(config.getBasePath())
+        .setLoadActiveTimelineOnLoad(loadActiveTimelineOnLoad)
+        .setConsistencyGuardConfig(config.getConsistencyGuardConfig())
         .setTimeGeneratorConfig(config.getTimeGeneratorConfig())
         .setFileSystemRetryConfig(config.getFileSystemRetryConfig())
         .setMetaserverConfig(config.getProps()).build();
-  }
-
-  /**
-   * Returns next instant time in milliseconds. An explicit Lock is enabled in the context.
-   *
-   * @param milliseconds Milliseconds to add to current time while generating the new instant time.
-   */
-  public String createNewInstantTime(long milliseconds) {
-    return HoodieActiveTimeline.createNewInstantTime(true, timeGenerator, milliseconds);
-  }
-
-  /**
-   * Returns next instant time in the correct format. An explicit Lock is enabled in the context.
-   */
-  public String createNewInstantTime() {
-    return HoodieActiveTimeline.createNewInstantTime(true, timeGenerator);
   }
 
   /**
@@ -206,15 +212,7 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
    * @param shouldLock Whether to lock the context to get the instant time.
    */
   public String createNewInstantTime(boolean shouldLock) {
-    return HoodieActiveTimeline.createNewInstantTime(shouldLock, timeGenerator);
-  }
-
-  public Option<EmbeddedTimelineService> getTimelineServer() {
-    return timelineServer;
-  }
-
-  public HoodieHeartbeatClient getHeartbeatClient() {
-    return heartbeatClient;
+    return TimelineUtils.generateInstantTime(shouldLock, timeGenerator);
   }
 
   /**
@@ -231,10 +229,11 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
     Timer.Context conflictResolutionTimer = metrics.getConflictResolutionCtx();
     try {
       TransactionUtils.resolveWriteConflictIfAny(table, this.txnManager.getCurrentTransactionOwner(),
-          Option.of(metadata), config, txnManager.getLastCompletedTransactionOwner(), false, pendingInflightAndRequestedInstants);
+          Option.of(metadata), config, txnManager.getLastCompletedTransactionOwner(), true, pendingInflightAndRequestedInstants);
       metrics.emitConflictResolutionSuccessful();
     } catch (HoodieWriteConflictException e) {
       metrics.emitConflictResolutionFailed();
+      e.getCategory().ifPresent(metrics::emitConflictResolutionByCategory);
       throw e;
     } finally {
       if (conflictResolutionTimer != null) {
@@ -257,12 +256,206 @@ public abstract class BaseHoodieClient implements Serializable, AutoCloseable {
       if (finalizeCtx != null) {
         Option<Long> durationInMs = Option.of(metrics.getDurationInMs(finalizeCtx.stop()));
         durationInMs.ifPresent(duration -> {
-          LOG.info("Finalize write elapsed time (milliseconds): " + duration);
+          log.info("Finalize write elapsed time (milliseconds): {}", duration);
           metrics.updateFinalizeWriteMetrics(duration, stats.size());
         });
       }
     } catch (HoodieIOException ioe) {
       throw new HoodieCommitException("Failed to complete commit " + instantTime + " due to finalize errors.", ioe);
     }
+  }
+
+  /**
+   * Write the HoodieCommitMetadata to metadata table if available.
+   *
+   * @param table         {@link HoodieTable} of interest.
+   * @param instantTime   instant time of the commit.
+   * @param metadata      instance of {@link HoodieCommitMetadata}.
+   */
+  protected void writeTableMetadata(HoodieTable table, String instantTime, HoodieCommitMetadata metadata) {
+    context.setJobStatus(this.getClass().getSimpleName(), "Committing to metadata table: " + config.getTableName());
+    Option<HoodieTableMetadataWriter> metadataWriterOpt = table.getMetadataWriter(instantTime);
+    if (metadataWriterOpt.isPresent()) {
+      try (HoodieTableMetadataWriter metadataWriter = metadataWriterOpt.get()) {
+        metadataWriter.update(metadata, instantTime);
+      } catch (Exception e) {
+        if (e instanceof HoodieException) {
+          throw (HoodieException) e;
+        } else {
+          throw new HoodieException("Failed to update metadata", e);
+        }
+      }
+    }
+  }
+
+  /**
+   * Updates the cols being indexed with column stats. This is for tracking purpose so that queries can leverage col stats
+   * from MDT only for indexed columns.
+   * @param metaClient instance of {@link HoodieTableMetaClient} of interest.
+   * @param columnsToIndex list of columns to index.
+   */
+  protected abstract void updateColumnsToIndexWithColStats(HoodieTableMetaClient metaClient, List<String> columnsToIndex);
+
+  protected void executeUsingTxnManager(Option<HoodieInstant> ownerInstant, Runnable r) {
+    this.txnManager.beginStateChange(ownerInstant, Option.empty());
+    try {
+      r.run();
+    } finally {
+      this.txnManager.endStateChange(ownerInstant);
+    }
+  }
+
+  public TransactionManager getTransactionManager() {
+    return txnManager;
+  }
+
+  protected boolean isStreamingWriteToMetadataEnabled(HoodieTable table) {
+    return config.isMetadataTableEnabled()
+        && config.isMetadataStreamingWritesEnabled(table.getMetaClient().getTableConfig().getTableVersion());
+  }
+
+  /**
+   * Merges rolling metadata from recent completed instants into the current commit metadata.
+   * This method MUST be called within the transaction lock after conflict resolution.
+   *
+   * <p>Rolling metadata keys configured via {@link HoodieWriteConfig#ROLLING_METADATA_KEYS} will be
+   * automatically carried forward from recent instants. The system walks back through completed
+   * commits and clean instants (in reverse completion-time order) up to
+   * {@link HoodieWriteConfig#ROLLING_METADATA_TIMELINE_LOOKBACK_COMMITS} to find the most
+   * recent value for each key.
+   *
+   * @param table HoodieTable instance (may have refreshed timeline after conflict resolution)
+   * @param metadata Current commit metadata to be augmented with rolling metadata
+   */
+  protected void mergeRollingMetadata(HoodieTable table, HoodieCommitMetadata metadata) {
+    // IMPORTANT: We're inside the lock here. The timeline in 'table' is either:
+    // 1. Fresh from createTable() if no conflict resolution happened
+    // 2. Reloaded during resolveWriteConflict() if conflicts were checked
+    // In both cases, we have the latest view of the timeline.
+
+    // Skip for metadata table - rolling metadata is only for data tables
+    if (table.isMetadataTable()) {
+      return;
+    }
+
+    Set<String> rollingKeys = config.getRollingMetadataKeys();
+    if (rollingKeys.isEmpty()) {
+      return;  // No rolling metadata configured
+    }
+
+    Map<String, String> foundRollingMetadata = collectRollingMetadataFromTimeline(table, config, rollingKeys, metadata.getExtraMetadata());
+    for (Map.Entry<String, String> entry : foundRollingMetadata.entrySet()) {
+      metadata.addMetadata(entry.getKey(), entry.getValue());
+    }
+  }
+
+  /**
+   * Overload of {@link #mergeRollingMetadata(HoodieTable, HoodieCommitMetadata)} for clean
+   * commits. Populates {@link HoodieCleanMetadata#getExtraMetadata()} with rolling metadata
+   * values found on the active timeline.
+   *
+   * <p>This is {@code public static} so that {@code CleanActionExecutor} (which does not extend
+   * {@code BaseHoodieClient}) can invoke it.
+   */
+  public static void mergeRollingMetadata(HoodieTable table, HoodieWriteConfig config, HoodieCleanMetadata metadata) {
+    if (table.isMetadataTable()) {
+      return;
+    }
+    Set<String> rollingKeys = config.getRollingMetadataKeys();
+    if (rollingKeys.isEmpty()) {
+      return;
+    }
+
+    Map<String, String> existing = metadata.getExtraMetadata() != null
+        ? metadata.getExtraMetadata() : Collections.emptyMap();
+    Map<String, String> foundRollingMetadata = collectRollingMetadataFromTimeline(table, config, rollingKeys, existing);
+    if (!foundRollingMetadata.isEmpty()) {
+      Map<String, String> merged = new HashMap<>(existing);
+      merged.putAll(foundRollingMetadata);
+      metadata.setExtraMetadata(merged);
+    }
+  }
+
+  /**
+   * Walks backwards through completed instants (commits, replace-commits, delta-commits, and
+   * clean) on the active timeline, extracting extra-metadata values for the requested rolling
+   * keys. For commit-type instants the values come from {@link HoodieCommitMetadata#getMetadata};
+   * for clean instants they come from {@link HoodieCleanMetadata#getExtraMetadata()}.
+   *
+   * <p>Keys already present with a non-empty value in {@code existingExtra} are skipped (empty
+   * strings are treated as "missing").
+   */
+  private static Map<String, String> collectRollingMetadataFromTimeline(
+      HoodieTable table, HoodieWriteConfig config,
+      Set<String> rollingKeys, Map<String, String> existingExtra) {
+
+    Map<String, String> foundRollingMetadata = new HashMap<>();
+    Set<String> remaining = new HashSet<>(rollingKeys);
+
+    for (String key : rollingKeys) {
+      if (existingExtra.containsKey(key) && !StringUtils.isNullOrEmpty(existingExtra.get(key))) {
+        remaining.remove(key);
+      }
+    }
+    if (remaining.isEmpty()) {
+      log.debug("All rolling metadata keys already present. No walkback needed.");
+      return foundRollingMetadata;
+    }
+
+    int lookbackLimit = config.getRollingMetadataTimelineLookbackCommits();
+    HoodieTimeline completed = table.getActiveTimeline().filterCompletedInstants();
+    List<HoodieInstant> instants = completed.getReverseOrderedInstantsByCompletionTime()
+        .filter(i -> HoodieTimeline.VALID_ACTIONS_FOR_ROLLING_METADATA.contains(i.getAction()))
+        .limit(lookbackLimit)
+        .collect(Collectors.toList());
+
+    log.debug("Walking back up to {} instants to find rolling metadata for keys: {}", lookbackLimit, remaining);
+    int instantsWalkedBack = 0;
+
+    try {
+      for (HoodieInstant instant : instants) {
+        if (remaining.isEmpty()) {
+          break;
+        }
+        String action = instant.getAction();
+        Map<String, String> extraMeta = null;
+
+        if (HoodieTimeline.CLEAN_ACTION.equals(action)) {
+          HoodieCleanMetadata cleanMeta = table.getActiveTimeline().readCleanMetadata(instant);
+          extraMeta = cleanMeta.getExtraMetadata();
+        } else {
+          HoodieCommitMetadata commitMeta = table.getMetaClient().getActiveTimeline()
+              .readInstantContent(instant, HoodieCommitMetadata.class);
+          extraMeta = commitMeta.getExtraMetadata();
+        }
+        instantsWalkedBack++;
+
+        if (extraMeta == null) {
+          continue;
+        }
+        for (String key : new HashSet<>(remaining)) {
+          String value = extraMeta.get(key);
+          if (!StringUtils.isNullOrEmpty(value)) {
+            foundRollingMetadata.put(key, value);
+            remaining.remove(key);
+            log.debug("Found rolling metadata key '{}' in {} instant {} with value: {}",
+                key, action, instant.requestedTime(), value);
+          }
+        }
+      }
+
+      if (!foundRollingMetadata.isEmpty() || !remaining.isEmpty()) {
+        log.info("Rolling metadata: walked {} instants. Rolled forward: {}, Not found: {}, Total keys: {}",
+            instantsWalkedBack, foundRollingMetadata.size(), remaining.size(), rollingKeys.size());
+      }
+      if (!remaining.isEmpty()) {
+        log.warn("Rolling metadata keys not found in last {} instants: {}.", instantsWalkedBack, remaining);
+      }
+    } catch (IOException e) {
+      log.error("Failed to read previous metadata for rolling metadata keys: {}.", rollingKeys, e);
+      throw new HoodieIOException("Failed to read previous metadata for rolling keys: " + rollingKeys, e);
+    }
+
+    return foundRollingMetadata;
   }
 }

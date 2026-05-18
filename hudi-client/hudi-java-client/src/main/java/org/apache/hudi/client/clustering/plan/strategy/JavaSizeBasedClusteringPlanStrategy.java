@@ -27,12 +27,12 @@ import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.util.StringUtils;
+import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.table.action.cluster.strategy.PartitionAwareClusteringPlanStrategy;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.HashMap;
 import java.util.List;
@@ -46,9 +46,9 @@ import static org.apache.hudi.config.HoodieClusteringConfig.PLAN_STRATEGY_SORT_C
  * 1) Creates clustering groups based on max size allowed per group.
  * 2) Excludes files that are greater than 'small.file.limit' from clustering plan.
  */
+@Slf4j
 public class JavaSizeBasedClusteringPlanStrategy<T>
     extends PartitionAwareClusteringPlanStrategy<T, List<HoodieRecord<T>>, List<HoodieKey>, List<WriteStatus>> {
-  private static final Logger LOG = LoggerFactory.getLogger(JavaSizeBasedClusteringPlanStrategy.class);
 
   public JavaSizeBasedClusteringPlanStrategy(HoodieTable table,
                                              HoodieEngineContext engineContext,
@@ -57,7 +57,7 @@ public class JavaSizeBasedClusteringPlanStrategy<T>
   }
 
   @Override
-  protected Stream<HoodieClusteringGroup> buildClusteringGroupsForPartition(String partitionPath, List<FileSlice> fileSlices) {
+  protected Pair<Stream<HoodieClusteringGroup>, Boolean> buildClusteringGroupsForPartition(String partitionPath, List<FileSlice> fileSlices) {
     return super.buildClusteringGroupsForPartition(partitionPath, fileSlices);
   }
 

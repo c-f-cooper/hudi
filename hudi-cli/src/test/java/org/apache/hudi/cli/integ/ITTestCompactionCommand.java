@@ -24,6 +24,7 @@ import org.apache.hudi.cli.testutils.HoodieCLIIntegrationTestBase;
 import org.apache.hudi.cli.testutils.ShellEvaluationResultUtil;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.client.TestCompactionAdminClient;
+import org.apache.hudi.client.WriteClientTestUtils;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.common.model.CompactionOperation;
@@ -31,15 +32,16 @@ import org.apache.hudi.common.model.HoodieAvroPayload;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.table.HoodieTableVersion;
 import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
-import org.apache.hudi.common.table.timeline.versioning.TimelineLayoutVersion;
 import org.apache.hudi.common.testutils.CompactionTestUtils;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.util.CompactionUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.config.HoodieIndexConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.testutils.HoodieClientTestBase;
 
@@ -78,11 +80,12 @@ public class ITTestCompactionCommand extends HoodieCLIIntegrationTestBase {
     tableName = "test_table_" + ITTestCompactionCommand.class.getName();
     basePath = Paths.get(basePath, tableName).toString();
 
-    HoodieCLI.conf = jsc.hadoopConfiguration();
+    HoodieCLI.conf = HadoopFSUtils.getStorageConfWithCopy(jsc.hadoopConfiguration());
     // Create table and connect
     new TableCommand().createTable(
         basePath, tableName, HoodieTableType.MERGE_ON_READ.name(),
-        "", TimelineLayoutVersion.VERSION_1, "org.apache.hudi.common.model.HoodieAvroPayload");
+        "", HoodieTableVersion.current().versionCode(),
+        "org.apache.hudi.common.model.HoodieAvroPayload");
 
     initMetaClient();
   }
@@ -133,7 +136,7 @@ public class ITTestCompactionCommand extends HoodieCLIIntegrationTestBase {
     // assert compaction complete
     assertTrue(HoodieCLI.getTableMetaClient().getActiveTimeline().reload()
         .filterCompletedInstants().getInstantsAsStream()
-        .map(HoodieInstant::getTimestamp).collect(Collectors.toList()).contains(instance),
+        .map(HoodieInstant::requestedTime).collect(Collectors.toList()).contains(instance),
         "Pending compaction must be completed");
   }
 
@@ -161,7 +164,7 @@ public class ITTestCompactionCommand extends HoodieCLIIntegrationTestBase {
     // assert compaction complete
     assertTrue(HoodieCLI.getTableMetaClient().getActiveTimeline().reload()
             .filterCompletedInstants().getInstantsAsStream()
-            .map(HoodieInstant::getTimestamp).count() > 0,
+            .map(HoodieInstant::requestedTime).count() > 0,
         "Completed compaction couldn't be 0");
   }
 
@@ -266,7 +269,7 @@ public class ITTestCompactionCommand extends HoodieCLIIntegrationTestBase {
     // get compaction instance
     HoodieActiveTimeline timeline = HoodieCLI.getTableMetaClient().getActiveTimeline();
     Option<String> instance =
-        timeline.filterPendingCompactionTimeline().firstInstant().map(HoodieInstant::getTimestamp);
+        timeline.filterPendingCompactionTimeline().firstInstant().map(HoodieInstant::requestedTime);
     assertTrue(instance.isPresent(), "Must have pending compaction.");
     return instance.get();
   }
@@ -298,7 +301,7 @@ public class ITTestCompactionCommand extends HoodieCLIIntegrationTestBase {
       HoodieTestDataGenerator dataGen) throws IOException {
     // inserts
     String newCommitTime = "001";
-    client.startCommitWithTime(newCommitTime);
+    WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
 
     List<HoodieRecord> records = dataGen.generateInserts(newCommitTime, 10);
     JavaRDD<HoodieRecord> writeRecords = jsc.parallelize(records, 1);
@@ -311,7 +314,7 @@ public class ITTestCompactionCommand extends HoodieCLIIntegrationTestBase {
       throws IOException {
     // updates
     String newCommitTime = "002";
-    client.startCommitWithTime(newCommitTime);
+    WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
 
     List<HoodieRecord> toBeUpdated = dataGen.generateUpdates(newCommitTime, 2);
     records.addAll(toBeUpdated);
@@ -323,19 +326,20 @@ public class ITTestCompactionCommand extends HoodieCLIIntegrationTestBase {
        List<HoodieRecord> records) {
     // Delete
     String newCommitTime = "003";
-    client.startCommitWithTime(newCommitTime);
+    WriteClientTestUtils.startCommitWithTime(client, newCommitTime);
 
     // just delete half of the records
     int numToDelete = records.size() / 2;
     List<HoodieKey> toBeDeleted = records.stream().map(HoodieRecord::getKey).limit(numToDelete).collect(Collectors.toList());
     JavaRDD<HoodieKey> deleteRecords = jsc.parallelize(toBeDeleted, 1);
-    client.delete(deleteRecords, newCommitTime);
+    client.commit(newCommitTime, client.delete(deleteRecords, newCommitTime));
   }
 
-  private JavaRDD<WriteStatus> operateFunc(
+  private void operateFunc(
       HoodieClientTestBase.Function3<JavaRDD<WriteStatus>, SparkRDDWriteClient, JavaRDD<HoodieRecord>, String> writeFn,
       SparkRDDWriteClient<HoodieAvroPayload> client, JavaRDD<HoodieRecord> writeRecords, String commitTime)
       throws IOException {
-    return writeFn.apply(client, writeRecords, commitTime);
+    List<WriteStatus> writeStatuses = writeFn.apply(client, writeRecords, commitTime).collect();
+    client.commit(commitTime, jsc.parallelize(writeStatuses));
   }
 }

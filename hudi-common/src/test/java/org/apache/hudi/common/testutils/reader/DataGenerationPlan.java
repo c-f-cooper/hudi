@@ -19,6 +19,9 @@
 
 package org.apache.hudi.common.testutils.reader;
 
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
 import java.util.List;
 
 /**
@@ -29,6 +32,8 @@ import java.util.List;
  * 1. One plan generates one file, either a base file, or a log file.
  * 2. One file contains one operation, e.g., insert, delete, or update.
  */
+@AllArgsConstructor
+@Getter
 public class DataGenerationPlan {
   // The values for "_row_key" field.
   private final List<String> recordKeys;
@@ -39,43 +44,12 @@ public class DataGenerationPlan {
   // The operation type of the record.
   private final OperationType operationType;
   private final String instantTime;
+  private final boolean writePositions;
 
   public enum OperationType {
     INSERT,
     UPDATE,
     DELETE
-  }
-
-  public DataGenerationPlan(List<String> recordKeys,
-                            String partitionPath,
-                            long timestamp,
-                            OperationType operationType,
-                            String instantTime) {
-    this.recordKeys = recordKeys;
-    this.partitionPath = partitionPath;
-    this.timestamp = timestamp;
-    this.operationType = operationType;
-    this.instantTime = instantTime;
-  }
-
-  public List<String> getRecordKeys() {
-    return recordKeys;
-  }
-
-  public String getPartitionPath() {
-    return partitionPath;
-  }
-
-  public long getTimestamp() {
-    return timestamp;
-  }
-
-  public OperationType getOperationType() {
-    return operationType;
-  }
-
-  public String getInstantTime() {
-    return instantTime;
   }
 
   public static Builder newBuilder() {
@@ -88,6 +62,7 @@ public class DataGenerationPlan {
     private long timestamp;
     private OperationType operationType;
     private String instantTime;
+    private boolean writePositions;
 
     public Builder withRecordKeys(List<String> recordKeys) {
       this.recordKeys = recordKeys;
@@ -114,13 +89,19 @@ public class DataGenerationPlan {
       return this;
     }
 
+    public Builder withWritePositions(boolean writePositions) {
+      this.writePositions = writePositions;
+      return this;
+    }
+
     public DataGenerationPlan build() {
       return new DataGenerationPlan(
           recordKeys,
           partitionPath,
           timestamp,
           operationType,
-          instantTime);
+          instantTime,
+          writePositions);
     }
   }
 }

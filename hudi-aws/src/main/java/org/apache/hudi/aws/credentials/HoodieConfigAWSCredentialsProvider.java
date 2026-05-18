@@ -18,24 +18,22 @@
 
 package org.apache.hudi.aws.credentials;
 
-import org.apache.hudi.config.HoodieAWSConfig;
 import org.apache.hudi.common.util.StringUtils;
+import org.apache.hudi.config.HoodieAWSConfig;
 
+import lombok.extern.slf4j.Slf4j;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Properties;
 
 /**
  * Credentials provider which fetches AWS access key from Hoodie config.
  */
+@Slf4j
 public class HoodieConfigAWSCredentialsProvider implements AwsCredentialsProvider {
-
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieConfigAWSCredentialsProvider.class);
 
   private AwsCredentials awsCredentials;
 
@@ -45,7 +43,7 @@ public class HoodieConfigAWSCredentialsProvider implements AwsCredentialsProvide
     String sessionToken = props.getProperty(HoodieAWSConfig.AWS_SESSION_TOKEN.key());
 
     if (StringUtils.isNullOrEmpty(accessKey) || StringUtils.isNullOrEmpty(secretKey)) {
-      LOG.debug("AWS access key or secret key not found in the Hudi configuration. "
+      log.debug("AWS access key or secret key not found in the Hudi configuration. "
               + "Use default AWS credentials");
     } else {
       this.awsCredentials = createCredentials(accessKey, secretKey, sessionToken);

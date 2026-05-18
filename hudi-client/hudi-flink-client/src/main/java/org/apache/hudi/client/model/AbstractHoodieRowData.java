@@ -18,7 +18,9 @@
 
 package org.apache.hudi.client.model;
 
+import org.apache.hudi.adapter.DataTypeAdapter;
 import org.apache.hudi.common.model.HoodieOperation;
+import org.apache.hudi.common.util.ValidationUtils;
 
 import org.apache.flink.table.data.ArrayData;
 import org.apache.flink.table.data.DecimalData;
@@ -28,6 +30,7 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.types.RowKind;
+import org.apache.flink.types.variant.Variant;
 
 /**
  * RowData implementation for Hoodie Row. It wraps an {@link RowData} and keeps meta columns locally. But the {@link RowData}
@@ -57,6 +60,11 @@ public abstract class AbstractHoodieRowData implements RowData {
       metaColumns[5] = HoodieOperation.fromValue(row.getRowKind().toByteValue()).getName();
     }
     this.row = row;
+  }
+
+  public void updateMetaField(int pos, String value) {
+    ValidationUtils.checkArgument(pos < metaColumnsNum, "Invalid position for metadata field: " + pos);
+    metaColumns[pos] = value;
   }
 
   @Override
@@ -155,9 +163,13 @@ public abstract class AbstractHoodieRowData implements RowData {
     return row.getMap(rebaseOrdinal(ordinal));
   }
 
-  private String getMetaColumnVal(int ordinal) {
+  protected String getMetaColumnVal(int ordinal) {
     return this.metaColumns[ordinal];
   }
 
   protected abstract int rebaseOrdinal(int ordinal);
+
+  public Variant getVariant(int i) {
+    return DataTypeAdapter.getVariant(row, rebaseOrdinal(i));
+  }
 }

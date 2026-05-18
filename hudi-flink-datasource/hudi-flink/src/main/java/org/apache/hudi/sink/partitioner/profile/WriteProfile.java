@@ -34,10 +34,11 @@ import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.table.action.commit.SmallFile;
 import org.apache.hudi.util.StreamerUtil;
 
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.core.fs.Path;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.hadoop.conf.Configuration;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -54,8 +55,8 @@ import java.util.stream.Stream;
  *
  * <p>The profile is re-constructed when there are new commits on the timeline.
  */
+@Slf4j
 public class WriteProfile {
-  private static final Logger LOG = LoggerFactory.getLogger(WriteProfile.class);
 
   /**
    * The write config.
@@ -70,17 +71,20 @@ public class WriteProfile {
   /**
    * The meta client.
    */
+  @Getter
   protected final HoodieTableMetaClient metaClient;
 
   /**
    * The average record size.
    */
+  @Getter
   private long avgSize = -1L;
 
   /**
    * Total records to write for each bucket based on
    * the config option {@link HoodieStorageConfig#PARQUET_MAX_FILE_SIZE}.
    */
+  @Getter
   private long recordsPerBucket;
 
   /**
@@ -114,23 +118,12 @@ public class WriteProfile {
     this.basePath = new Path(config.getBasePath());
     this.smallFilesMap = new HashMap<>();
     this.recordsPerBucket = config.getCopyOnWriteInsertSplitSize();
-    this.metaClient = StreamerUtil.createMetaClient(config.getBasePath(), context.getHadoopConf().get());
+    this.metaClient = StreamerUtil.createMetaClient(
+        config.getBasePath(), context.getStorageConf().unwrapAs(Configuration.class));
     this.metadataCache = new HashMap<>();
     this.fsView = getFileSystemView();
     // profile the record statistics on construction
     recordProfile();
-  }
-
-  public long getAvgSize() {
-    return avgSize;
-  }
-
-  public long getRecordsPerBucket() {
-    return recordsPerBucket;
-  }
-
-  public HoodieTableMetaClient getMetaClient() {
-    return this.metaClient;
   }
 
   protected HoodieTable<?, ?, ?, ?> getTable() {
@@ -152,7 +145,7 @@ public class WriteProfile {
         HoodieInstant instant = instants.next();
         final HoodieCommitMetadata commitMetadata =
             this.metadataCache.computeIfAbsent(
-                instant.getTimestamp(),
+                instant.requestedTime(),
                 k -> WriteProfiles.getCommitMetadataSafely(config.getTableName(), basePath, instant, commitTimeline)
                     .orElse(null));
         if (commitMetadata == null) {
@@ -166,7 +159,7 @@ public class WriteProfile {
         }
       }
     }
-    LOG.info("Refresh average bytes per record => " + avgSize);
+    log.info("Refresh average bytes per record => " + avgSize);
     return avgSize;
   }
 
@@ -204,7 +197,7 @@ public class WriteProfile {
     if (!commitTimeline.empty()) { // if we have some commits
       HoodieInstant latestCommitTime = commitTimeline.lastInstant().get();
       List<HoodieBaseFile> allFiles = fsView
-          .getLatestBaseFilesBeforeOrOn(partitionPath, latestCommitTime.getTimestamp()).collect(Collectors.toList());
+          .getLatestBaseFilesBeforeOrOn(partitionPath, latestCommitTime.requestedTime()).collect(Collectors.toList());
 
       for (HoodieBaseFile file : allFiles) {
         // filter out the corrupted files.
@@ -229,7 +222,7 @@ public class WriteProfile {
    * whose instant does not belong to the given instants {@code instants}.
    */
   private void cleanMetadataCache(Stream<HoodieInstant> instants) {
-    Set<String> timestampSet = instants.map(HoodieInstant::getTimestamp).collect(Collectors.toSet());
+    Set<String> timestampSet = instants.map(HoodieInstant::requestedTime).collect(Collectors.toSet());
     this.metadataCache.keySet().retainAll(timestampSet);
   }
 
@@ -237,7 +230,7 @@ public class WriteProfile {
     this.avgSize = averageBytesPerRecord();
     if (config.shouldAllowMultiWriteOnSameInstant()) {
       this.recordsPerBucket = config.getParquetMaxFileSize() / avgSize;
-      LOG.info("Refresh insert records per bucket => " + recordsPerBucket);
+      log.info("Refresh insert records per bucket => " + recordsPerBucket);
     }
   }
 

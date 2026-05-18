@@ -21,12 +21,11 @@ package org.apache.hudi.sink.clustering;
 import org.apache.hudi.avro.model.HoodieClusteringGroup;
 import org.apache.hudi.avro.model.HoodieClusteringPlan;
 import org.apache.hudi.client.WriteStatus;
-import org.apache.hudi.common.data.HoodieListData;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.TableServiceType;
 import org.apache.hudi.common.model.WriteOperationType;
-import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.ClusteringUtils;
 import org.apache.hudi.common.util.CommitUtils;
@@ -42,10 +41,9 @@ import org.apache.hudi.table.action.HoodieWriteMetadata;
 import org.apache.hudi.util.ClusteringUtil;
 import org.apache.hudi.util.FlinkWriteClients;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.MetricGroup;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Collection;
 import java.util.HashMap;
@@ -65,8 +63,8 @@ import java.util.stream.Collectors;
  * <p>It also inherits the {@link CleanFunction} cleaning ability. This is needed because
  * the SQL API does not allow multiple sinks in one table sink provider.
  */
+@Slf4j
 public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
-  private static final Logger LOG = LoggerFactory.getLogger(ClusteringCommitSink.class);
 
   /**
    * Config options.
@@ -112,9 +110,24 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
   @Override
   public void invoke(ClusteringCommitEvent event, Context context) throws Exception {
     final String instant = event.getInstant();
+    if (event.isFailed()
+        || (event.getWriteStatuses() != null
+        && event.getWriteStatuses().stream().anyMatch(writeStatus -> writeStatus.getTotalErrorRecords() > 0))) {
+      log.warn("Receive abnormal ClusteringCommitEvent of instant {}, task ID is {},"
+              + " is failed: {}, error record count: {}",
+          instant, event.getTaskID(), event.isFailed(), getNumErrorRecords(event));
+    }
     commitBuffer.computeIfAbsent(instant, k -> new HashMap<>())
         .put(event.getFileIds(), event);
     commitIfNecessary(instant, commitBuffer.get(instant).values());
+  }
+
+  private long getNumErrorRecords(ClusteringCommitEvent event) {
+    if (event.getWriteStatuses() == null) {
+      return -1L;
+    }
+    return event.getWriteStatuses().stream()
+        .map(WriteStatus::getTotalErrorRecords).reduce(Long::sum).orElse(0L);
   }
 
   /**
@@ -127,13 +140,20 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
   private void commitIfNecessary(String instant, Collection<ClusteringCommitEvent> events) {
     HoodieClusteringPlan clusteringPlan = clusteringPlanCache.computeIfAbsent(instant, k -> {
       try {
-        Option<Pair<HoodieInstant, HoodieClusteringPlan>> clusteringPlanOption = ClusteringUtils.getClusteringPlan(
-            this.writeClient.getHoodieTable().getMetaClient(), HoodieTimeline.getReplaceCommitInflightInstant(instant));
-        return clusteringPlanOption.get().getRight();
+        HoodieTableMetaClient metaClient = this.writeClient.getHoodieTable().getMetaClient();
+        return ClusteringUtils.getInflightClusteringInstant(instant, metaClient.getActiveTimeline(), table.getInstantGenerator())
+            .flatMap(pendingInstant -> ClusteringUtils.getClusteringPlan(
+            metaClient, pendingInstant))
+            .map(Pair::getRight)
+            .orElse(null);
       } catch (Exception e) {
         throw new HoodieException(e);
       }
     });
+
+    if (clusteringPlan == null) {
+      return;
+    }
 
     boolean isReady = clusteringPlan.getInputGroups().size() == events.size();
     if (!isReady) {
@@ -155,7 +175,7 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
       doCommit(instant, clusteringPlan, events);
     } catch (Throwable throwable) {
       // make it fail-safe
-      LOG.error("Error while committing clustering instant: " + instant, throwable);
+      log.error("Error while committing clustering instant: " + instant, throwable);
     } finally {
       // reset the status
       reset(instant);
@@ -170,9 +190,9 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
 
     long numErrorRecords = statuses.stream().map(WriteStatus::getTotalErrorRecords).reduce(Long::sum).orElse(0L);
 
-    if (numErrorRecords > 0 && !this.conf.getBoolean(FlinkOptions.IGNORE_FAILED)) {
+    if (numErrorRecords > 0 && !this.conf.get(FlinkOptions.IGNORE_FAILED)) {
       // handle failure case
-      LOG.error("Got {} error records during clustering of instant {},\n"
+      log.error("Got {} error records during clustering of instant {},\n"
           + "option '{}' is configured as false,"
           + "rolls back the clustering", numErrorRecords, instant, FlinkOptions.IGNORE_FAILED.key());
       ClusteringUtil.rollbackClustering(table, writeClient, instant);
@@ -196,13 +216,12 @@ public class ClusteringCommitSink extends CleanFunction<ClusteringCommitEvent> {
     }
     // commit the clustering
     this.table.getMetaClient().reloadActiveTimeline();
-    this.writeClient.completeTableService(
-        TableServiceType.CLUSTER, writeMetadata.getCommitMetadata().get(), table, instant, Option.of(HoodieListData.lazy(writeMetadata.getWriteStatuses())));
+    this.writeClient.completeTableService(TableServiceType.CLUSTER, writeMetadata.getCommitMetadata().get(), table, instant);
 
     clusteringMetrics.updateCommitMetrics(instant, writeMetadata.getCommitMetadata().get());
     // whether to clean up the input base parquet files used for clustering
-    if (!conf.getBoolean(FlinkOptions.CLEAN_ASYNC_ENABLED) && !isCleaning) {
-      LOG.info("Running inline clean");
+    if (!conf.get(FlinkOptions.CLEAN_ASYNC_ENABLED)) {
+      log.info("Running inline clean");
       this.writeClient.clean();
     }
   }

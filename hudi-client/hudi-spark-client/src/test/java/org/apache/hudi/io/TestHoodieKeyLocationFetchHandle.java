@@ -18,6 +18,7 @@
 
 package org.apache.hudi.io;
 
+import org.apache.hudi.common.config.HoodieStorageConfig;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.fs.ConsistencyGuardConfig;
@@ -28,10 +29,10 @@ import org.apache.hudi.common.model.HoodieRecordLocation;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.testutils.HoodieTestUtils;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.collection.ClosableIterator;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.config.HoodieCompactionConfig;
 import org.apache.hudi.config.HoodieIndexConfig;
-import org.apache.hudi.common.config.HoodieStorageConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.index.HoodieIndexUtils;
 import org.apache.hudi.keygen.BaseKeyGenerator;
@@ -50,7 +51,6 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -58,7 +58,7 @@ import java.util.Properties;
 import scala.Tuple2;
 
 import static java.util.stream.Collectors.toList;
-import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.AVRO_SCHEMA_WITH_METADATA_FIELDS;
+import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.HOODIE_SCHEMA_WITH_METADATA_FIELDS;
 import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.TRIP_EXAMPLE_SCHEMA;
 import static org.apache.hudi.common.testutils.HoodieTestTable.makeNewCommitTime;
 import static org.apache.hudi.common.testutils.Transformations.recordsToPartitionRecordsMap;
@@ -76,7 +76,7 @@ public class TestHoodieKeyLocationFetchHandle extends HoodieSparkClientTestHarne
     initSparkContexts("TestRecordFetcher");
     initPath();
     initTestDataGenerator();
-    initFileSystem();
+    initHoodieStorage();
   }
 
   @AfterEach
@@ -87,7 +87,7 @@ public class TestHoodieKeyLocationFetchHandle extends HoodieSparkClientTestHarne
   @ParameterizedTest
   @ValueSource(booleans = {true, false})
   public void testFetchHandle(boolean populateMetaFields) throws Exception {
-    metaClient = HoodieTestUtils.init(hadoopConf, basePath, HoodieTableType.COPY_ON_WRITE, populateMetaFields ? new Properties() : getPropertiesForKeyGen());
+    metaClient = HoodieTestUtils.init(storageConf, basePath, HoodieTableType.COPY_ON_WRITE, populateMetaFields ? new Properties() : getPropertiesForKeyGen());
     config = getConfigBuilder()
         .withProperties(getPropertiesForKeyGen())
         .withIndexConfig(HoodieIndexConfig.newBuilder()
@@ -96,21 +96,22 @@ public class TestHoodieKeyLocationFetchHandle extends HoodieSparkClientTestHarne
     List<HoodieRecord> records = dataGen.generateInserts(makeNewCommitTime(), 100);
     Map<String, List<HoodieRecord>> partitionRecordsMap = recordsToPartitionRecordsMap(records);
     HoodieTable hoodieTable = HoodieSparkTable.create(config, context, metaClient);
-    HoodieSparkWriteableTestTable testTable = HoodieSparkWriteableTestTable.of(hoodieTable, AVRO_SCHEMA_WITH_METADATA_FIELDS);
+    HoodieSparkWriteableTestTable testTable = HoodieSparkWriteableTestTable.of(hoodieTable, HOODIE_SCHEMA_WITH_METADATA_FIELDS);
     Map<Tuple2<String, String>, List<Tuple2<HoodieKey, HoodieRecordLocation>>> expectedList =
         writeToParquetAndGetExpectedRecordLocations(partitionRecordsMap, testTable);
 
     List<Tuple2<String, HoodieBaseFile>> partitionPathFileIdPairs = loadAllFilesForPartitions(new ArrayList<>(partitionRecordsMap.keySet()), context, hoodieTable);
 
-    BaseKeyGenerator keyGenerator = (BaseKeyGenerator) HoodieSparkKeyGeneratorFactory.createKeyGenerator(new TypedProperties(getPropertiesForKeyGen()));
+    BaseKeyGenerator keyGenerator = (BaseKeyGenerator) HoodieSparkKeyGeneratorFactory.createKeyGenerator(TypedProperties.copy(getPropertiesForKeyGen()));
 
     for (Tuple2<String, HoodieBaseFile> entry : partitionPathFileIdPairs) {
       HoodieKeyLocationFetchHandle fetcherHandle = new HoodieKeyLocationFetchHandle(config, hoodieTable, Pair.of(entry._1, entry._2),
           populateMetaFields ? Option.empty() : Option.of(keyGenerator));
-      Iterator<Pair<HoodieKey, HoodieRecordLocation>> result = fetcherHandle.locations().iterator();
-      List<Tuple2<HoodieKey, HoodieRecordLocation>> actualList = new ArrayList<>();
-      result.forEachRemaining(x -> actualList.add(new Tuple2<>(x.getLeft(), x.getRight())));
-      assertEquals(expectedList.get(new Tuple2<>(entry._1, entry._2.getFileId())), actualList);
+      try (ClosableIterator<Pair<HoodieKey, HoodieRecordLocation>> result = fetcherHandle.locations()) {
+        List<Tuple2<HoodieKey, HoodieRecordLocation>> actualList = new ArrayList<>();
+        result.forEachRemaining(x -> actualList.add(new Tuple2<>(x.getLeft(), x.getRight())));
+        assertEquals(expectedList.get(new Tuple2<>(entry._1, entry._2.getFileId())), actualList);
+      }
     }
   }
 

@@ -17,24 +17,23 @@
 
 package org.apache.hudi.functional
 
+import org.apache.hudi.{DataSourceReadOptions, DataSourceWriteOptions, ScalaAssertionSupport}
 import org.apache.hudi.common.config.HoodieMetadataConfig
 import org.apache.hudi.common.model.{HoodieCleaningPolicy, HoodieTableType}
 import org.apache.hudi.common.model.HoodieTableType.{COPY_ON_WRITE, MERGE_ON_READ}
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline
-import org.apache.hudi.common.table.{HoodieTableMetaClient, TableSchemaResolver}
-import org.apache.hudi.common.testutils.HoodieTestTable
+import org.apache.hudi.common.table.{HoodieTableConfig, TableSchemaResolver}
+import org.apache.hudi.common.table.timeline.TimelineUtils
+import org.apache.hudi.common.testutils.{HoodieTestTable, HoodieTestUtils}
 import org.apache.hudi.config.{HoodieArchivalConfig, HoodieCleanConfig, HoodieCompactionConfig, HoodieWriteConfig}
-import org.apache.hudi.exception.ExceptionUtil.getRootCause
-import org.apache.hudi.exception.{HoodieKeyGeneratorException, HoodieTimeTravelException}
+import org.apache.hudi.exception.HoodieTimeTravelException
 import org.apache.hudi.testutils.HoodieSparkClientTestBase
-import org.apache.hudi.{DataSourceReadOptions, DataSourceWriteOptions, ScalaAssertionSupport, config}
-import org.apache.spark.sql.SaveMode.{Append, Overwrite}
+
 import org.apache.spark.sql.{DataFrame, Row, SaveMode, SparkSession}
+import org.apache.spark.sql.SaveMode.{Append, Overwrite}
+import org.junit.jupiter.api.{AfterEach, BeforeEach}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertNotNull, assertNull, assertTrue}
-import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
-import org.scalatest.Assertions.assertThrows
 
 import java.text.SimpleDateFormat
 
@@ -46,7 +45,7 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
     "hoodie.bulkinsert.shuffle.parallelism" -> "2",
     "hoodie.delete.shuffle.parallelism" -> "1",
     DataSourceWriteOptions.RECORDKEY_FIELD.key -> "id",
-    DataSourceWriteOptions.PRECOMBINE_FIELD.key -> "version",
+    HoodieTableConfig.ORDERING_FIELDS.key -> "version",
     HoodieWriteConfig.TBL_NAME.key -> "hoodie_test"
   )
 
@@ -56,7 +55,7 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
     initSparkContexts()
     spark = sqlContext.sparkSession
     initTestDataGenerator()
-    initFileSystem()
+    initHoodieStorage()
   }
 
   @AfterEach override def tearDown(): Unit = {
@@ -177,7 +176,7 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
     val opts = commonOpts ++ Map(
       DataSourceWriteOptions.TABLE_TYPE.key -> tableType.name,
       DataSourceWriteOptions.RECORDKEY_FIELD.key -> "id",
-      DataSourceWriteOptions.PRECOMBINE_FIELD.key -> "version",
+      HoodieTableConfig.ORDERING_FIELDS.key -> "version",
       DataSourceWriteOptions.PARTITIONPATH_FIELD.key -> "dt"
     )
 
@@ -230,17 +229,17 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
   private def writeBatch(df: DataFrame, options: Map[String, String], mode: SaveMode = Append): String = {
     df.write.format("hudi").options(options).mode(mode).save(basePath)
     metaClient.reloadActiveTimeline()
-    metaClient.getActiveTimeline.filterCompletedInstants().lastInstant().get().getTimestamp
+    metaClient.getActiveTimeline.filterCompletedInstants().lastInstant().get().requestedTime
   }
 
   private def defaultDateTimeFormat(queryInstant: String): String = {
-    val date = HoodieActiveTimeline.parseDateFromInstantTime(queryInstant)
+    val date = TimelineUtils.parseDateFromInstantTime(queryInstant)
     val format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS")
     format.format(date)
   }
 
   private def defaultDateFormat(queryInstant: String): String = {
-    val date = HoodieActiveTimeline.parseDateFromInstantTime(queryInstant)
+    val date = TimelineUtils.parseDateFromInstantTime(queryInstant)
     val format = new SimpleDateFormat("yyyy-MM-dd")
     format.format(date)
   }
@@ -252,10 +251,7 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
     val _spark = spark
     import _spark.implicits._
 
-    metaClient = HoodieTableMetaClient.builder()
-      .setBasePath(basePath)
-      .setConf(spark.sessionState.newHadoopConf)
-      .build()
+    metaClient = createMetaClient(spark, basePath)
 
     val opts = commonOpts ++ Map(
       DataSourceWriteOptions.TABLE_TYPE.key -> tableType.name,
@@ -283,9 +279,9 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
       .select("id", "name", "value", "version")
       .take(1)(0)
     assertEquals(Row(1, "a1", 10, 1000), result1)
-    val schema1 = tableSchemaResolver.getTableAvroSchema(firstCommit)
-    assertNull(schema1.getField("year"))
-    assertNull(schema1.getField("month"))
+    val schema1 = tableSchemaResolver.getTableSchema(firstCommit)
+    assertTrue(schema1.getField("year").isEmpty)
+    assertTrue(schema1.getField("month").isEmpty)
 
     // Query as of secondCommitTime
     val result2 = spark.read.format("hudi")
@@ -294,9 +290,9 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
       .select("id", "name", "value", "version", "year")
       .take(1)(0)
     assertEquals(Row(1, "a1", 12, 1001, "2022"), result2)
-    val schema2 = tableSchemaResolver.getTableAvroSchema(secondCommit)
-    assertNotNull(schema2.getField("year"))
-    assertNull(schema2.getField("month"))
+    val schema2 = tableSchemaResolver.getTableSchema(secondCommit)
+    assertTrue(schema2.getField("year").isPresent)
+    assertTrue(schema2.getField("month").isEmpty)
 
     // Query as of thirdCommitTime
     val result3 = spark.read.format("hudi")
@@ -305,9 +301,9 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
       .select("id", "name", "value", "version", "year", "month")
       .take(1)(0)
     assertEquals(Row(1, "a1", 13, 1002, "2022", "08"), result3)
-    val schema3 = tableSchemaResolver.getTableAvroSchema(thirdCommit)
-    assertNotNull(schema3.getField("year"))
-    assertNotNull(schema3.getField("month"))
+    val schema3 = tableSchemaResolver.getTableSchema(thirdCommit)
+    assertTrue(schema3.getField("year").isPresent)
+    assertTrue(schema3.getField("month").isPresent)
   }
 
   @ParameterizedTest
@@ -370,7 +366,7 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
           .select("id", "name", "value", "version")
           .take(1)
       }
-      assertTrue(getRootCause(e1).getMessage.contains("Cleaner cleaned up the timestamp of interest. Please ensure sufficient commits are retained with cleaner for Timestamp as of query to work"))
+      assertTrue(HoodieTestUtils.getRootCause(e1).getMessage.contains("Cleaner cleaned up the timestamp of interest. Please ensure sufficient commits are retained with cleaner for Timestamp as of query to work"))
     }
 
     // add more writes so that first commit goes into archived timeline.
@@ -395,6 +391,6 @@ class TestTimeTravelQuery extends HoodieSparkClientTestBase with ScalaAssertionS
         .select("id", "name", "value", "version")
         .take(1)
     }
-    assertTrue(getRootCause(e2).getMessage.contains(expectedErrorMsg))
+    assertTrue(HoodieTestUtils.getRootCause(e2).getMessage.contains(expectedErrorMsg))
   }
 }

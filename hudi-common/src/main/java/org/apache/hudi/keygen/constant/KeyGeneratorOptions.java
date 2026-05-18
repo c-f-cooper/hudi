@@ -34,6 +34,14 @@ import org.apache.hudi.common.config.TimestampKeyGeneratorConfig;
     description = "")
 public class KeyGeneratorOptions extends HoodieConfig {
 
+  public static final ConfigProperty<String> SLASH_SEPARATED_DATE_PARTITIONING = ConfigProperty
+      .key("hoodie.datasource.write.slash.separated.date.partitioning")
+      .defaultValue("false")
+      .markAdvanced()
+      .withDocumentation("Flag to indicate whether to use slash separated date partitioning.\n"
+          + "If set to true, date partition values in yyyy-MM-dd format will be transformed to yyyy/MM/dd directory structure.\n"
+          + "By default false. Cannot be used together with hive-style partitioning.");
+
   public static final ConfigProperty<String> URL_ENCODE_PARTITIONING = ConfigProperty
       .key("hoodie.datasource.write.partitionpath.urlencode")
       .defaultValue("false")
@@ -54,6 +62,13 @@ public class KeyGeneratorOptions extends HoodieConfig {
           + "Actual value will be obtained by invoking .toString() on the field value. Nested fields can be specified using\n"
           + "the dot notation eg: `a.b.c`");
 
+  public static final ConfigProperty<String> SECONDARYKEY_COLUMN_NAME = ConfigProperty
+      .key("hoodie.datasource.write.secondarykey.column")
+      .noDefaultValue()
+      .withDocumentation("Columns that constitute the secondary key component.\n"
+          + "Actual value will be obtained by invoking .toString() on the field value. Nested fields can be specified using\n"
+          + "the dot notation eg: `a.b.c`");
+
   public static final ConfigProperty<String> PARTITIONPATH_FIELD_NAME = ConfigProperty
       .key("hoodie.datasource.write.partitionpath.field")
       .noDefaultValue()
@@ -63,6 +78,7 @@ public class KeyGeneratorOptions extends HoodieConfig {
   public static final ConfigProperty<String> KEYGENERATOR_CONSISTENT_LOGICAL_TIMESTAMP_ENABLED = ConfigProperty
       .key("hoodie.datasource.write.keygenerator.consistent.logical.timestamp.enabled")
       .defaultValue("false")
+      .sinceVersion("0.10.1")
       .markAdvanced()
       .withDocumentation("When set to true, consistent value will be generated for a logical timestamp type column, "
           + "like timestamp-millis and timestamp-micros, irrespective of whether row-writer is enabled. Disabled by default so "

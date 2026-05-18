@@ -17,7 +17,6 @@
 
 package org.apache.spark.sql.hudi.command.procedures
 
-import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.hadoop.fs.HadoopFSUtils
 
 import org.apache.hadoop.fs.{ContentSummary, FileStatus, Path}
@@ -32,7 +31,8 @@ class ShowFsPathDetailProcedure extends BaseProcedure with ProcedureBuilder {
     ProcedureParameter.required(0, "path", DataTypes.StringType),
     ProcedureParameter.optional(1, "is_sub", DataTypes.BooleanType, false),
     ProcedureParameter.optional(2, "sort", DataTypes.BooleanType, true),
-    ProcedureParameter.optional(3, "limit", DataTypes.IntegerType, 100)
+    ProcedureParameter.optional(3, "limit", DataTypes.IntegerType, 100),
+    ProcedureParameter.optional(4, "filter", DataTypes.StringType, "")
   )
 
   private val OUTPUT_TYPE = new StructType(Array[StructField](
@@ -57,6 +57,9 @@ class ShowFsPathDetailProcedure extends BaseProcedure with ProcedureBuilder {
     val isSub = getArgValueOrDefault(args, PARAMETERS(1)).get.asInstanceOf[Boolean]
     val sort = getArgValueOrDefault(args, PARAMETERS(2)).get.asInstanceOf[Boolean]
     val limit = getArgValueOrDefault(args, PARAMETERS(3))
+    val filter = getArgValueOrDefault(args, PARAMETERS(4)).get.asInstanceOf[String]
+
+    validateFilter(filter, outputType)
 
     val path: Path = new Path(srcPath)
     val fs = HadoopFSUtils.getFs(path, jsc.hadoopConfiguration())
@@ -74,7 +77,7 @@ class ShowFsPathDetailProcedure extends BaseProcedure with ProcedureBuilder {
     }
 
     val df = spark.sqlContext.createDataFrame(rows, OUTPUT_TYPE)
-    if (sort) {
+    val results = if (sort) {
       if (limit.isDefined) {
         df.orderBy(df("storage_size").desc).limit(limit.get.asInstanceOf[Int]).collect()
       } else {
@@ -87,6 +90,7 @@ class ShowFsPathDetailProcedure extends BaseProcedure with ProcedureBuilder {
         df.orderBy(df("file_num").desc).collect()
       }
     }
+    applyFilter(results, filter, outputType)
   }
 
   def getFileSize(size: Long): String = {

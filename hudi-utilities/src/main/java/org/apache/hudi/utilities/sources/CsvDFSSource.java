@@ -19,6 +19,7 @@
 package org.apache.hudi.utilities.sources;
 
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.utilities.schema.SchemaProvider;
@@ -29,7 +30,7 @@ import org.apache.spark.sql.DataFrameReader;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.avro.SchemaConverters;
+import org.apache.spark.sql.avro.HoodieSparkSchemaConverters;
 import org.apache.spark.sql.types.StructType;
 
 import java.util.Arrays;
@@ -85,18 +86,17 @@ public class CsvDFSSource extends RowSource {
     super(props, sparkContext, sparkSession, schemaProvider);
     this.pathSelector = DFSPathSelector.createSourceSelector(props, sparkContext.hadoopConfiguration());
     if (schemaProvider != null) {
-      sourceSchema = (StructType) SchemaConverters.toSqlType(schemaProvider.getSourceSchema())
-          .dataType();
+      sourceSchema = (StructType) HoodieSparkSchemaConverters.toSqlType(schemaProvider.getSourceHoodieSchema())._1;
     } else {
       sourceSchema = null;
     }
   }
 
   @Override
-  protected Pair<Option<Dataset<Row>>, String> fetchNextBatch(Option<String> lastCkptStr,
+  protected Pair<Option<Dataset<Row>>, Checkpoint> fetchNextBatch(Option<Checkpoint> lastCheckpoint,
       long sourceLimit) {
-    Pair<Option<String>, String> selPathsWithMaxModificationTime =
-        pathSelector.getNextFilePathsAndMaxModificationTime(sparkContext, lastCkptStr, sourceLimit);
+    Pair<Option<String>, Checkpoint> selPathsWithMaxModificationTime =
+        pathSelector.getNextFilePathsAndMaxModificationTime(sparkContext, lastCheckpoint, sourceLimit);
     return Pair.of(fromFiles(
         selPathsWithMaxModificationTime.getLeft()), selPathsWithMaxModificationTime.getRight());
   }

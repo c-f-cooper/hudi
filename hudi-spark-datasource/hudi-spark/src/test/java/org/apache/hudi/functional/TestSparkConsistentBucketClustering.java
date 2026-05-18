@@ -18,18 +18,22 @@
 
 package org.apache.hudi.functional;
 
-import org.apache.hudi.AvroConversionUtils;
+import org.apache.hudi.HoodieSchemaConversionUtils;
+import org.apache.hudi.client.WriteClientTestUtils;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.clustering.plan.strategy.SparkConsistentBucketClusteringPlanStrategy;
-import org.apache.hudi.client.clustering.run.strategy.SparkConsistentBucketClusteringExecutionStrategy;
 import org.apache.hudi.client.clustering.update.strategy.SparkConsistentBucketDuplicateUpdateStrategy;
 import org.apache.hudi.client.timeline.HoodieTimelineArchiver;
+import org.apache.hudi.client.timeline.versioning.v2.TimelineArchiverV2;
 import org.apache.hudi.common.config.HoodieStorageConfig;
 import org.apache.hudi.common.fs.ConsistencyGuardConfig;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieConsistentHashingMetadata;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.schema.HoodieSchemaField;
+import org.apache.hudi.common.schema.HoodieSchemaType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.testutils.HoodieTestUtils;
@@ -45,14 +49,13 @@ import org.apache.hudi.execution.bulkinsert.BulkInsertSortMode;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.index.bucket.ConsistentBucketIndexUtils;
 import org.apache.hudi.keygen.constant.KeyGeneratorOptions;
+import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.table.HoodieSparkTable;
 import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.table.action.cluster.ClusteringPlanPartitionFilterMode;
 import org.apache.hudi.testutils.HoodieSparkClientTestHarness;
 import org.apache.hudi.testutils.MetadataMergeWriteStatus;
 
-import org.apache.avro.Schema;
-import org.apache.hadoop.fs.Path;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -81,8 +84,10 @@ import static org.apache.hudi.common.model.HoodieRecord.FILENAME_METADATA_FIELD;
 import static org.apache.hudi.config.HoodieClusteringConfig.DAYBASED_LOOKBACK_PARTITIONS;
 import static org.apache.hudi.config.HoodieClusteringConfig.PLAN_PARTITION_FILTER_MODE;
 import static org.apache.hudi.config.HoodieClusteringConfig.PLAN_STRATEGY_SKIP_PARTITIONS_FROM_LATEST;
+import static org.apache.hudi.config.HoodieClusteringConfig.SINGLE_SPARK_JOB_CONSISTENT_HASHING_EXECUTION_STRATEGY;
+import static org.apache.hudi.config.HoodieClusteringConfig.SPARK_CONSISTENT_BUCKET_EXECUTION_STRATEGY;
 
-@Tag("functional")
+@Tag("functional-c")
 public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHarness {
 
   private HoodieWriteConfig config;
@@ -93,23 +98,26 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
   }
 
   public void setup(int maxFileSize, Map<String, String> options) throws IOException {
+    setup(maxFileSize, options, false);
+  }
+
+  public void setup(int maxFileSize, Map<String, String> options, boolean singleJob) throws IOException {
     initPath();
     initSparkContexts();
     initTestDataGenerator();
-    initFileSystem();
+    initHoodieStorage();
     Properties props = getPropertiesForKeyGen(true);
     props.putAll(options);
     props.setProperty(KeyGeneratorOptions.RECORDKEY_FIELD_NAME.key(), "_row_key");
-    metaClient = HoodieTestUtils.init(hadoopConf, basePath, HoodieTableType.MERGE_ON_READ, props);
+    metaClient = HoodieTestUtils.init(storageConf, basePath, HoodieTableType.MERGE_ON_READ, props);
     config = getConfigBuilder().withProps(props)
-        .withAutoCommit(false)
         .withIndexConfig(HoodieIndexConfig.newBuilder().fromProperties(props)
             .withIndexType(HoodieIndex.IndexType.BUCKET).withBucketIndexEngineType(HoodieIndex.BucketIndexEngineType.CONSISTENT_HASHING)
             .withBucketNum("8").withBucketMaxNum(14).withBucketMinNum(4).build())
         .withStorageConfig(HoodieStorageConfig.newBuilder().parquetMaxFileSize(maxFileSize).build())
         .withClusteringConfig(HoodieClusteringConfig.newBuilder()
             .withClusteringPlanStrategyClass(SparkConsistentBucketClusteringPlanStrategy.class.getName())
-            .withClusteringExecutionStrategyClass(SparkConsistentBucketClusteringExecutionStrategy.class.getName())
+            .withClusteringExecutionStrategyClass(singleJob ? SINGLE_SPARK_JOB_CONSISTENT_HASHING_EXECUTION_STRATEGY : SPARK_CONSISTENT_BUCKET_EXECUTION_STRATEGY)
             .withClusteringUpdatesStrategy(SparkConsistentBucketDuplicateUpdateStrategy.class.getName()).build())
         .build();
 
@@ -128,13 +136,13 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
    */
   @ParameterizedTest
   @MethodSource("configParams")
-  public void testResizing(boolean isSplit, boolean rowWriterEnable) throws IOException {
+  public void testResizing(boolean isSplit, boolean rowWriterEnable, boolean single) throws IOException {
     final int maxFileSize = isSplit ? 5120 : 128 * 1024 * 1024;
     final int targetBucketNum = isSplit ? 14 : 4;
-    setup(maxFileSize);
+    setup(maxFileSize, Collections.emptyMap(), single);
     config.setValue("hoodie.datasource.write.row.writer.enable", String.valueOf(rowWriterEnable));
     config.setValue("hoodie.metadata.enable", "false");
-    writeData(writeClient.createNewInstantTime(), 2000, true);
+    writeData(2000, true);
     String clusteringTime = (String) writeClient.scheduleClustering(Option.empty()).get();
     writeClient.cluster(clusteringTime, true);
 
@@ -161,37 +169,39 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
    */
   @ParameterizedTest
   @MethodSource("configParams")
-  public void testLoadMetadata(boolean isCommitFilePresent, boolean rowWriterEnable) throws IOException {
+  public void testLoadMetadata(boolean isCommitFilePresent, boolean rowWriterEnable, boolean single) throws IOException {
     final int maxFileSize = 5120;
     final int targetBucketNum = 14;
-    setup(maxFileSize);
+    setup(maxFileSize, Collections.emptyMap(), single);
     writeClient.getConfig().setValue(HoodieCleanConfig.CLEANER_COMMITS_RETAINED.key(), "1");
     writeClient.getConfig().setValue(HoodieArchivalConfig.MIN_COMMITS_TO_KEEP.key(), "4");
     writeClient.getConfig().setValue(HoodieArchivalConfig.MAX_COMMITS_TO_KEEP.key(), "5");
     writeClient.getConfig().setValue("hoodie.datasource.write.row.writer.enable", String.valueOf(rowWriterEnable));
-    writeData(writeClient.createNewInstantTime(), 2000, true);
+    writeData(2000, true);
     String clusteringTime = (String) writeClient.scheduleClustering(Option.empty()).get();
     writeClient.cluster(clusteringTime, true);
-    writeData(writeClient.createNewInstantTime(), 10, true);
-    writeData(writeClient.createNewInstantTime(), 10, true);
-    writeData(writeClient.createNewInstantTime(), 10, true);
-    writeData(writeClient.createNewInstantTime(), 10, true);
-    writeData(writeClient.createNewInstantTime(), 10, true);
-    writeData(writeClient.createNewInstantTime(), 10, true);
+    writeData(10, true);
+    writeData(10, true);
+    writeData(10, true);
+    writeData(10, true);
+    writeData(10, true);
+    writeData(10, true);
     metaClient = HoodieTableMetaClient.reload(metaClient);
     final HoodieTable table = HoodieSparkTable.create(config, context, metaClient);
     writeClient.clean();
-    HoodieTimelineArchiver hoodieTimelineArchiver = new HoodieTimelineArchiver(writeClient.getConfig(), table);
+    HoodieTimelineArchiver hoodieTimelineArchiver = new TimelineArchiverV2(writeClient.getConfig(), table);
     hoodieTimelineArchiver.archiveIfRequired(context);
     Arrays.stream(dataGen.getPartitionPaths()).forEach(p -> {
       if (!isCommitFilePresent) {
-        Path metadataPath = FSUtils.getPartitionPath(table.getMetaClient().getHashingMetadataPath(), p);
+        StoragePath metadataPath =
+            FSUtils.constructAbsolutePath(table.getMetaClient().getHashingMetadataPath(), p);
         try {
-          Arrays.stream(table.getMetaClient().getFs().listStatus(metadataPath)).forEach(fl -> {
-            if (fl.getPath().getName().contains(HoodieConsistentHashingMetadata.HASHING_METADATA_COMMIT_FILE_SUFFIX)) {
+          table.getStorage().listDirectEntries(metadataPath).forEach(fl -> {
+            if (fl.getPath().getName()
+                .contains(HoodieConsistentHashingMetadata.HASHING_METADATA_COMMIT_FILE_SUFFIX)) {
               try {
                 // delete commit marker to test recovery job
-                table.getMetaClient().getFs().delete(fl.getPath());
+                table.getStorage().deleteDirectory(fl.getPath());
               } catch (IOException e) {
                 throw new RuntimeException(e);
               }
@@ -204,8 +214,8 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
       HoodieConsistentHashingMetadata metadata = ConsistentBucketIndexUtils.loadMetadata(table, p).get();
       Assertions.assertEquals(targetBucketNum, metadata.getNodes().size());
     });
-    writeData(writeClient.createNewInstantTime(), 10, true);
-    writeData(writeClient.createNewInstantTime(), 10, true);
+    writeData(10, true);
+    writeData(10, true);
     Assertions.assertEquals(2080, readRecords().size());
   }
 
@@ -217,7 +227,7 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
    */
   @ParameterizedTest
   @MethodSource("configParamsForSorting")
-  public void testClusteringColumnSort(String sortColumn, boolean rowWriterEnable) throws IOException {
+  public void testClusteringColumnSort(String sortColumn, boolean rowWriterEnable) throws Exception {
     Map<String, String> options = new HashMap<>();
     // Record key is handled specially
     if (sortColumn.equals("_row_key")) {
@@ -228,8 +238,8 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
     options.put("hoodie.datasource.write.row.writer.enable", String.valueOf(rowWriterEnable));
     setup(128 * 1024 * 1024, options);
 
-    writeData(writeClient.createNewInstantTime(), 500, true);
-    writeData(writeClient.createNewInstantTime(), 500, true);
+    writeData(500, true);
+    writeData(500, true);
     String clusteringTime = (String) writeClient.scheduleClustering(Option.empty()).get();
     writeClient.cluster(clusteringTime, true);
 
@@ -240,14 +250,14 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
     Assertions.assertEquals(1000, rows.size());
 
     StructType schema = rows.get(0).schema();
-    Schema rawSchema = AvroConversionUtils.convertStructTypeToAvroSchema(schema,  "test_struct_name", "test_namespace");
-    Schema.Field field = rawSchema.getField(sortColumn);
-    Schema.Field fileNameFiled = rawSchema.getField(FILENAME_METADATA_FIELD);
+    HoodieSchema rawSchema = HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(schema,  "test_struct_name", "test_namespace");
+    HoodieSchemaField field = rawSchema.getField(sortColumn).get();
+    HoodieSchemaField fileNameFiled = rawSchema.getField(FILENAME_METADATA_FIELD).get();
 
     Comparator comparator;
-    if (field.schema().getType() == Schema.Type.DOUBLE) {
+    if (field.schema().getType() == HoodieSchemaType.DOUBLE) {
       comparator = Comparator.comparingDouble(row -> (double) (((Row) row).get(field.pos())));
-    } else if (field.schema().getType() == Schema.Type.STRING) {
+    } else if (field.schema().getType() == HoodieSchemaType.STRING) {
       comparator = Comparator.comparing(row -> ((Row) row).get(field.pos()).toString());
     } else {
       throw new HoodieException("Cannot get comparator: unsupported data type, " + field.schema().getType());
@@ -273,7 +283,7 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
   @Test
   public void testConcurrentClustering() throws IOException {
     setup(5120);
-    writeData(writeClient.createNewInstantTime(), 2000, true);
+    writeData(2000, true);
     String clusteringTime = (String) writeClient.scheduleClustering(Option.empty()).get();
     // Schedule again, it should not be scheduled as the previous one are doing clustering to all partitions
     Assertions.assertFalse(writeClient.scheduleClustering(Option.empty()).isPresent());
@@ -298,18 +308,18 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
   public void testConcurrentWrite(boolean rowWriterEnable) throws IOException {
     setup(5120);
     config.setValue("hoodie.datasource.write.row.writer.enable", String.valueOf(rowWriterEnable));
-    String writeTime = writeClient.createNewInstantTime();
+    String writeTime = WriteClientTestUtils.createNewInstantTime();
     List<WriteStatus> writeStatues = writeData(writeTime, 2000, false);
     // Cannot schedule clustering if there is in-flight writer
     Assertions.assertFalse(writeClient.scheduleClustering(Option.empty()).isPresent());
-    Assertions.assertTrue(writeClient.commitStats(writeTime, context.parallelize(writeStatues, 1), writeStatues.stream().map(WriteStatus::getStat).collect(Collectors.toList()),
+    Assertions.assertTrue(writeClient.commitStats(writeTime, writeStatues.stream().map(WriteStatus::getStat).collect(Collectors.toList()),
         Option.empty(), metaClient.getCommitActionType()));
     metaClient = HoodieTableMetaClient.reload(metaClient);
 
     // Schedule clustering
     String clusteringTime = (String) writeClient.scheduleClustering(Option.empty()).get();
     // Concurrent is not blocked by the clustering
-    writeData(writeClient.createNewInstantTime(), 2000, true);
+    writeData(2000, true);
     // The records are immediately visible when the writer completes
     Assertions.assertEquals(4000, readRecords().size());
     // Clustering finished, check the number of records (there will be file group switch in the background)
@@ -318,10 +328,7 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
   }
 
   private List<Row> readRecords() {
-    Dataset<Row> roViewDF = sparkSession
-        .read()
-        .format("hudi")
-        .load(basePath + "/*/*/*/*");
+    Dataset<Row> roViewDF = sparkSession.read().format("hudi").load(basePath);
     roViewDF.createOrReplaceTempView("hudi_ro_table");
     return sparkSession.sqlContext().sql("select * from hudi_ro_table").collectAsList();
   }
@@ -329,19 +336,23 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
   /**
    * Insert `num` records into table given the commitTime
    *
-   * @param commitTime
    * @param totalRecords
    */
+  private List<WriteStatus> writeData(int totalRecords, boolean doCommit) {
+    String commitTime = WriteClientTestUtils.createNewInstantTime();
+    return writeData(commitTime, totalRecords, doCommit);
+  }
+
   private List<WriteStatus> writeData(String commitTime, int totalRecords, boolean doCommit) {
     List<HoodieRecord> records = dataGen.generateInserts(commitTime, totalRecords);
     JavaRDD<HoodieRecord> writeRecords = jsc.parallelize(records, 2);
     metaClient = HoodieTableMetaClient.reload(metaClient);
 
-    writeClient.startCommitWithTime(commitTime);
+    WriteClientTestUtils.startCommitWithTime(writeClient, commitTime);
     List<WriteStatus> writeStatues = writeClient.upsert(writeRecords, commitTime).collect();
     org.apache.hudi.testutils.Assertions.assertNoWriteErrors(writeStatues);
     if (doCommit) {
-      Assertions.assertTrue(writeClient.commitStats(commitTime, context.parallelize(writeStatues, 1), writeStatues.stream().map(WriteStatus::getStat).collect(Collectors.toList()),
+      Assertions.assertTrue(writeClient.commitStats(commitTime, writeStatues.stream().map(WriteStatus::getStat).collect(Collectors.toList()),
           Option.empty(), metaClient.getCommitActionType()));
     }
     metaClient = HoodieTableMetaClient.reload(metaClient);
@@ -356,15 +367,20 @@ public class TestSparkConsistentBucketClustering extends HoodieSparkClientTestHa
         .withCompactionConfig(HoodieCompactionConfig.newBuilder().compactionSmallFileSize(1024 * 1024).build())
         .withStorageConfig(HoodieStorageConfig.newBuilder().hfileMaxFileSize(1024 * 1024).parquetMaxFileSize(1024 * 1024).build())
         .forTable("test-trip-table")
+        .withMarkersTimelineServerBasedBatchIntervalMs(10)
         .withEmbeddedTimelineServerEnabled(true);
   }
 
   private static Stream<Arguments> configParams() {
     return Stream.of(
-        Arguments.of(true, false),
-        Arguments.of(false, false),
-        Arguments.of(true, true),
-        Arguments.of(false, true)
+        Arguments.of(true, false, true),
+        Arguments.of(false, false, true),
+        Arguments.of(true, true, true),
+        Arguments.of(false, true, true),
+        Arguments.of(true, false, false),
+        Arguments.of(false, false, false),
+        Arguments.of(true, true, false),
+        Arguments.of(false, true, false)
     );
   }
 

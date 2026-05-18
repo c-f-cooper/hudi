@@ -31,6 +31,7 @@ import org.apache.hudi.common.table.view.TableFileSystemView;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.ValidationUtils;
+import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.common.util.collection.Triple;
 import org.apache.hudi.config.HoodieClusteringConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
@@ -40,8 +41,7 @@ import org.apache.hudi.index.bucket.ConsistentBucketIndexUtils;
 import org.apache.hudi.index.bucket.HoodieConsistentBucketIndex;
 import org.apache.hudi.table.HoodieTable;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -57,10 +57,9 @@ import java.util.stream.Stream;
 /**
  * Clustering plan strategy specifically for consistent bucket index.
  */
+@Slf4j
 public abstract class BaseConsistentHashingBucketClusteringPlanStrategy<T extends HoodieRecordPayload, I, K, O>
     extends PartitionAwareClusteringPlanStrategy<T, I, K, O> {
-
-  private static final Logger LOG = LoggerFactory.getLogger(BaseConsistentHashingBucketClusteringPlanStrategy.class);
 
   public static final String METADATA_PARTITION_KEY = "clustering.group.partition";
   public static final String METADATA_CHILD_NODE_KEY = "clustering.group.child.node";
@@ -84,7 +83,7 @@ public abstract class BaseConsistentHashingBucketClusteringPlanStrategy<T extend
   public boolean checkPrecondition() {
     HoodieTimeline timeline = getHoodieTable().getActiveTimeline().getDeltaCommitTimeline().filterInflightsAndRequested();
     if (!timeline.empty()) {
-      LOG.warn("When using consistent bucket, clustering cannot be scheduled async if there are concurrent writers. "
+      log.warn("When using consistent bucket, clustering cannot be scheduled async if there are concurrent writers. "
           + "Writer instant: {}.", timeline.getInstants());
       return false;
     }
@@ -95,7 +94,7 @@ public abstract class BaseConsistentHashingBucketClusteringPlanStrategy<T extend
    * Generate cluster group based on split, merge and sort rules
    */
   @Override
-  protected Stream<HoodieClusteringGroup> buildClusteringGroupsForPartition(String partitionPath, List<FileSlice> fileSlices) {
+  protected Pair<Stream<HoodieClusteringGroup>, Boolean> buildClusteringGroupsForPartition(String partitionPath, List<FileSlice> fileSlices) {
     Option<HoodieConsistentHashingMetadata> metadata = ConsistentBucketIndexUtils.loadMetadata(getHoodieTable(), partitionPath);
     ValidationUtils.checkArgument(metadata.isPresent(), "Metadata is empty for partition: " + partitionPath);
     ConsistentBucketIdentifier identifier = new ConsistentBucketIdentifier(metadata.get());
@@ -128,7 +127,7 @@ public abstract class BaseConsistentHashingBucketClusteringPlanStrategy<T extend
             .build();
       }).collect(Collectors.toList()));
     }
-    return ret.stream();
+    return Pair.of(ret.stream(), true);
   }
 
   /**
@@ -161,7 +160,7 @@ public abstract class BaseConsistentHashingBucketClusteringPlanStrategy<T extend
     TableFileSystemView fileSystemView = getHoodieTable().getFileSystemView();
     boolean isPartitionInClustering = fileSystemView.getFileGroupsInPendingClustering().anyMatch(p -> p.getLeft().getPartitionPath().equals(partition));
     if (isPartitionInClustering) {
-      LOG.info("Partition {} is already in clustering, skip.", partition);
+      log.info("Partition {} is already in clustering, skip.", partition);
       return Stream.empty();
     }
 
@@ -322,7 +321,7 @@ public abstract class BaseConsistentHashingBucketClusteringPlanStrategy<T extend
       extraMetadata.put(METADATA_CHILD_NODE_KEY, ConsistentHashingNode.toJsonString(nodes));
       extraMetadata.put(METADATA_SEQUENCE_NUMBER_KEY, Integer.toString(seqNo));
     } catch (IOException e) {
-      LOG.error("Failed to construct extra metadata, partition: {}, nodes:{}", partition, nodes);
+      log.error("Failed to construct extra metadata, partition: {}, nodes:{}", partition, nodes);
       throw new HoodieClusteringException("Failed to construct extra metadata, partition: " + partition + ", nodes:" + nodes);
     }
     return extraMetadata;

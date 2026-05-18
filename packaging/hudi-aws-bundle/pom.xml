@@ -24,7 +24,7 @@
     <parent>
         <artifactId>hudi</artifactId>
         <groupId>org.apache.hudi</groupId>
-        <version>1.0.0-SNAPSHOT</version>
+        <version>1.3.0-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -72,7 +72,6 @@
                             </transformers>
                             <artifactSet>
                                 <includes combine.children="append">
-                                    <include>org.apache.hudi:hudi-hadoop-common</include>
                                     <include>org.apache.hudi:hudi-hadoop-mr</include>
                                     <include>org.apache.hudi:hudi-sync-common</include>
                                     <include>org.apache.hudi:hudi-hive-sync</include>
@@ -83,6 +82,9 @@
                                     <include>org.apache.httpcomponents:httpcore</include>
                                     <include>io.netty:*</include>
                                     <include>software.amazon.awssdk:*</include>
+                                    <!-- Kinesis KCL and deaggregation for JsonKinesisSource -->
+                                    <include>com.amazonaws:amazon-kinesis-deaggregator</include>
+                                    <include>com.amazonaws:amazon-kinesis-client</include>
                                     <include>io.dropwizard.metrics:metrics-core</include>
                                     <include>com.beust:jcommander</include>
                                     <include>commons-io:commons-io</include>
@@ -125,7 +127,6 @@
                                         <exclude>META-INF/*.RSA</exclude>
                                         <exclude>META-INF/services/javax.*</exclude>
                                         <exclude>**/*.proto</exclude>
-                                        <exclude>hbase-webapps/**</exclude>
                                     </excludes>
                                 </filter>
                             </filters>
@@ -138,9 +139,6 @@
         <resources>
             <resource>
                 <directory>src/main/resources</directory>
-            </resource>
-            <resource>
-                <directory>src/test/resources</directory>
             </resource>
         </resources>
     </build>
@@ -157,6 +155,10 @@
                 <exclusion>
                     <groupId>org.apache.hadoop</groupId>
                     <artifactId>*</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>com.fasterxml.jackson.module</groupId>
+                    <artifactId>jackson-module-afterburner</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>

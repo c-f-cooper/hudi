@@ -21,13 +21,13 @@ package org.apache.hudi.utils;
 import org.apache.hudi.avro.model.HoodieCompactionOperation;
 import org.apache.hudi.avro.model.HoodieCompactionPlan;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
+import org.apache.hudi.client.WriteClientTestUtils;
+import org.apache.hudi.common.config.HoodieMetadataConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
-import org.apache.hudi.common.table.timeline.TimelineMetadataUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.configuration.FlinkOptions;
-import org.apache.hudi.exception.HoodieIOException;
 import org.apache.hudi.metadata.FlinkHoodieBackedTableMetadataWriter;
 import org.apache.hudi.table.HoodieFlinkTable;
 import org.apache.hudi.util.CompactionUtil;
@@ -51,8 +51,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static org.apache.hudi.common.testutils.HoodieTestUtils.INSTANT_GENERATOR;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -63,6 +65,7 @@ public class TestCompactionUtil {
   private HoodieFlinkTable<?> table;
   private HoodieTableMetaClient metaClient;
   private Configuration conf;
+  private FlinkHoodieBackedTableMetadataWriter flinkMetadataWriter;
 
   @TempDir
   File tempFile;
@@ -73,7 +76,7 @@ public class TestCompactionUtil {
 
   void beforeEach(Map<String, String> options) throws IOException {
     this.conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
-    conf.setString(FlinkOptions.TABLE_TYPE, FlinkOptions.TABLE_TYPE_MERGE_ON_READ);
+    conf.set(FlinkOptions.TABLE_TYPE, FlinkOptions.TABLE_TYPE_MERGE_ON_READ);
     options.forEach((k, v) -> conf.setString(k, v));
 
     StreamerUtil.initTableIfNotExists(conf);
@@ -81,9 +84,9 @@ public class TestCompactionUtil {
     this.table = FlinkTables.createTable(conf);
     this.metaClient = table.getMetaClient();
     // initialize the metadata table path
-    if (conf.getBoolean(FlinkOptions.METADATA_ENABLED)) {
-      FlinkHoodieBackedTableMetadataWriter.create(table.getHadoopConf(), table.getConfig(),
-          table.getContext(), Option.empty());
+    if (conf.get(FlinkOptions.METADATA_ENABLED)) {
+      this.flinkMetadataWriter = (FlinkHoodieBackedTableMetadataWriter) FlinkHoodieBackedTableMetadataWriter.create(
+          table.getStorageConf(), table.getConfig(), table.getContext(), Option.empty());
     }
   }
 
@@ -97,19 +100,19 @@ public class TestCompactionUtil {
         .filter(instant -> instant.getState() == HoodieInstant.State.INFLIGHT)
         .getInstants();
     assertThat("all the instants should be in pending state", instants.size(), is(3));
-    CompactionUtil.rollbackCompaction(table);
+    CompactionUtil.rollbackCompaction(table, FlinkWriteClients.createWriteClient(conf));
     boolean allRolledBack = metaClient.getActiveTimeline().filterPendingCompactionTimeline().getInstantsAsStream()
         .allMatch(instant -> instant.getState() == HoodieInstant.State.REQUESTED);
     assertTrue(allRolledBack, "all the instants should be rolled back");
     List<String> actualInstants = metaClient.getActiveTimeline()
-        .filterPendingCompactionTimeline().getInstantsAsStream().map(HoodieInstant::getTimestamp).collect(Collectors.toList());
+        .filterPendingCompactionTimeline().getInstantsAsStream().map(HoodieInstant::requestedTime).collect(Collectors.toList());
     assertThat(actualInstants, is(oriInstants));
   }
 
   @Test
   void rollbackEarliestCompaction() throws Exception {
     beforeEach();
-    conf.setInteger(FlinkOptions.COMPACTION_TIMEOUT_SECONDS, 0);
+    conf.set(FlinkOptions.COMPACTION_TIMEOUT_SECONDS, 0);
     List<String> oriInstants = IntStream.range(0, 3)
         .mapToObj(i -> generateCompactionPlan()).collect(Collectors.toList());
     List<HoodieInstant> instants = metaClient.getActiveTimeline()
@@ -124,7 +127,7 @@ public class TestCompactionUtil {
 
     String instantTime = metaClient.getActiveTimeline()
         .filterPendingCompactionTimeline().filter(instant -> instant.getState() == HoodieInstant.State.REQUESTED)
-        .firstInstant().get().getTimestamp();
+        .firstInstant().get().requestedTime();
     assertThat(instantTime, is(oriInstants.get(0)));
   }
 
@@ -132,6 +135,7 @@ public class TestCompactionUtil {
   void testScheduleCompaction() throws Exception {
     Map<String, String> options = new HashMap<>();
     options.put(FlinkOptions.COMPACTION_SCHEDULE_ENABLED.key(), "false");
+    options.put(FlinkOptions.COMPACTION_ASYNC_ENABLED.key(), "false");
     options.put(FlinkOptions.COMPACTION_TRIGGER_STRATEGY.key(), FlinkOptions.TIME_ELAPSED);
     options.put(FlinkOptions.COMPACTION_DELTA_SECONDS.key(), "0");
     beforeEach(options);
@@ -164,7 +168,7 @@ public class TestCompactionUtil {
     beforeEach(options);
     CompactionUtil.inferMetadataConf(this.conf, this.metaClient);
     assertThat("Metadata table should be disabled after inference",
-        this.conf.getBoolean(FlinkOptions.METADATA_ENABLED), is(metadataEnabled));
+        this.conf.get(FlinkOptions.METADATA_ENABLED), is(metadataEnabled));
   }
 
   /**
@@ -172,17 +176,133 @@ public class TestCompactionUtil {
    */
   private String generateCompactionPlan() {
     HoodieCompactionOperation operation = new HoodieCompactionOperation();
-    HoodieCompactionPlan plan = new HoodieCompactionPlan(Collections.singletonList(operation), Collections.emptyMap(), 1, null, null);
-    String instantTime = table.getMetaClient().createNewInstantTime();
+    HoodieCompactionPlan plan = new HoodieCompactionPlan(Collections.singletonList(operation), Collections.emptyMap(), 1, null, null, null);
+    String instantTime = WriteClientTestUtils.createNewInstantTime();
     HoodieInstant compactionInstant =
-        new HoodieInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.COMPACTION_ACTION, instantTime);
-    try {
-      metaClient.getActiveTimeline().saveToCompactionRequested(compactionInstant,
-          TimelineMetadataUtils.serializeCompactionPlan(plan));
-      table.getActiveTimeline().transitionCompactionRequestedToInflight(compactionInstant);
-    } catch (IOException ioe) {
-      throw new HoodieIOException("Exception scheduling compaction", ioe);
+        INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.COMPACTION_ACTION, instantTime);
+    metaClient.getActiveTimeline().saveToCompactionRequested(compactionInstant, plan);
+    table.getActiveTimeline().transitionCompactionRequestedToInflight(compactionInstant);
+    metaClient.reloadActiveTimeline();
+    return instantTime;
+  }
+
+  @Test
+  void testScheduleMetadataCompactionSuccess() throws Exception {
+    Map<String, String> options = new HashMap<>();
+    options.put(FlinkOptions.METADATA_ENABLED.key(), "true");
+    options.put(FlinkOptions.COMPACTION_SCHEDULE_ENABLED.key(), "true");
+    options.put(FlinkOptions.METADATA_COMPACTION_DELTA_COMMITS.key(), "1");
+    beforeEach(options);
+
+    try (HoodieFlinkWriteClient metadataWriteClient = (HoodieFlinkWriteClient) flinkMetadataWriter.getWriteClient()) {
+      HoodieFlinkTable metadataTable = metadataWriteClient.getHoodieTable();
+      HoodieTableMetaClient metadataMetaClient = metadataTable.getMetaClient();
+
+      // Initially, there should be no pending compactions
+      int initialCount = metadataMetaClient.reloadActiveTimeline()
+          .filterPendingCompactionTimeline()
+          .getInstants().size();
+
+      // Call scheduleMetadataCompaction with committed = true when there are no pending compactions
+      CompactionUtil.scheduleMetadataCompaction(metadataWriteClient, true);
+
+      int finalCount = metadataMetaClient.reloadActiveTimeline()
+          .filterPendingCompactionTimeline()
+          .getInstants().size();
+
+      // A new compaction should have been scheduled, so count should increase
+      assertThat(finalCount, is(initialCount + 1));
     }
+  }
+
+  @Test
+  void testScheduleMetadataLogCompactionFallback() throws Exception {
+    Map<String, String> options = new HashMap<>();
+    options.put(FlinkOptions.METADATA_ENABLED.key(), "true");
+    options.put(FlinkOptions.COMPACTION_SCHEDULE_ENABLED.key(), "true");
+    options.put(HoodieMetadataConfig.LOG_COMPACT_BLOCKS_THRESHOLD.key(), "1");
+    options.put(HoodieMetadataConfig.ENABLE_LOG_COMPACTION_ON_METADATA_TABLE.key(), "true");
+    beforeEach(options);
+
+    try (HoodieFlinkWriteClient metadataWriteClient = (HoodieFlinkWriteClient) flinkMetadataWriter.getWriteClient()) {
+      HoodieFlinkTable metadataTable = metadataWriteClient.getHoodieTable();
+      HoodieTableMetaClient metadataMetaClient = metadataTable.getMetaClient();
+      // Initially, check the timeline for log compaction instants
+      int initialLogCompactionCount = metadataMetaClient.reloadActiveTimeline()
+          .filterPendingLogCompactionTimeline()
+          .getInstants().size();
+
+      assertEquals(0, initialLogCompactionCount);
+
+      // Call scheduleMetadataCompaction with committed = true
+      CompactionUtil.scheduleMetadataCompaction(metadataWriteClient, true);
+
+      int finalLogCompactionCount = metadataMetaClient.reloadActiveTimeline()
+          .filterPendingLogCompactionTimeline()
+          .getInstants().size();
+
+      // If regular compaction fails, it might fall back to log compaction if enabled
+      // The exact behavior depends on the implementation, so we just ensure no exception occurs
+      // and that the method executes properly
+      assertEquals(1, finalLogCompactionCount);
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void rollbackLogCompactionWithWriteClient(boolean rollbackSingleInstant) throws Exception {
+    Map<String, String> options = new HashMap<>();
+    options.put(FlinkOptions.METADATA_ENABLED.key(), "true");
+    options.put(FlinkOptions.COMPACTION_SCHEDULE_ENABLED.key(), "true");
+    options.put(HoodieMetadataConfig.LOG_COMPACT_BLOCKS_THRESHOLD.key(), "1");
+    options.put(HoodieMetadataConfig.ENABLE_LOG_COMPACTION_ON_METADATA_TABLE.key(), "true");
+    beforeEach(options);
+
+    try (HoodieFlinkWriteClient metadataWriteClient = (HoodieFlinkWriteClient) flinkMetadataWriter.getWriteClient()) {
+      HoodieFlinkTable metadataTable = metadataWriteClient.getHoodieTable();
+      HoodieTableMetaClient metadataMetaClient = metadataTable.getMetaClient();
+
+      // Generate a log compaction plan and transition it to inflight
+      String instantTime = generateLogCompactionPlan(metadataMetaClient, metadataTable);
+
+      // Verify that the log compaction is in inflight state
+      List<HoodieInstant> inflightInstants = metadataMetaClient.getActiveTimeline()
+          .filterPendingLogCompactionTimeline()
+          .filter(instant -> instant.getState() == HoodieInstant.State.INFLIGHT)
+          .getInstants();
+      assertThat("There should be one inflight log compaction instant", inflightInstants.size(), is(1));
+      assertEquals(instantTime, inflightInstants.get(0).requestedTime());
+
+      // Call the rollbackLogCompaction method with writeClient
+      if (rollbackSingleInstant) {
+        CompactionUtil.rollbackLogCompaction(metadataTable, instantTime, metadataWriteClient.getTransactionManager());
+      } else {
+        CompactionUtil.rollbackLogCompaction(metadataTable, metadataWriteClient);
+      }
+
+      // Reload the timeline to check the state after rollback
+      metadataMetaClient.reloadActiveTimeline();
+
+      // Check that the log compaction instant is now in REQUESTED state (rolled back)
+      List<HoodieInstant> requestedInstants = metadataMetaClient.getActiveTimeline()
+          .filterPendingLogCompactionTimeline()
+          .getInstants();
+
+      assertThat("There should be no requested instant after rollback", requestedInstants.size(), is(0));
+    }
+  }
+
+  /**
+   * Generates a log compaction plan on the timeline and returns its instant time.
+   */
+  private String generateLogCompactionPlan(HoodieTableMetaClient metaClient, HoodieFlinkTable table) {
+    HoodieCompactionOperation operation = new HoodieCompactionOperation();
+    HoodieCompactionPlan plan = new HoodieCompactionPlan(Collections.singletonList(operation), Collections.emptyMap(), 1, null, null, null);
+    String instantTime = WriteClientTestUtils.createNewInstantTime();
+    HoodieInstant logCompactionInstant =
+        INSTANT_GENERATOR.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.LOG_COMPACTION_ACTION, instantTime);
+    metaClient.getActiveTimeline().saveToLogCompactionRequested(logCompactionInstant, plan);
+    table.getActiveTimeline().transitionLogCompactionRequestedToInflight(logCompactionInstant);
     metaClient.reloadActiveTimeline();
     return instantTime;
   }

@@ -21,6 +21,8 @@ package org.apache.hudi.io.hfile;
 
 import org.apache.hudi.io.util.IOUtils;
 
+import lombok.Getter;
+
 import java.io.DataInputStream;
 import java.io.IOException;
 
@@ -108,9 +110,10 @@ public enum HFileBlockType {
   INDEX_V1("IDXBLK)+", BlockCategory.INDEX);
 
   public enum BlockCategory {
-    DATA, META, INDEX, BLOOM, ALL_CATEGORIES, UNKNOWN;
+    DATA, META, INDEX, BLOOM, ALL_CATEGORIES, UNKNOWN
   }
 
+  @Getter
   private final byte[] magic;
   private final BlockCategory metricCat;
 

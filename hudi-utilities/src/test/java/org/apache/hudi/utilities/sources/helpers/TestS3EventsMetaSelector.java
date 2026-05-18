@@ -20,6 +20,7 @@
 package org.apache.hudi.utilities.sources.helpers;
 
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.common.util.collection.Pair;
@@ -39,7 +40,6 @@ import org.mockito.MockitoAnnotations;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.GetQueueAttributesRequest;
 import software.amazon.awssdk.services.sqs.model.GetQueueAttributesResponse;
-import software.amazon.awssdk.services.sqs.model.Message;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -70,7 +70,7 @@ public class TestS3EventsMetaSelector extends HoodieSparkClientTestHarness {
   void setUp() {
     initSparkContexts();
     initPath();
-    initFileSystem();
+    initHoodieStorage();
     MockitoAnnotations.initMocks(this);
 
     props = new TypedProperties();
@@ -91,15 +91,15 @@ public class TestS3EventsMetaSelector extends HoodieSparkClientTestHarness {
     S3EventsMetaSelector selector = (S3EventsMetaSelector) ReflectionUtils.loadClass(clazz.getName(), props);
     // setup s3 record
     String bucket = "test-bucket";
-    String key = "part%3Dpart%2Bpart%24part%A3part%23part%26part%3Fpart%7Epart%25.snappy.parquet";
+    String key = "part%3Dpart%2Bpart%24part%C2%A3part%23part%26part%3Fpart%7Epart%25.snappy.parquet";
     String keyRes = "part=part+part$part£part#part&part?part~part%.snappy.parquet";
     Path path = new Path(bucket, key);
     CloudObjectTestUtils.setMessagesInQueue(sqs, path);
 
-    List<Message> processed = new ArrayList<>();
+    List<CloudObjectsSelector.MessageTracker> processed = new ArrayList<>();
 
     // test the return values
-    Pair<List<String>, String> eventFromQueue =
+    Pair<List<String>, Checkpoint> eventFromQueue =
         selector.getNextEventsFromQueue(sqs, Option.empty(), processed);
 
     assertEquals(1, eventFromQueue.getLeft().size());
@@ -110,7 +110,7 @@ public class TestS3EventsMetaSelector extends HoodieSparkClientTestHarness {
             .getJSONObject("s3")
             .getJSONObject("object")
             .getString("key"));
-    assertEquals("1627376736755", eventFromQueue.getRight());
+    assertEquals("1627376736755", eventFromQueue.getRight().getCheckpointKey());
   }
 
   @Test
@@ -124,8 +124,8 @@ public class TestS3EventsMetaSelector extends HoodieSparkClientTestHarness {
                 .attributesWithStrings(attribute)
                 .build());
 
-    List<Message> processed = new ArrayList<>();
-    Pair<List<String>, String> eventFromQueue =
+    List<CloudObjectsSelector.MessageTracker> processed = new ArrayList<>();
+    Pair<List<String>, Checkpoint> eventFromQueue =
         selector.getNextEventsFromQueue(sqs, Option.empty(), processed);
 
     assertEquals(0, eventFromQueue.getLeft().size());

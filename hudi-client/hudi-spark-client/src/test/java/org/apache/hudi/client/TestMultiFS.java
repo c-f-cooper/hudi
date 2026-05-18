@@ -22,19 +22,21 @@ import org.apache.hudi.common.model.HoodieAvroPayload;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.testutils.HoodieTestUtils;
 import org.apache.hudi.common.testutils.minicluster.HdfsTestService;
+import org.apache.hudi.common.util.Option;
 import org.apache.hudi.config.HoodieIndexConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.keygen.constant.KeyGeneratorOptions;
-import org.apache.hudi.testutils.HoodieSparkClientTestHarness;
+import org.apache.hudi.storage.hadoop.HadoopStorageConfiguration;
 import org.apache.hudi.testutils.HoodieClientTestUtils;
+import org.apache.hudi.testutils.HoodieSparkClientTestHarness;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
@@ -46,17 +48,18 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
 
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.COMMIT_ACTION;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.INSTANT_GENERATOR;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.TIMELINE_FACTORY;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+@Slf4j
 public class TestMultiFS extends HoodieSparkClientTestHarness {
-
-  private static final Logger LOG = LoggerFactory.getLogger(TestMultiFS.class);
   private static final String TABLE_TYPE = HoodieTableType.COPY_ON_WRITE.name();
   private static final String TABLE_NAME = "hoodie_rt";
   private static HdfsTestService hdfsTestService;
@@ -84,7 +87,7 @@ public class TestMultiFS extends HoodieSparkClientTestHarness {
     tablePath = baseUri + "/sample-table";
     dfsBasePath = dfs.getWorkingDirectory().toString();
     dfs.mkdirs(new Path(dfsBasePath));
-    hadoopConf = dfs.getConf();
+    storageConf = HadoopFSUtils.getStorageConf(dfs.getConf());
   }
 
   @AfterEach
@@ -102,62 +105,64 @@ public class TestMultiFS extends HoodieSparkClientTestHarness {
   @Test
   public void readLocalWriteHDFS() throws Exception {
     // Initialize table and filesystem
-    HoodieTableMetaClient.withPropertyBuilder()
+    HoodieTableMetaClient.newTableBuilder()
         .setTableType(TABLE_TYPE)
         .setTableName(TABLE_NAME)
         .setPayloadClass(HoodieAvroPayload.class)
-        .initTable(hadoopConf, dfsBasePath);
+        .initTable(storageConf.newInstance(), dfsBasePath);
 
     // Create write client to write some records in
     HoodieWriteConfig cfg = getHoodieWriteConfig(dfsBasePath);
     HoodieWriteConfig localConfig = getHoodieWriteConfig(tablePath);
 
-    HoodieTableMetaClient.withPropertyBuilder()
+    HoodieTableMetaClient.newTableBuilder()
         .setTableType(TABLE_TYPE)
         .setTableName(TABLE_NAME)
         .setPayloadClass(HoodieAvroPayload.class)
         .setRecordKeyFields(localConfig.getProps().getProperty(KeyGeneratorOptions.RECORDKEY_FIELD_NAME.key()))
         .setPartitionFields(localConfig.getProps().getProperty(KeyGeneratorOptions.PARTITIONPATH_FIELD_NAME.key()))
-        .initTable(hadoopConf, tablePath);
+        .initTable(storageConf.newInstance(), tablePath);
 
 
     try (SparkRDDWriteClient hdfsWriteClient = getHoodieWriteClient(cfg);
-         SparkRDDWriteClient localWriteClient = getHoodieWriteClient(localConfig)) {
+         SparkRDDWriteClient localWriteClient = getHoodieWriteClient(localConfig, false)) {
 
       // Write generated data to hdfs (only inserts)
       String readCommitTime = hdfsWriteClient.startCommit();
-      LOG.info("Starting commit " + readCommitTime);
+      log.info("Starting commit {}", readCommitTime);
       List<HoodieRecord> records = dataGen.generateInserts(readCommitTime, 10);
       JavaRDD<HoodieRecord> writeRecords = jsc.parallelize(records, 2);
-      hdfsWriteClient.upsert(writeRecords, readCommitTime);
+      JavaRDD<WriteStatus> writeStatusJavaRDD = hdfsWriteClient.upsert(writeRecords, readCommitTime);
+      hdfsWriteClient.commit(readCommitTime, writeStatusJavaRDD, Option.empty(), COMMIT_ACTION, Collections.emptyMap(), Option.empty());
 
       // Read from hdfs
-      FileSystem fs = HadoopFSUtils.getFs(dfsBasePath, HoodieTestUtils.getDefaultHadoopConf());
-      HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder().setConf(fs.getConf()).setBasePath(dfsBasePath).build();
-      HoodieTimeline timeline = new HoodieActiveTimeline(metaClient).getCommitTimeline();
-      Dataset<Row> readRecords = HoodieClientTestUtils.readCommit(dfsBasePath, sqlContext, timeline, readCommitTime);
+      FileSystem fs = HadoopFSUtils.getFs(dfsBasePath, HoodieTestUtils.getDefaultStorageConf());
+      HoodieTableMetaClient metaClient = HoodieTestUtils.createMetaClient(HadoopFSUtils.getStorageConf(fs.getConf()), dfsBasePath);
+      HoodieTimeline timeline = TIMELINE_FACTORY.createActiveTimeline(metaClient).getCommitAndReplaceTimeline();
+      Dataset<Row> readRecords = HoodieClientTestUtils.readCommit(dfsBasePath, sqlContext, timeline, readCommitTime, true, INSTANT_GENERATOR);
       assertEquals(readRecords.count(), records.size());
 
       // Write to local
-      HoodieTableMetaClient.withPropertyBuilder()
+      HoodieTableMetaClient.newTableBuilder()
           .setTableType(TABLE_TYPE)
           .setTableName(TABLE_NAME)
           .setPayloadClass(HoodieAvroPayload.class)
-          .initTable(hadoopConf, tablePath);
+          .initTable(storageConf.newInstance(), tablePath);
 
       String writeCommitTime = localWriteClient.startCommit();
-      LOG.info("Starting write commit " + writeCommitTime);
+      log.info("Starting write commit {}", writeCommitTime);
       List<HoodieRecord> localRecords = dataGen.generateInserts(writeCommitTime, 10);
       JavaRDD<HoodieRecord> localWriteRecords = jsc.parallelize(localRecords, 2);
-      LOG.info("Writing to path: " + tablePath);
-      localWriteClient.upsert(localWriteRecords, writeCommitTime);
+      log.info("Writing to path: {}", tablePath);
+      writeStatusJavaRDD = localWriteClient.upsert(localWriteRecords, writeCommitTime);
+      localWriteClient.commit(writeCommitTime, writeStatusJavaRDD, Option.empty(), COMMIT_ACTION, Collections.emptyMap(), Option.empty());
 
-      LOG.info("Reading from path: " + tablePath);
-      fs = HadoopFSUtils.getFs(tablePath, HoodieTestUtils.getDefaultHadoopConf());
-      metaClient = HoodieTableMetaClient.builder().setConf(fs.getConf()).setBasePath(tablePath).build();
-      timeline = new HoodieActiveTimeline(metaClient).getCommitTimeline();
+      log.info("Reading from path: {}", tablePath);
+      fs = HadoopFSUtils.getFs(tablePath, HoodieTestUtils.getDefaultStorageConf());
+      metaClient = HoodieTestUtils.createMetaClient(new HadoopStorageConfiguration(fs.getConf()), tablePath);
+      timeline = TIMELINE_FACTORY.createActiveTimeline(metaClient).getCommitAndReplaceTimeline();
       Dataset<Row> localReadRecords =
-          HoodieClientTestUtils.readCommit(tablePath, sqlContext, timeline, writeCommitTime);
+          HoodieClientTestUtils.readCommit(tablePath, sqlContext, timeline, writeCommitTime, true, INSTANT_GENERATOR);
       assertEquals(localReadRecords.count(), localRecords.size());
     }
   }

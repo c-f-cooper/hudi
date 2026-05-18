@@ -21,6 +21,7 @@ package org.apache.hudi.utilities.multitable;
 
 import org.apache.hudi.client.SparkRDDReadClient;
 import org.apache.hudi.client.SparkRDDWriteClient;
+import org.apache.hudi.client.WriteClientTestUtils;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
@@ -29,18 +30,20 @@ import org.apache.hudi.common.model.HoodieCleaningPolicy;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.testutils.InProcessTimeGenerator;
 import org.apache.hudi.common.testutils.HoodieCommonTestHarness;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.testutils.HoodieTestUtils;
+import org.apache.hudi.common.testutils.InProcessTimeGenerator;
 import org.apache.hudi.config.HoodieCleanConfig;
 import org.apache.hudi.config.HoodieCompactionConfig;
 import org.apache.hudi.config.HoodieIndexConfig;
 import org.apache.hudi.config.HoodieLayoutConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.TableNotFoundException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.keygen.constant.KeyGeneratorOptions;
+import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.table.action.commit.SparkBucketIndexPartitioner;
 import org.apache.hudi.table.action.compact.strategy.LogFileSizeBasedCompactionStrategy;
 import org.apache.hudi.table.storage.HoodieStorageLayout;
@@ -132,7 +135,7 @@ class TestHoodieMultiTableServicesMain extends HoodieCommonTestHarness implement
     HoodieMultiTableServicesMain.Config cfg = getHoodieMultiServiceConfig();
     HoodieTableMetaClient metaClient1 = getMetaClient("table1");
     cfg.batch = true;
-    cfg.basePath = Collections.singletonList(metaClient1.getBasePath());
+    cfg.basePath = Collections.singletonList(metaClient1.getBasePath().toString());
     HoodieMultiTableServicesMain main = new HoodieMultiTableServicesMain(jsc, cfg);
     main.startServices();
     // Verify cleans
@@ -177,7 +180,7 @@ class TestHoodieMultiTableServicesMain extends HoodieCommonTestHarness implement
     cfg.batch = true;
     HoodieTableMetaClient metaClient1 = getMetaClient("table1");
     cfg.configs.add(String.format("%s=%s", TABLES_SKIP_WRONG_PATH, "true"));
-    cfg.configs.add(String.format("%s=%s", TABLES_TO_BE_SERVED_PROP, metaClient1.getBasePathV2() + ",file:///fakepath"));
+    cfg.configs.add(String.format("%s=%s", TABLES_TO_BE_SERVED_PROP, metaClient1.getBasePath() + ",file:///fakepath"));
     HoodieMultiTableServicesMain main = new HoodieMultiTableServicesMain(jsc, cfg);
     try {
       main.startServices();
@@ -226,26 +229,28 @@ class TestHoodieMultiTableServicesMain extends HoodieCommonTestHarness implement
     Assertions.assertEquals(0, metaClient2.reloadActiveTimeline().getCleanerTimeline().countInstants());
   }
 
-  private void writeToTable(String basePath, String instant, boolean update) throws IOException {
+  private void writeToTable(StoragePath basePath, String instant, boolean update) throws IOException {
     String tableName = "test";
     HoodieWriteConfig.Builder writeConfigBuilder = getWriteConfigBuilder(basePath, tableName);
     // enable files and bloom_filters on the regular write client
     HoodieWriteConfig writeConfig = writeConfigBuilder.build();
     // do one upsert with synchronous metadata update
-    SparkRDDWriteClient writeClient = new SparkRDDWriteClient(context, writeConfig);
-    List<HoodieRecord> records;
-    writeClient.startCommitWithTime(instant);
-    if (update) {
-      records = dataGen.generateUpdates(instant, 100);
-    } else {
-      records = dataGen.generateInserts(instant, 100);
+    try (SparkRDDWriteClient writeClient = new SparkRDDWriteClient(context, writeConfig)) {
+      List<HoodieRecord> records;
+      WriteClientTestUtils.startCommitWithTime(writeClient, instant);
+      if (update) {
+        records = dataGen.generateUpdates(instant, 100);
+      } else {
+        records = dataGen.generateInserts(instant, 100);
+      }
+      JavaRDD<WriteStatus> result = writeClient.upsert(jsc.parallelize(records, 8), instant);
+      List<WriteStatus> statuses = result.collect();
+      assertNoWriteErrors(statuses);
+      writeClient.commit(instant, jsc().parallelize(statuses));
     }
-    JavaRDD<WriteStatus> result = writeClient.upsert(jsc.parallelize(records, 8), instant);
-    List<WriteStatus> statuses = result.collect();
-    assertNoWriteErrors(statuses);
   }
 
-  private HoodieWriteConfig.Builder getWriteConfigBuilder(String basePath, String tableName) {
+  private HoodieWriteConfig.Builder getWriteConfigBuilder(StoragePath basePath, String tableName) {
     Properties properties = new Properties();
     properties.setProperty(KeyGeneratorOptions.RECORDKEY_FIELD_NAME.key(), "_row_key");
     return HoodieWriteConfig.newBuilder()
@@ -271,7 +276,8 @@ class TestHoodieMultiTableServicesMain extends HoodieCommonTestHarness implement
     Properties props = new Properties();
     props.setProperty(KeyGeneratorOptions.RECORDKEY_FIELD_NAME.key(), "_row_key");
     props.setProperty(HoodieWriteConfig.PRECOMBINE_FIELD_NAME.key(), "_row_key");
-    return HoodieTestUtils.init(jsc.hadoopConfiguration(), rootPathStr, getTableType(), props);
+    return HoodieTestUtils.init(
+        HadoopFSUtils.getStorageConf(jsc.hadoopConfiguration()), rootPathStr, getTableType(), props);
   }
 
   private Properties makeIndexConfig(HoodieIndex.IndexType indexType) {
@@ -346,7 +352,7 @@ class TestHoodieMultiTableServicesMain extends HoodieCommonTestHarness implement
   }
 
   @AfterAll
-  public static synchronized void cleanUpAfterAll() {
+  public static synchronized void cleanUpAfterAll() throws IOException {
     if (spark != null) {
       spark.close();
       spark = null;

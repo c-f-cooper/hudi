@@ -19,16 +19,21 @@
 package org.apache.hudi.client.transaction;
 
 import org.apache.hudi.avro.model.HoodieRequestedReplaceMetadata;
-import org.apache.hudi.common.table.timeline.MetadataConversionUtils;
+import org.apache.hudi.avro.model.HoodieRollbackPlan;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieMetadataWrapper;
 import org.apache.hudi.common.model.HoodieReplaceCommitMetadata;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.timeline.MetadataConversionUtils;
+import org.apache.hudi.common.util.ClusteringUtils;
 import org.apache.hudi.common.util.CommitUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
+
+import lombok.Getter;
+import lombok.ToString;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -37,11 +42,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.CLUSTERING_ACTION;
 import static org.apache.hudi.common.table.timeline.HoodieTimeline.COMMIT_ACTION;
 import static org.apache.hudi.common.table.timeline.HoodieTimeline.COMPACTION_ACTION;
 import static org.apache.hudi.common.table.timeline.HoodieTimeline.DELTA_COMMIT_ACTION;
 import static org.apache.hudi.common.table.timeline.HoodieTimeline.LOG_COMPACTION_ACTION;
 import static org.apache.hudi.common.table.timeline.HoodieTimeline.REPLACE_COMMIT_ACTION;
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.ROLLBACK_ACTION;
 import static org.apache.hudi.common.util.CommitUtils.getPartitionAndFileIdWithoutSuffixFromSpecificRecord;
 
 /**
@@ -49,22 +56,38 @@ import static org.apache.hudi.common.util.CommitUtils.getPartitionAndFileIdWitho
  * Since we interchange payload types between AVRO specific records and POJO's, this object serves as
  * a common payload to manage these conversions.
  */
+@ToString(onlyExplicitlyIncluded = true)
 public class ConcurrentOperation {
 
+  @Getter
   private WriteOperationType operationType;
   private final HoodieMetadataWrapper metadataWrapper;
+  @Getter
   private final Option<HoodieCommitMetadata> commitMetadataOption;
+  @ToString.Include
   private final String actionState;
+  @ToString.Include
   private final String actionType;
+  @ToString.Include
   private final String instantTime;
+  private final HoodieTableMetaClient metaClient;
+  @Getter
   private Set<Pair<String, String>> mutatedPartitionAndFileIds = Collections.emptySet();
+  @Getter
+  private String rolledbackCommit;
 
   public ConcurrentOperation(HoodieInstant instant, HoodieTableMetaClient metaClient) throws IOException {
+    // Replace inflight compaction and clustering to requested since inflight does not contain the plan.
+    if ((instant.getAction().equals(COMPACTION_ACTION) || ClusteringUtils.isClusteringInstant(metaClient.getActiveTimeline(), instant, metaClient.getInstantGenerator()))
+        && instant.getState().equals(HoodieInstant.State.INFLIGHT)) {
+      instant = metaClient.createNewInstant(HoodieInstant.State.REQUESTED, instant.getAction(), instant.requestedTime());
+    }
     this.metadataWrapper = new HoodieMetadataWrapper(MetadataConversionUtils.createMetaWrapper(instant, metaClient));
     this.commitMetadataOption = Option.empty();
     this.actionState = instant.getState().name();
     this.actionType = instant.getAction();
-    this.instantTime = instant.getTimestamp();
+    this.instantTime = instant.requestedTime();
+    this.metaClient = metaClient;  // used only by the other concurrent operation (which reads from timeline)
     init(instant);
   }
 
@@ -73,8 +96,14 @@ public class ConcurrentOperation {
     this.metadataWrapper = new HoodieMetadataWrapper(commitMetadata);
     this.actionState = instant.getState().name();
     this.actionType = instant.getAction();
-    this.instantTime = instant.getTimestamp();
-    init(instant);
+    this.instantTime = instant.requestedTime();
+    this.metaClient = null;  // used only by the other concurrent operation (which reads from timeline)
+    try {
+      init(instant);
+    } catch (IOException e) {
+      // This should never happen since we are initializing with commit metadata
+      throw new RuntimeException("Failed to initialize ConcurrentOperation for instant: " + instant, e);
+    }
   }
 
   public String getInstantActionState() {
@@ -89,19 +118,7 @@ public class ConcurrentOperation {
     return instantTime;
   }
 
-  public WriteOperationType getOperationType() {
-    return operationType;
-  }
-
-  public Set<Pair<String, String>> getMutatedPartitionAndFileIds() {
-    return mutatedPartitionAndFileIds;
-  }
-
-  public Option<HoodieCommitMetadata> getCommitMetadataOption() {
-    return commitMetadataOption;
-  }
-
-  private void init(HoodieInstant instant) {
+  private void init(HoodieInstant instant) throws IOException {
     if (this.metadataWrapper.isAvroMetadata()) {
       switch (getInstantActionType()) {
         case COMPACTION_ACTION:
@@ -113,11 +130,30 @@ public class ConcurrentOperation {
           break;
         case COMMIT_ACTION:
         case DELTA_COMMIT_ACTION:
-          this.mutatedPartitionAndFileIds = getPartitionAndFileIdWithoutSuffixFromSpecificRecord(this.metadataWrapper.getMetadataFromTimeline().getHoodieCommitMetadata()
-              .getPartitionToWriteStats());
-          this.operationType = WriteOperationType.fromValue(this.metadataWrapper.getMetadataFromTimeline().getHoodieCommitMetadata().getOperationType());
+          // Ingestion .requested instants may have empty plan files, so the deserialized
+          // commit metadata will be null. In that case we leave mutatedPartitionAndFileIds
+          // empty and operationType unset, since the write has not started yet.
+          org.apache.hudi.avro.model.HoodieCommitMetadata avroCommitMeta =
+              this.metadataWrapper.getMetadataFromTimeline().getHoodieCommitMetadata();
+          if (avroCommitMeta != null) {
+            this.mutatedPartitionAndFileIds = getPartitionAndFileIdWithoutSuffixFromSpecificRecord(avroCommitMeta.getPartitionToWriteStats());
+            this.operationType = WriteOperationType.fromValue(avroCommitMeta.getOperationType());
+          }
+          break;
+        case ROLLBACK_ACTION:
+          this.operationType = WriteOperationType.UNKNOWN;
+          if (!instant.isCompleted()) {
+            // requested rollback instants have rollback plan in the details; (inflight rollback is empty).
+            // irrespective of requested/inflight, always read rollback plan.
+            if (this.metaClient != null) {
+              HoodieInstant requested = metaClient.getInstantGenerator().getRollbackRequestedInstant(instant);
+              HoodieRollbackPlan rollbackPlan = metaClient.getActiveTimeline().readRollbackPlan(requested);
+              this.rolledbackCommit = rollbackPlan.getInstantToRollback().getCommitTime();
+            }
+          }
           break;
         case REPLACE_COMMIT_ACTION:
+        case CLUSTERING_ACTION:
           if (instant.isCompleted()) {
             this.mutatedPartitionAndFileIds = getPartitionAndFileIdWithoutSuffixFromSpecificRecord(
                 this.metadataWrapper.getMetadataFromTimeline().getHoodieReplaceCommitMetadata().getPartitionToWriteStats());
@@ -160,6 +196,7 @@ public class ConcurrentOperation {
         case COMMIT_ACTION:
         case DELTA_COMMIT_ACTION:
         case REPLACE_COMMIT_ACTION:
+        case CLUSTERING_ACTION:
         case LOG_COMPACTION_ACTION:
           this.mutatedPartitionAndFileIds = CommitUtils.getPartitionAndFileIdWithoutSuffix(this.metadataWrapper.getCommitMetadata().getPartitionToWriteStats());
           this.operationType = this.metadataWrapper.getCommitMetadata().getOperationType();
@@ -181,14 +218,5 @@ public class ConcurrentOperation {
         .flatMap(ig -> ig.getSlices().stream())
         .map(fileSlice -> Pair.of(fileSlice.getPartitionPath(), fileSlice.getFileId()))
         .collect(Collectors.toSet());
-  }
-
-  @Override
-  public String toString() {
-    return "{"
-        + "actionType=" + this.getInstantActionType()
-        + ", instantTime=" + this.getInstantTimestamp()
-        + ", actionState=" + this.getInstantActionState()
-        + '\'' + '}';
   }
 }

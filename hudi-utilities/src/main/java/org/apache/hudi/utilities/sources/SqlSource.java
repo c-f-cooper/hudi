@@ -20,17 +20,17 @@ package org.apache.hudi.utilities.sources;
 
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.utilities.config.SqlSourceConfig;
 import org.apache.hudi.utilities.schema.SchemaProvider;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -55,9 +55,10 @@ import static org.apache.hudi.common.util.ConfigUtils.getStringWithAltKeys;
  *
  * Also, users are expected to set --allow-commit-on-no-checkpoint-change while using this SqlSource.
  */
+@Slf4j
 public class SqlSource extends RowSource {
+
   private static final long serialVersionUID = 1L;
-  private static final Logger LOG = LoggerFactory.getLogger(SqlSource.class);
   private final String sourceSql;
   private final SparkSession spark;
 
@@ -74,11 +75,10 @@ public class SqlSource extends RowSource {
   }
 
   @Override
-  protected Pair<Option<Dataset<Row>>, String> fetchNextBatch(
-      Option<String> lastCkptStr, long sourceLimit) {
-    LOG.debug(sourceSql);
+  protected Pair<Option<Dataset<Row>>, Checkpoint> fetchNextBatch(
+      Option<Checkpoint> lastCheckpoint, long sourceLimit) {
+    log.debug(sourceSql);
     Dataset<Row> source = spark.sql(sourceSql);
-    LOG.debug(source.showString(10, 0, true));
     // Remove Hoodie meta columns except partition path from input source.
     if (Arrays.asList(source.columns()).contains(HoodieRecord.COMMIT_TIME_METADATA_FIELD)) {
       source =

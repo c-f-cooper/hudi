@@ -18,11 +18,10 @@
 
 package org.apache.hudi.async;
 
-import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.util.collection.Pair;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.Serializable;
 import java.util.concurrent.BlockingQueue;
@@ -38,27 +37,30 @@ import java.util.function.Function;
 /**
  * Base Class for running archive/clean/delta-sync/compaction/clustering in separate thread and controlling their life-cycles.
  */
+@Slf4j
 public abstract class HoodieAsyncService implements Serializable {
-
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieAsyncService.class);
   private static final long POLLING_SECONDS = 10;
 
   // Flag indicating whether an error is incurred in the service
   protected boolean hasError;
   // Flag to track if the service is started.
+  @Getter
   private boolean started;
   // Flag indicating shutdown is externally requested
+  @Getter
   private boolean shutdownRequested;
   // Flag indicating the service is shutdown
+  @Getter
   private volatile boolean shutdown;
   // Executor Service for running delta-sync/compaction
   private transient ExecutorService executor;
   // Future tracking delta-sync/compaction
   private transient CompletableFuture future;
   // Run in daemon mode
+  @Getter
   private final boolean runInDaemonMode;
   // Queue to hold pending compaction/clustering instants
-  private transient BlockingQueue<HoodieInstant> pendingInstants = new LinkedBlockingQueue<>();
+  private transient BlockingQueue<String> pendingInstants = new LinkedBlockingQueue<>();
   // Mutex lock for synchronized access to pendingInstants queue
   private transient ReentrantLock queueLock = new ReentrantLock();
   // Condition instance to use with the queueLock
@@ -71,18 +73,6 @@ public abstract class HoodieAsyncService implements Serializable {
   protected HoodieAsyncService(boolean runInDaemonMode) {
     shutdownRequested = false;
     this.runInDaemonMode = runInDaemonMode;
-  }
-
-  public boolean isStarted() {
-    return started;
-  }
-
-  public boolean isShutdownRequested() {
-    return shutdownRequested;
-  }
-
-  public boolean isShutdown() {
-    return shutdown;
   }
 
   public boolean hasError() {
@@ -102,7 +92,7 @@ public abstract class HoodieAsyncService implements Serializable {
     try {
       future.get();
     } catch (ExecutionException ex) {
-      LOG.error("Service shutdown with error", ex);
+      log.error("Service shutdown with error", ex);
       throw ex;
     }
   }
@@ -126,7 +116,7 @@ public abstract class HoodieAsyncService implements Serializable {
             // Wait for some max time after requesting shutdown
             executor.awaitTermination(24, TimeUnit.HOURS);
           } catch (InterruptedException ie) {
-            LOG.error("Interrupted while waiting for shutdown", ie);
+            log.error("Interrupted while waiting for shutdown", ie);
           }
         }
       }
@@ -141,7 +131,7 @@ public abstract class HoodieAsyncService implements Serializable {
    */
   public void start(Function<Boolean, Boolean> onShutdownCallback) {
     if (started) {
-      LOG.warn("The async service already started.");
+      log.info("The async service already started.");
       return;
     }
     Pair<CompletableFuture, ExecutorService> res = startService();
@@ -174,10 +164,6 @@ public abstract class HoodieAsyncService implements Serializable {
     });
   }
 
-  public boolean isRunInDaemonMode() {
-    return runInDaemonMode;
-  }
-
   /**
    * Wait till outstanding pending compaction/clustering reduces to the passed in value.
    *
@@ -197,23 +183,23 @@ public abstract class HoodieAsyncService implements Serializable {
 
   /**
    * Enqueues new pending table service instant.
-   * @param instant {@link HoodieInstant} to enqueue.
+   * @param instantTime {@link String} to enqueue.
    */
-  public void enqueuePendingAsyncServiceInstant(HoodieInstant instant) {
-    LOG.info("Enqueuing new pending table service instant: " + instant.getTimestamp());
-    pendingInstants.add(instant);
+  public void enqueuePendingAsyncServiceInstant(String instantTime) {
+    log.info("Enqueuing new pending table service instant: " + instantTime);
+    pendingInstants.add(instantTime);
   }
 
   /**
    * Fetch next pending compaction/clustering instant if available.
    *
-   * @return {@link HoodieInstant} corresponding to the next pending compaction/clustering.
+   * @return {@link String} corresponding to the next pending compaction/clustering.
    * @throws InterruptedException
    */
-  HoodieInstant fetchNextAsyncServiceInstant() throws InterruptedException {
-    LOG.info(String.format("Waiting for next instant up to %d seconds", POLLING_SECONDS));
-    HoodieInstant instant = pendingInstants.poll(POLLING_SECONDS, TimeUnit.SECONDS);
-    if (instant != null) {
+  String fetchNextAsyncServiceInstant() throws InterruptedException {
+    log.info("Waiting for next instant up to {} seconds", POLLING_SECONDS);
+    String instantTime = pendingInstants.poll(POLLING_SECONDS, TimeUnit.SECONDS);
+    if (instantTime != null) {
       try {
         queueLock.lock();
         // Signal waiting thread
@@ -222,6 +208,6 @@ public abstract class HoodieAsyncService implements Serializable {
         queueLock.unlock();
       }
     }
-    return instant;
+    return instantTime;
   }
 }

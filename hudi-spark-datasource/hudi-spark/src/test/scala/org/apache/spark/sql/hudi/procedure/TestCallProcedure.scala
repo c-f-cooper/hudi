@@ -18,7 +18,7 @@
 package org.apache.spark.sql.hudi.procedure
 
 import org.apache.hudi.common.model.IOType
-import org.apache.hudi.common.testutils.FileCreateUtils
+import org.apache.hudi.common.testutils.FileCreateUtilsLegacy
 
 class TestCallProcedure extends HoodieSparkProcedureTestBase {
 
@@ -37,7 +37,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
       // insert data to table
@@ -71,7 +71,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
       // insert data to table
@@ -104,7 +104,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
       // insert data to table
@@ -148,7 +148,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
       // insert data to table
@@ -160,6 +160,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
       var commits = spark.sql(s"""call show_commits(table => '$tableName', limit => 10)""").collect()
       assertResult(3){commits.length}
 
+      spark.table(s"$tableName").select("id").count
       spark.table(s"$tableName").select("id").cache()
       assertCached(spark.table(s"$tableName").select("id"), 1)
 
@@ -187,7 +188,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
            | location '$tablePath'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 
@@ -196,15 +197,15 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
         s"Argument: instant_time is required")
 
       val instantTime = "101"
-      FileCreateUtils.createMarkerFile(tablePath, "", instantTime, "f0", IOType.APPEND)
+      FileCreateUtilsLegacy.createMarkerFile(tablePath, "", instantTime, "f0", IOType.APPEND)
       assertResult(1) {
-        FileCreateUtils.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
+        FileCreateUtilsLegacy.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
       }
 
       checkAnswer(s"""call delete_marker(table => '$tableName', instant_time => '$instantTime')""")(Seq(true))
 
       assertResult(0) {
-        FileCreateUtils.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
+        FileCreateUtilsLegacy.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
       }
     }
   }
@@ -225,7 +226,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
            | location '$tablePath'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
 
@@ -234,21 +235,21 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
         s"Argument: instant_time is required")
 
       var instantTime = "101"
-      FileCreateUtils.createMarkerFile(tablePath, "", instantTime, "f0", IOType.APPEND)
+      FileCreateUtilsLegacy.createMarkerFile(tablePath, "", instantTime, "f0", IOType.APPEND)
       assertResult(1) {
-        FileCreateUtils.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
+        FileCreateUtilsLegacy.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
       }
       instantTime = "102"
-      FileCreateUtils.createMarkerFile(tablePath, "", instantTime, "f0", IOType.APPEND)
+      FileCreateUtilsLegacy.createMarkerFile(tablePath, "", instantTime, "f0", IOType.APPEND)
       assertResult(1) {
-        FileCreateUtils.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
+        FileCreateUtilsLegacy.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
       }
 
       instantTime = "101,102"
       checkAnswer(s"""call delete_marker(table => '$tableName', instant_time => '$instantTime')""")(Seq(true))
 
       assertResult(0) {
-        FileCreateUtils.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
+        FileCreateUtilsLegacy.getTotalMarkerFileCount(tablePath, "", instantTime, IOType.APPEND)
       }
     }
   }
@@ -268,7 +269,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
       // insert data to table
@@ -312,7 +313,7 @@ class TestCallProcedure extends HoodieSparkProcedureTestBase {
            | location '${tmp.getCanonicalPath}/$tableName'
            | tblproperties (
            |  primaryKey = 'id',
-           |  preCombineField = 'ts'
+           |  orderingFields = 'ts'
            | )
        """.stripMargin)
       // insert data to table

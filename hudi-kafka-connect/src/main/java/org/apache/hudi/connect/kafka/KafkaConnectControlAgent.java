@@ -22,6 +22,7 @@ import org.apache.hudi.connect.ControlMessage;
 import org.apache.hudi.connect.transaction.TransactionCoordinator;
 import org.apache.hudi.connect.transaction.TransactionParticipant;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.CommitFailedException;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -29,8 +30,6 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Collections;
@@ -50,9 +49,8 @@ import java.util.concurrent.TimeUnit;
  * Use a single instance per worker (single-threaded),
  * and register multiple tasks that can receive the control messages.
  */
+@Slf4j
 public class KafkaConnectControlAgent implements KafkaControlAgent {
-
-  private static final Logger LOG = LoggerFactory.getLogger(KafkaConnectControlAgent.class);
   private static final Object LOCK = new Object();
   private static final long KAFKA_POLL_TIMEOUT_MS = 100;
   private static final int EXEC_SHUTDOWN_TIMEOUT_MS = 5000;
@@ -125,7 +123,7 @@ public class KafkaConnectControlAgent implements KafkaControlAgent {
     Properties props = new Properties();
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
     // Todo fetch the worker id or name instead of a uuid.
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, "hudi-control-group" + UUID.randomUUID().toString());
+    props.put(ConsumerConfig.GROUP_ID_CONFIG, "hudi-control-group" + UUID.randomUUID());
     props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
     props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
 
@@ -143,8 +141,8 @@ public class KafkaConnectControlAgent implements KafkaControlAgent {
         records = consumer.poll(Duration.ofMillis(KAFKA_POLL_TIMEOUT_MS));
         for (ConsumerRecord<String, byte[]> record : records) {
           try {
-            LOG.debug(String.format("Kafka consumerGroupId = %s topic = %s, partition = %s, offset = %s, customer = %s, country = %s",
-                "", record.topic(), record.partition(), record.offset(), record.key(), record.value()));
+            log.debug("Kafka consumerGroupId = {} topic = {}, partition = {}, offset = {}, customer = {}, country = {}",
+                "", record.topic(), record.partition(), record.offset(), record.key(), record.value());
             ControlMessage message = ControlMessage.parseFrom(record.value());
             String senderTopic = message.getTopicName();
 
@@ -154,23 +152,23 @@ public class KafkaConnectControlAgent implements KafkaControlAgent {
                   partitionWorker.processControlEvent(message);
                 }
               } else {
-                LOG.warn(String.format("Failed to send message for unregistered participants for topic %s", senderTopic));
+                log.warn("Failed to send message for unregistered participants for topic {}", senderTopic);
               }
             } else if (message.getReceiverType().equals(ControlMessage.EntityType.COORDINATOR)) {
               if (topicCoordinators.containsKey(senderTopic)) {
                 topicCoordinators.get(senderTopic).processControlEvent(message);
               }
             } else {
-              LOG.warn(String.format("Sender type of Control Message unknown %s", message.getSenderType().name()));
+              log.warn("Sender type of Control Message unknown {}", message.getSenderType().name());
             }
           } catch (Exception e) {
-            LOG.error(String.format("Fatal error while consuming a kafka record for topic = %s partition = %s", record.topic(), record.partition()), e);
+            log.error("Fatal error while consuming a kafka record for topic = {} partition = {}", record.topic(), record.partition(), e);
           }
         }
         try {
           consumer.commitSync();
         } catch (CommitFailedException exception) {
-          LOG.error("Fatal error while committing kafka control topic");
+          log.error("Fatal error while committing kafka control topic");
         }
       }
     });
@@ -182,16 +180,16 @@ public class KafkaConnectControlAgent implements KafkaControlAgent {
     if (executorService != null) {
       boolean terminated = false;
       try {
-        LOG.info("Shutting down executor service.");
+        log.info("Shutting down executor service.");
         executorService.shutdown();
-        LOG.info("Awaiting termination.");
+        log.info("Awaiting termination.");
         terminated = executorService.awaitTermination(EXEC_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
       } catch (InterruptedException e) {
         // ignored
       }
 
       if (!terminated) {
-        LOG.warn(
+        log.warn(
             "Unclean Kafka Control Manager executor service shutdown ");
         executorService.shutdownNow();
       }

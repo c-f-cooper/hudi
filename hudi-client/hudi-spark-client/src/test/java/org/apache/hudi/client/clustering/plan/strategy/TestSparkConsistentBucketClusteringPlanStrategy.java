@@ -19,6 +19,7 @@
 package org.apache.hudi.client.clustering.plan.strategy;
 
 import org.apache.hudi.avro.model.HoodieClusteringGroup;
+import org.apache.hudi.common.config.HoodieStorageConfig;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.ConsistentHashingNode;
 import org.apache.hudi.common.model.FileSlice;
@@ -29,7 +30,6 @@ import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.testutils.HoodieTestUtils;
 import org.apache.hudi.common.util.collection.Triple;
 import org.apache.hudi.config.HoodieIndexConfig;
-import org.apache.hudi.common.config.HoodieStorageConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.index.bucket.ConsistentBucketIdentifier;
@@ -60,8 +60,8 @@ public class TestSparkConsistentBucketClusteringPlanStrategy extends HoodieSpark
   private void setup() throws IOException {
     initPath();
     initSparkContexts();
-    initFileSystem();
-    metaClient = HoodieTestUtils.init(hadoopConf, basePath, HoodieTableType.MERGE_ON_READ);
+    initHoodieStorage();
+    metaClient = HoodieTestUtils.init(storageConf, basePath, HoodieTableType.MERGE_ON_READ);
   }
 
   @AfterEach
@@ -189,7 +189,7 @@ public class TestSparkConsistentBucketClusteringPlanStrategy extends HoodieSpark
     FileSlice fs = new FileSlice("partition", "001", fileId);
     if (baseFileSize > 0) {
       HoodieBaseFile f = new HoodieBaseFile(fileId);
-      f.setFileLen(baseFileSize);
+      f.setFileSize(baseFileSize);
       fs.setBaseFile(f);
     }
 
@@ -200,7 +200,7 @@ public class TestSparkConsistentBucketClusteringPlanStrategy extends HoodieSpark
     long logFileSize = (totalLogFileSize + numLogFiles - 1) / Math.max(numLogFiles, 1);
     for (int i = 0; i < numLogFiles; ++i) {
       HoodieLogFile f = new HoodieLogFile(String.format(".%s_%s.log.%d", fileId, "12345678", i));
-      f.setFileLen(logFileSize);
+      f.setFileSize(logFileSize);
       fs.addLogFile(f);
     }
 

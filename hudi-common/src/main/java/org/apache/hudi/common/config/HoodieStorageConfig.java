@@ -51,7 +51,7 @@ public class HoodieStorageConfig extends HoodieConfig {
 
   public static final ConfigProperty<String> PARQUET_PAGE_SIZE = ConfigProperty
       .key("hoodie.parquet.page.size")
-      .defaultValue(String.valueOf(1 * 1024 * 1024))
+      .defaultValue(String.valueOf(1024 * 1024))
       .markAdvanced()
       .withDocumentation("Parquet page size in bytes. Page is the unit of read within a parquet file. "
           + "Within a block, pages are compressed separately.");
@@ -79,6 +79,59 @@ public class HoodieStorageConfig extends HoodieConfig {
       .defaultValue(String.valueOf(120 * 1024 * 1024))
       .markAdvanced()
       .withDocumentation("Target file size in bytes for HFile base files.");
+
+  public static final ConfigProperty<String> LANCE_MAX_FILE_SIZE = ConfigProperty
+      .key("hoodie.lance.max.file.size")
+      .defaultValue(String.valueOf(120 * 1024 * 1024))
+      .markAdvanced()
+      .withDocumentation("Target file size in bytes for Lance base files.");
+
+  public static final ConfigProperty<String> LANCE_WRITE_ALLOCATOR_SIZE_BYTES = ConfigProperty
+      .key("hoodie.lance.write.allocator.size.bytes")
+      .defaultValue(String.valueOf(256 * 1024 * 1024))
+      .markAdvanced()
+      .withDocumentation("Maximum size in bytes of the Arrow child allocator used by the Lance "
+          + "writer for buffering in-flight batch data. Must be large enough that the Arrow "
+          + "BaseLargeVariableWidthVector's power-of-2 doubling growth never requests a buffer "
+          + "exceeding this cap, otherwise writes fail with OutOfMemoryException. The default of "
+          + "256MB clears the 128MB doubling step with headroom; pair with "
+          + "hoodie.lance.write.flush.byte.watermark to bound in-flight memory regardless of "
+          + "blob size or row count.");
+
+  public static final ConfigProperty<String> LANCE_WRITE_FLUSH_BYTE_WATERMARK = ConfigProperty
+      .key("hoodie.lance.write.flush.byte.watermark")
+      .defaultValue(String.valueOf(96 * 1024 * 1024))
+      .markAdvanced()
+      .withDocumentation("Byte-size watermark on the Lance writer's in-flight Arrow buffers; "
+          + "the writer flushes the current batch when the sum of FieldVector buffer sizes "
+          + "reaches this value, in addition to the row-count batch threshold. Keeps the data "
+          + "buffer below the next power-of-2 doubling step so reallocation cannot exceed "
+          + "hoodie.lance.write.allocator.size.bytes. Default is roughly 3/8 of the allocator "
+          + "size, leaving room for offset/validity buffers.");
+
+  public static final ConfigProperty<String> LANCE_READ_ALLOCATOR_SIZE_BYTES = ConfigProperty
+      .key("hoodie.lance.read.allocator.size.bytes")
+      .defaultValue(String.valueOf(256 * 1024 * 1024))
+      .markAdvanced()
+      .withDocumentation("Maximum size in bytes of the Arrow child allocator used by the Lance "
+          + "reader for the per-read data buffers. Raise this for files with very wide rows or "
+          + "large blob columns.");
+
+  public static final ConfigProperty<String> LANCE_READ_METADATA_ALLOCATOR_SIZE_BYTES = ConfigProperty
+      .key("hoodie.lance.read.metadata.allocator.size.bytes")
+      .defaultValue(String.valueOf(8 * 1024 * 1024))
+      .markAdvanced()
+      .withDocumentation("Maximum size in bytes of the Arrow child allocator used by the Lance "
+          + "reader for footer/metadata operations (schema, bloom filter). Independent of the "
+          + "data allocator since metadata allocations are small and short-lived.");
+
+  public static final ConfigProperty<Boolean> HFILE_WRITER_TO_ALLOW_DUPLICATES = ConfigProperty
+      .key("hoodie.hfile.writes.allow.duplicates")
+      .defaultValue(false)
+      .withDocumentation("When bootstrapping RI, if the main dataset contains duplicates then "
+          + "it will fail the bootstrap job. TO avoid the failure and bootstrap the RI with dups"
+          + " this config can be set to true. One thing to note is that, there is no deterministic"
+          + " way to specify which among these records will be ingested into RI.");
 
   public static final ConfigProperty<String> HFILE_BLOCK_SIZE = ConfigProperty
       .key("hoodie.hfile.block.size")
@@ -129,7 +182,7 @@ public class HoodieStorageConfig extends HoodieConfig {
 
   public static final ConfigProperty<String> PARQUET_WRITE_LEGACY_FORMAT_ENABLED = ConfigProperty
       .key("hoodie.parquet.writelegacyformat.enabled")
-      .defaultValue("false")
+      .noDefaultValue()
       .markAdvanced()
       .withDocumentation("Sets spark.sql.parquet.writeLegacyFormat. If true, data will be written in a way of Spark 1.4 and earlier. "
           + "For example, decimal values will be written in Parquet's fixed-length byte array format which other systems such as Apache Hive and Apache Impala use. "
@@ -155,8 +208,18 @@ public class HoodieStorageConfig extends HoodieConfig {
   public static final ConfigProperty<Boolean> PARQUET_WITH_BLOOM_FILTER_ENABLED = ConfigProperty
       .key("hoodie.parquet.bloom.filter.enabled")
       .defaultValue(true)
+      .markAdvanced()
+      .sinceVersion("0.15.0")
       .withDocumentation("Control whether to write bloom filter or not. Default true. "
           + "We can set to false in non bloom index cases for CPU resource saving.");
+
+  public static final ConfigProperty<Boolean> WRITE_UTC_TIMEZONE = ConfigProperty
+      .key("hoodie.parquet.write.utc-timezone.enabled")
+      .defaultValue(true)
+      .markAdvanced()
+      .sinceVersion("1.1.0")
+      .withDocumentation("Use UTC timezone or local timezone to the conversion between epoch"
+              + " time and LocalDateTime. Default value is utc timezone for forward compatibility.");
 
   public static final ConfigProperty<String> HFILE_COMPRESSION_ALGORITHM_NAME = ConfigProperty
       .key("hoodie.hfile.compression.algorithm")
@@ -176,7 +239,8 @@ public class HoodieStorageConfig extends HoodieConfig {
       .defaultValue(String.valueOf(0.35))
       .markAdvanced()
       .withDocumentation("Expected additional compression as records move from log files to parquet. Used for merge_on_read "
-          + "table to send inserts into log files & control the size of compacted parquet file.");
+          + "table to send inserts into log files & control the size of compacted parquet file."
+          + "When encoding log blocks in parquet format, increase this value for a more accurate estimation");
 
   // Configs that control the bloom filter that is written to the file footer
   public static final ConfigProperty<String> BLOOM_FILTER_TYPE = ConfigProperty
@@ -225,6 +289,46 @@ public class HoodieStorageConfig extends HoodieConfig {
       .withDocumentation("Provided write support class should extend HoodieAvroWriteSupport class "
           + "and it is loaded at runtime. This is only required when trying to "
           + "override the existing write context.");
+
+  public static final ConfigProperty<String> HOODIE_PARQUET_SPARK_ROW_WRITE_SUPPORT_CLASS = ConfigProperty
+      .key("hoodie.parquet.spark.row.write.support.class")
+      .defaultValue("org.apache.hudi.io.storage.row.HoodieRowParquetWriteSupport")
+      .markAdvanced()
+      .sinceVersion("0.15.0")
+      .withDocumentation("Provided write support class should extend HoodieRowParquetWriteSupport class "
+          + "and it is loaded at runtime. This is only required when trying to "
+          + "override the existing write context when `hoodie.datasource.write.row.writer.enable=true`.");
+
+  public static final ConfigProperty<String> HOODIE_PARQUET_FLINK_ROW_DATA_WRITE_SUPPORT_CLASS = ConfigProperty
+      .key("hoodie.parquet.flink.rowdata.write.support.class")
+      .defaultValue("org.apache.hudi.io.storage.row.HoodieRowDataParquetWriteSupport")
+      .markAdvanced()
+      .sinceVersion("1.1.0")
+      .withDocumentation("Provided write support class should extend HoodieRowDataParquetWriteSupport class "
+          + "and it is loaded at runtime. This is only required when trying to override the existing write support.");
+
+  public static final ConfigProperty<String> HOODIE_STORAGE_CLASS = ConfigProperty
+      .key("hoodie.storage.class")
+      .defaultValue("org.apache.hudi.storage.hadoop.HoodieHadoopStorage")
+      .markAdvanced()
+      .sinceVersion("0.15.0")
+      .withDocumentation("The fully-qualified class name of the `HoodieStorage` implementation class to instantiate. "
+          + "The provided class should implement `org.apache.hudi.storage.HoodieStorage`");
+
+  public static final ConfigProperty<String> HOODIE_IO_FACTORY_CLASS = ConfigProperty
+      .key("hoodie.io.factory.class")
+      .defaultValue("org.apache.hudi.io.storage.hadoop.HoodieHadoopIOFactory")
+      .markAdvanced()
+      .sinceVersion("0.15.0")
+      .withDocumentation("The fully-qualified class name of the factory class to return readers and writers of files used "
+          + "by Hudi. The provided class should implement `org.apache.hudi.io.storage.HoodieIOFactory`.");
+
+  public static final ConfigProperty<String> HOODIE_PARQUET_CONFIG_INJECTOR_CLASS = ConfigProperty
+      .key("hoodie.parquet.write.config.injector.class")
+      .noDefaultValue()
+      .markAdvanced()
+      .sinceVersion("1.2.0")
+      .withDocumentation("Config injector implementation for HoodieParquetConfigInjector class, for users willing to inject some custom configs to parquet writers");
 
   /**
    * @deprecated Use {@link #PARQUET_MAX_FILE_SIZE} and its methods instead
@@ -341,6 +445,10 @@ public class HoodieStorageConfig extends HoodieConfig {
     super();
   }
 
+  public String getBloomFilterType() {
+    return getString(BLOOM_FILTER_TYPE);
+  }
+
   public static HoodieStorageConfig.Builder newBuilder() {
     return new Builder();
   }
@@ -381,6 +489,11 @@ public class HoodieStorageConfig extends HoodieConfig {
       return this;
     }
 
+    public Builder allowDuplicatesWithHfileWrites(boolean allowDuplicatesToBeInserted) {
+      storageConfig.setValue(HFILE_WRITER_TO_ALLOW_DUPLICATES, String.valueOf(allowDuplicatesToBeInserted));
+      return this;
+    }
+
     public Builder hfileBlockSize(int blockSize) {
       storageConfig.setValue(HFILE_BLOCK_SIZE, String.valueOf(blockSize));
       return this;
@@ -408,6 +521,11 @@ public class HoodieStorageConfig extends HoodieConfig {
 
     public Builder parquetCompressionCodec(String parquetCompressionCodec) {
       storageConfig.setValue(PARQUET_COMPRESSION_CODEC_NAME, parquetCompressionCodec);
+      return this;
+    }
+
+    public Builder parquetDictionaryEnabled(boolean enable) {
+      storageConfig.setValue(PARQUET_DICTIONARY_ENABLED, String.valueOf(enable));
       return this;
     }
 
@@ -446,6 +564,11 @@ public class HoodieStorageConfig extends HoodieConfig {
       return this;
     }
 
+    public Builder lanceMaxFileSize(long maxFileSize) {
+      storageConfig.setValue(LANCE_MAX_FILE_SIZE, String.valueOf(maxFileSize));
+      return this;
+    }
+
     public Builder orcStripeSize(int orcStripeSize) {
       storageConfig.setValue(ORC_STRIPE_SIZE, String.valueOf(orcStripeSize));
       return this;
@@ -463,6 +586,71 @@ public class HoodieStorageConfig extends HoodieConfig {
 
     public Builder withAvroWriteSupport(String avroWriteSupportClassName) {
       storageConfig.setValue(HOODIE_AVRO_WRITE_SUPPORT_CLASS, avroWriteSupportClassName);
+      return this;
+    }
+
+    public Builder withRowDataWriteSupport(String rowDataWriteSupportClassName) {
+      storageConfig.setValue(HOODIE_PARQUET_FLINK_ROW_DATA_WRITE_SUPPORT_CLASS, rowDataWriteSupportClassName);
+      return this;
+    }
+
+    public Builder withWriteUtcTimezone(boolean writeUtcTimezone) {
+      storageConfig.setValue(WRITE_UTC_TIMEZONE, String.valueOf(writeUtcTimezone));
+      return this;
+    }
+
+    /**
+     * Sets the bloom filter type for the configuration.
+     *
+     * @param bloomFilterType The bloom filter type (SIMPLE or DYNAMIC_V0)
+
+     */
+    public Builder withBloomFilterType(String bloomFilterType) {
+      storageConfig.setValue(BLOOM_FILTER_TYPE, bloomFilterType);
+      return this;
+    }
+
+    /**
+     * Sets the number of entries to be stored in the bloom filter.
+     *
+     * @param numEntries The number of entries for the bloom filter
+
+     */
+    public Builder withBloomFilterNumEntries(int numEntries) {
+      storageConfig.setValue(BLOOM_FILTER_NUM_ENTRIES_VALUE, String.valueOf(numEntries));
+      return this;
+    }
+
+    /**
+     * Sets the false positive probability (FPP) for the bloom filter.
+     *
+     * @param fpp The false positive probability as a double
+
+     */
+    public Builder withBloomFilterFpp(double fpp) {
+      storageConfig.setValue(BLOOM_FILTER_FPP_VALUE, String.valueOf(fpp));
+      return this;
+    }
+
+    /**
+     * Sets the maximum number of entries for dynamic bloom filter.
+     *
+     * @param maxEntries The maximum number of entries for dynamic bloom filter
+
+     */
+    public Builder withBloomFilterDynamicMaxEntries(int maxEntries) {
+      storageConfig.setValue(BLOOM_FILTER_DYNAMIC_MAX_ENTRIES, String.valueOf(maxEntries));
+      return this;
+    }
+
+    /**
+     * Sets the parquet config injector class name.
+     *
+     * @param parquetConfigInjectorClass The fully-qualified class name of the parquet config injector
+
+     */
+    public Builder withParquetConfigInjectorClass(String parquetConfigInjectorClass) {
+      storageConfig.setValue(HOODIE_PARQUET_CONFIG_INJECTOR_CLASS, parquetConfigInjectorClass);
       return this;
     }
 

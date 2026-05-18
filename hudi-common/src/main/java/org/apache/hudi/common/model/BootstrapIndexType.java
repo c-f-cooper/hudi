@@ -19,32 +19,31 @@
 
 package org.apache.hudi.common.model;
 
-import org.apache.hudi.common.bootstrap.index.HFileBootstrapIndex;
 import org.apache.hudi.common.bootstrap.index.NoOpBootstrapIndex;
+import org.apache.hudi.common.bootstrap.index.hfile.HFileBootstrapIndex;
 import org.apache.hudi.common.config.EnumDescription;
 import org.apache.hudi.common.config.EnumFieldDescription;
 import org.apache.hudi.common.config.HoodieConfig;
+
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
 
 import static org.apache.hudi.common.table.HoodieTableConfig.BOOTSTRAP_INDEX_CLASS_NAME;
 import static org.apache.hudi.common.table.HoodieTableConfig.BOOTSTRAP_INDEX_ENABLE;
 import static org.apache.hudi.common.table.HoodieTableConfig.BOOTSTRAP_INDEX_TYPE;
 
+@AllArgsConstructor(access = AccessLevel.PACKAGE)
+@Getter
 @EnumDescription("Bootstrap index type to use for mapping between skeleton and actual data files.")
 public enum BootstrapIndexType {
+
   @EnumFieldDescription("Maintains mapping in HFile format.")
   HFILE(HFileBootstrapIndex.class.getName()),
   @EnumFieldDescription("No-op, an empty implementation.")
-  NO_OP(NoOpBootstrapIndex.class.getName());
+  NONE(NoOpBootstrapIndex.class.getName());
 
   private final String className;
-
-  BootstrapIndexType(String className) {
-    this.className = className;
-  }
-
-  public String getClassName() {
-    return className;
-  }
 
   public static BootstrapIndexType fromClassName(String className) {
     for (BootstrapIndexType type : BootstrapIndexType.values()) {
@@ -57,7 +56,7 @@ public enum BootstrapIndexType {
 
   public static String getBootstrapIndexClassName(HoodieConfig config) {
     if (!config.getBooleanOrDefault(BOOTSTRAP_INDEX_ENABLE)) {
-      return BootstrapIndexType.NO_OP.getClassName();
+      return BootstrapIndexType.NONE.getClassName();
     }
     if (config.contains(BOOTSTRAP_INDEX_CLASS_NAME)) {
       return config.getString(BOOTSTRAP_INDEX_CLASS_NAME);
@@ -68,9 +67,13 @@ public enum BootstrapIndexType {
   }
 
   public static String getDefaultBootstrapIndexClassName(HoodieConfig config) {
+    return getBootstrapIndexType(config).getClassName();
+  }
+
+  public static BootstrapIndexType getBootstrapIndexType(HoodieConfig config) {
     if (!config.getBooleanOrDefault(BOOTSTRAP_INDEX_ENABLE)) {
-      return BootstrapIndexType.NO_OP.getClassName();
+      return BootstrapIndexType.NONE;
     }
-    return BootstrapIndexType.valueOf(BOOTSTRAP_INDEX_TYPE.defaultValue()).getClassName();
+    return BootstrapIndexType.valueOf(BOOTSTRAP_INDEX_TYPE.defaultValue());
   }
 }

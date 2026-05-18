@@ -21,23 +21,23 @@ package org.apache.hudi.table.upgrade;
 
 import org.apache.hudi.client.BaseHoodieWriteClient;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
-import org.apache.hudi.client.common.HoodieFlinkEngineContext;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.keygen.constant.KeyGeneratorOptions;
 import org.apache.hudi.table.HoodieFlinkTable;
 import org.apache.hudi.table.HoodieTable;
 
+import lombok.AccessLevel;
+import lombok.NoArgsConstructor;
+
 /**
  * Flink upgrade and downgrade helper.
  */
+@NoArgsConstructor(access = AccessLevel.PRIVATE)
 public class FlinkUpgradeDowngradeHelper implements SupportsUpgradeDowngrade {
 
   private static final FlinkUpgradeDowngradeHelper SINGLETON_INSTANCE =
       new FlinkUpgradeDowngradeHelper();
-
-  private FlinkUpgradeDowngradeHelper() {
-  }
 
   public static FlinkUpgradeDowngradeHelper getInstance() {
     return SINGLETON_INSTANCE;
@@ -45,7 +45,7 @@ public class FlinkUpgradeDowngradeHelper implements SupportsUpgradeDowngrade {
 
   @Override
   public HoodieTable getTable(HoodieWriteConfig config, HoodieEngineContext context) {
-    return HoodieFlinkTable.create(config, (HoodieFlinkEngineContext) context);
+    return HoodieFlinkTable.create(config, context);
   }
 
   @Override
@@ -55,6 +55,10 @@ public class FlinkUpgradeDowngradeHelper implements SupportsUpgradeDowngrade {
 
   @Override
   public BaseHoodieWriteClient getWriteClient(HoodieWriteConfig config, HoodieEngineContext context) {
+    // Because flink enables reusing of embedded timeline service by default, disable the embedded time service to avoid closing of the reused timeline server.
+    // The write config inherits from the info of the currently running timeline server started in coordinator, even though the flag is disabled, it still can
+    // access the remote timeline server started before.
+    config.setValue(HoodieWriteConfig.EMBEDDED_TIMELINE_SERVER_ENABLE.key(), "false");
     return new HoodieFlinkWriteClient(context, config);
   }
 }

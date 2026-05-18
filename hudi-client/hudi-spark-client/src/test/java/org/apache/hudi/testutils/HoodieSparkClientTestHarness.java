@@ -21,9 +21,12 @@ import org.apache.hudi.HoodieConversionUtils;
 import org.apache.hudi.avro.model.HoodieActionInstant;
 import org.apache.hudi.avro.model.HoodieCleanMetadata;
 import org.apache.hudi.avro.model.HoodieCleanerPlan;
+import org.apache.hudi.client.BaseHoodieWriteClient;
 import org.apache.hudi.client.SparkRDDReadClient;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.client.SparkTaskContextSupplier;
+import org.apache.hudi.client.WriteClientTestUtils;
+import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.common.HoodieCleanStat;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
@@ -52,12 +55,16 @@ import org.apache.hudi.data.HoodieJavaRDD;
 import org.apache.hudi.exception.HoodieMetadataException;
 import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.index.HoodieIndex;
+import org.apache.hudi.keygen.factory.HoodieSparkKeyGeneratorFactory;
 import org.apache.hudi.metadata.FileSystemBackedTableMetadata;
 import org.apache.hudi.metadata.HoodieBackedTableMetadataWriter;
 import org.apache.hudi.metadata.HoodieTableMetadata;
 import org.apache.hudi.metadata.HoodieTableMetadataWriter;
-import org.apache.hudi.metadata.MetadataPartitionType;
 import org.apache.hudi.metadata.SparkHoodieBackedTableMetadataWriter;
+import org.apache.hudi.storage.HoodieStorageUtils;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathInfo;
 import org.apache.hudi.table.HoodieSparkTable;
 import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.table.WorkloadStat;
@@ -65,11 +72,10 @@ import org.apache.hudi.timeline.service.TimelineService;
 import org.apache.hudi.util.JFunction;
 import org.apache.hudi.utils.HoodieWriterClientTestHarness;
 
-import org.apache.hadoop.conf.Configuration;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocalFileSystem;
-import org.apache.hadoop.fs.Path;
 import org.apache.spark.SparkConf;
 import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
@@ -80,8 +86,6 @@ import org.apache.spark.sql.SparkSessionExtensions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.TestInfo;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -96,12 +100,14 @@ import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import scala.Tuple2;
 
+import static org.apache.hudi.common.testutils.HoodieTestUtils.INSTANT_GENERATOR;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.getDefaultStorageConf;
 import static org.apache.hudi.common.util.CleanerUtils.convertCleanMetadata;
+import static org.apache.hudi.testutils.Assertions.assertNoWriteErrors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertLinesMatch;
@@ -112,9 +118,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 /**
  * The test harness for resource initialization and cleanup.
  */
+@Slf4j
 public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTestHarness {
-
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieSparkClientTestHarness.class);
 
   @AfterAll
   public static void tearDownAll() throws IOException {
@@ -124,14 +129,12 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
   protected JavaSparkContext jsc;
   protected HoodieSparkEngineContext context;
   protected SparkSession sparkSession;
-  protected Configuration hadoopConf;
   protected SQLContext sqlContext;
-  protected FileSystem fs;
   protected ExecutorService executorService;
-  protected HoodieTableMetaClient metaClient;
   protected SparkRDDWriteClient writeClient;
   protected SparkRDDReadClient readClient;
   protected HoodieTableFileSystemView tableView;
+  protected Map<String, String> extraConf = new HashMap<>();
 
   protected TimelineService timelineService;
   protected final SparkTaskContextSupplier supplier = new SparkTaskContextSupplier();
@@ -154,7 +157,7 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     initPath();
     initSparkContexts();
     initTestDataGenerator();
-    initFileSystem();
+    initHoodieStorage();
     initMetaClient();
     initTimelineService();
   }
@@ -195,11 +198,12 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
 
     // Initialize a local spark env
     SparkConf sc = HoodieClientTestUtils.getSparkConfForTest(appName + "#" + testMethodName);
+    extraConf.forEach(sc::set);
     SparkContext sparkContext = new SparkContext(sc);
     HoodieClientTestUtils.overrideSparkHadoopConfiguration(sparkContext);
     jsc = new JavaSparkContext(sparkContext);
     jsc.setLogLevel("ERROR");
-    hadoopConf = jsc.hadoopConfiguration();
+    storageConf = HadoopFSUtils.getStorageConf(jsc.hadoopConfiguration());
     sparkSession = SparkSession.builder()
         .withExtensions(JFunction.toScala(sparkSessionExtensions -> {
           sparkSessionExtensionsInjector.ifPresent(injector -> injector.accept(sparkSessionExtensions));
@@ -208,12 +212,13 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
         .config(jsc.getConf())
         .getOrCreate();
 
-    sqlContext = new SQLContext(sparkSession);
+    sqlContext = SQLContext.getOrCreate(sparkContext);
     context = new HoodieSparkEngineContext(jsc, sqlContext);
 
     // NOTE: It's important to set Spark's `Tests.IS_TESTING` so that our tests are recognized
     //       as such by Spark
     System.setProperty("spark.testing", "true");
+    sparkSession.sparkContext().persistentRdds().foreach(rdd -> rdd._2.persist());
   }
 
   /**
@@ -224,25 +229,32 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     initSparkContexts(this.getClass().getSimpleName());
   }
 
+  protected void initQueryIndexConf() {
+    extraConf.put("hoodie.fileIndex.dataSkippingFailureMode", "strict");
+  }
+
   /**
    * Cleanups Spark contexts ({@link JavaSparkContext} and {@link SQLContext}).
    */
   protected void cleanupSparkContexts() {
-    if (sqlContext != null) {
-      LOG.info("Clearing sql context cache of spark-session used in previous test-case");
-      sqlContext.clearCache();
-      sqlContext = null;
+    if (sparkSession != null) {
+      sparkSession.stop();
       sparkSession = null;
     }
 
+    // SparkSession.stop() should clean the necessary resources.
+    if (sqlContext != null) {
+      sqlContext = null;
+    }
+
     if (jsc != null) {
-      LOG.info("Closing spark context used in previous test-case");
+      log.info("Closing spark context used in previous test-case");
       jsc.stop();
       jsc = null;
     }
 
     if (context != null) {
-      LOG.info("Closing spark engine context used in previous test-case");
+      log.info("Closing spark engine context used in previous test-case");
       context = null;
     }
   }
@@ -250,19 +262,19 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
   /**
    * Initializes a file system with the hadoop configuration of Spark context.
    */
-  protected void initFileSystem() {
+  protected void initHoodieStorage() {
     if (jsc == null) {
       throw new IllegalStateException("The Spark context has not been initialized.");
     }
 
-    initFileSystemWithConfiguration(hadoopConf);
+    initFileSystemWithConfiguration(storageConf);
   }
 
   /**
    * Initializes file system with a default empty configuration.
    */
   protected void initFileSystemWithDefaultConfiguration() {
-    initFileSystemWithConfiguration(new Configuration());
+    initFileSystemWithConfiguration(getDefaultStorageConf());
   }
 
   /**
@@ -271,10 +283,10 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
    * @throws IOException
    */
   protected void cleanupFileSystem() throws IOException {
-    if (fs != null) {
-      LOG.warn("Closing file-system instance used in previous test-run");
-      fs.close();
-      fs = null;
+    if (storage != null) {
+      log.warn("Closing file-system instance used in previous test-run");
+      storage.close();
+      storage = null;
     }
   }
 
@@ -309,7 +321,7 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     if (tableName != null && !tableName.isEmpty()) {
       properties.put(HoodieTableConfig.NAME.key(), tableName);
     }
-    metaClient = HoodieTestUtils.init(hadoopConf, basePath, tableType, properties);
+    metaClient = HoodieTestUtils.init(storageConf, basePath, tableType, properties);
   }
 
   /**
@@ -373,18 +385,18 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     }
   }
 
-  private void initFileSystemWithConfiguration(Configuration configuration) {
+  private void initFileSystemWithConfiguration(StorageConfiguration<?> configuration) {
     if (basePath == null) {
       throw new IllegalStateException("The base path has not been initialized.");
     }
 
-    fs = HadoopFSUtils.getFs(basePath, configuration);
+    storage = HoodieStorageUtils.getStorage(basePath, configuration);
+    FileSystem fs = (FileSystem) storage.getFileSystem();
     if (fs instanceof LocalFileSystem) {
-      LocalFileSystem lfs = (LocalFileSystem) fs;
       // With LocalFileSystem, with checksum disabled, fs.open() returns an inputStream which is FSInputStream
       // This causes ClassCastExceptions in LogRecordScanner (and potentially other places) calling fs.open
       // So, for the tests, we enforce checksum verification to circumvent the problem
-      lfs.setVerifyChecksum(true);
+      ((LocalFileSystem) fs).setVerifyChecksum(true);
     }
   }
 
@@ -393,8 +405,13 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     return readClient;
   }
 
+  @Override
   public SparkRDDWriteClient getHoodieWriteClient(HoodieWriteConfig cfg) {
-    if (null != writeClient) {
+    return getHoodieWriteClient(cfg, true);
+  }
+
+  public SparkRDDWriteClient getHoodieWriteClient(HoodieWriteConfig cfg, boolean shouldCloseOlderClient) {
+    if (null != writeClient && shouldCloseOlderClient) {
       writeClient.close();
       writeClient = null;
     }
@@ -402,17 +419,18 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     return writeClient;
   }
 
-  public HoodieTableMetaClient getHoodieMetaClient(Configuration conf, String basePath) {
-    metaClient = HoodieTableMetaClient.builder().setConf(conf).setBasePath(basePath).build();
+  public HoodieTableMetaClient getHoodieMetaClient(StorageConfiguration<?> conf, String basePath) {
+    metaClient = HoodieTestUtils.createMetaClient(conf, basePath);
     return metaClient;
   }
 
-  public HoodieTableFileSystemView getHoodieTableFileSystemView(HoodieTableMetaClient metaClient, HoodieTimeline visibleActiveTimeline,
-                                                                FileStatus[] fileStatuses) {
+  public HoodieTableFileSystemView getHoodieTableFileSystemView(HoodieTableMetaClient metaClient,
+                                                                HoodieTimeline visibleActiveTimeline,
+                                                                List<StoragePathInfo> pathInfoList) {
     if (tableView == null) {
-      tableView = new HoodieTableFileSystemView(metaClient, visibleActiveTimeline, fileStatuses);
+      tableView = new HoodieTableFileSystemView(metaClient, visibleActiveTimeline, pathInfoList);
     } else {
-      tableView.init(metaClient, visibleActiveTimeline, fileStatuses);
+      tableView.init(metaClient, visibleActiveTimeline, pathInfoList);
     }
     return tableView;
   }
@@ -432,7 +450,7 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     return HoodieJavaRDD.getJavaRDD(index.tagLocation(HoodieJavaRDD.of(records), context, table));
   }
 
-  public static Pair<HashMap<String, WorkloadStat>, WorkloadStat> buildProfile(JavaRDD<HoodieRecord> inputRecordsRDD) {
+  public static Pair<Map<String, WorkloadStat>, WorkloadStat> buildProfile(JavaRDD<HoodieRecord> inputRecordsRDD) {
     HashMap<String, WorkloadStat> partitionPathStatMap = new HashMap<>();
     WorkloadStat globalStat = new WorkloadStat();
 
@@ -464,6 +482,18 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
       }
     }
     return Pair.of(partitionPathStatMap, globalStat);
+  }
+
+  @Override
+  protected List<WriteStatus> writeAndVerifyBatch(BaseHoodieWriteClient client, List<HoodieRecord> inserts, String commitTime, boolean populateMetaFields, boolean autoCommitOff) {
+    WriteClientTestUtils.startCommitWithTime(client, commitTime);
+    JavaRDD<HoodieRecord> insertRecordsRDD1 = jsc.parallelize(inserts, 2);
+    List<WriteStatus> statusList = ((SparkRDDWriteClient) client).upsert(insertRecordsRDD1, commitTime).collect();
+    client.commit(commitTime, jsc.parallelize(statusList, 1));
+    assertNoWriteErrors(statusList);
+    verifyRecordsWritten(commitTime, populateMetaFields, inserts, statusList, client.getConfig(),
+        HoodieSparkKeyGeneratorFactory.createKeyGenerator(client.getConfig().getProps()));
+    return statusList;
   }
 
   /**
@@ -505,13 +535,17 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     metaClient = HoodieTableMetaClient.reload(metaClient);
     HoodieTable table = HoodieSparkTable.create(writeConfig, engineContext);
     TableFileSystemView tableView = table.getHoodieView();
-    List<String> fullPartitionPaths = fsPartitions.stream().map(partition -> basePath + "/" + partition).collect(Collectors.toList());
-    Map<String, FileStatus[]> partitionToFilesMap = tableMetadata.getAllFilesInPartitions(fullPartitionPaths);
+    List<String> fullPartitionPaths =
+        fsPartitions.stream().map(partition -> basePath + "/" + partition)
+            .collect(Collectors.toList());
+    Map<String, List<StoragePathInfo>> partitionToFilesMap =
+        tableMetadata.getAllFilesInPartitions(fullPartitionPaths);
     assertEquals(fsPartitions.size(), partitionToFilesMap.size());
 
     fsPartitions.forEach(partition -> {
       try {
-        validateFilesPerPartition(testTable, tableMetadata, tableView, partitionToFilesMap, partition);
+        validateFilesPerPartition(testTable, tableMetadata, tableView, partitionToFilesMap,
+            partition);
       } catch (IOException e) {
         fail("Exception should not be raised: " + e);
       }
@@ -520,16 +554,16 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
       runFullValidation(table.getConfig().getMetadataConfig(), writeConfig, metadataTableBasePath, engineContext);
     }
 
-    LOG.info("Validation time=" + timer.endTimer());
+    log.info("Validation time={}", timer.endTimer());
   }
 
   public void syncTableMetadata(HoodieWriteConfig writeConfig) {
-    if (!writeConfig.getMetadataConfig().enabled()) {
+    if (!writeConfig.getMetadataConfig().isEnabled()) {
       return;
     }
     // Open up the metadata table again, for syncing
-    try (HoodieTableMetadataWriter writer = SparkHoodieBackedTableMetadataWriter.create(hadoopConf, writeConfig, context)) {
-      LOG.info("Successfully synced to metadata table");
+    try (HoodieTableMetadataWriter writer = SparkHoodieBackedTableMetadataWriter.create(storageConf, writeConfig, context)) {
+      log.info("Successfully synced to metadata table");
     } catch (Exception e) {
       throw new HoodieMetadataException("Error syncing to metadata table.", e);
     }
@@ -537,54 +571,59 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
 
   public HoodieBackedTableMetadataWriter metadataWriter(HoodieWriteConfig clientConfig) {
     return (HoodieBackedTableMetadataWriter) SparkHoodieBackedTableMetadataWriter
-        .create(hadoopConf, clientConfig, new HoodieSparkEngineContext(jsc));
+        .create(storageConf, clientConfig, new HoodieSparkEngineContext(jsc));
   }
 
-  public HoodieTableMetadata metadata(HoodieWriteConfig clientConfig, HoodieEngineContext hoodieEngineContext) {
-    return HoodieTableMetadata.create(hoodieEngineContext, clientConfig.getMetadataConfig(), clientConfig.getBasePath());
+  public HoodieTableMetadata metadata(HoodieWriteConfig clientConfig,
+                                      HoodieEngineContext hoodieEngineContext) {
+    return metaClient.getTableFormat().getMetadataFactory().create(
+        hoodieEngineContext, storage, clientConfig.getMetadataConfig(), clientConfig.getBasePath());
   }
 
-  protected void validateFilesPerPartition(HoodieTestTable testTable, HoodieTableMetadata tableMetadata, TableFileSystemView tableView,
-                                           Map<String, FileStatus[]> partitionToFilesMap, String partition) throws IOException {
-    Path partitionPath;
+  protected void validateFilesPerPartition(HoodieTestTable testTable,
+                                           HoodieTableMetadata tableMetadata,
+                                           TableFileSystemView tableView,
+                                           Map<String, List<StoragePathInfo>> partitionToFilesMap,
+                                           String partition) throws IOException {
+    StoragePath partitionPath;
     if (partition.equals("")) {
       // Should be the non-partitioned case
-      partitionPath = new Path(basePath);
+      partitionPath = new StoragePath(basePath);
     } else {
-      partitionPath = new Path(basePath, partition);
+      partitionPath = new StoragePath(basePath, partition);
     }
 
     FileStatus[] fsStatuses = testTable.listAllFilesInPartition(partition);
-    FileStatus[] metaStatuses = tableMetadata.getAllFilesInPartition(partitionPath);
+    List<StoragePathInfo> metaFilesList = tableMetadata.getAllFilesInPartition(partitionPath);
     List<String> fsFileNames = Arrays.stream(fsStatuses)
         .map(s -> s.getPath().getName()).collect(Collectors.toList());
-    List<String> metadataFilenames = Arrays.stream(metaStatuses)
+    List<String> metadataFilenames = metaFilesList.stream()
         .map(s -> s.getPath().getName()).collect(Collectors.toList());
     Collections.sort(fsFileNames);
     Collections.sort(metadataFilenames);
 
     assertLinesMatch(fsFileNames, metadataFilenames);
-    assertEquals(fsStatuses.length, partitionToFilesMap.get(partitionPath.toString()).length);
+    assertEquals(fsStatuses.length, partitionToFilesMap.get(partitionPath.toString()).size());
 
     // Block sizes should be valid
-    Arrays.stream(metaStatuses).forEach(s -> assertTrue(s.getBlockSize() > 0));
+    metaFilesList.forEach(s -> assertTrue(s.getBlockSize() > 0));
     List<Long> fsBlockSizes = Arrays.stream(fsStatuses).map(FileStatus::getBlockSize).sorted().collect(Collectors.toList());
-    List<Long> metadataBlockSizes = Arrays.stream(metaStatuses).map(FileStatus::getBlockSize).sorted().collect(Collectors.toList());
+    List<Long> metadataBlockSizes = metaFilesList.stream().map(StoragePathInfo::getBlockSize).sorted().collect(Collectors.toList());
     assertEquals(fsBlockSizes, metadataBlockSizes);
 
-    assertEquals(fsFileNames.size(), metadataFilenames.size(), "Files within partition " + partition + " should match");
-    assertEquals(fsFileNames, metadataFilenames, "Files within partition " + partition + " should match");
+    assertEquals(fsFileNames.size(), metadataFilenames.size(),
+        "Files within partition " + partition + " should match");
+    assertEquals(fsFileNames, metadataFilenames,
+        "Files within partition " + partition + " should match");
 
     // FileSystemView should expose the same data
-    List<HoodieFileGroup> fileGroups = tableView.getAllFileGroups(partition).collect(Collectors.toList());
+    List<HoodieFileGroup> fileGroups =
+        tableView.getAllFileGroups(partition).collect(Collectors.toList());
     fileGroups.addAll(tableView.getAllReplacedFileGroups(partition).collect(Collectors.toList()));
 
-    fileGroups.forEach(g -> LoggerFactory.getLogger(getClass()).info(g.toString()));
-    fileGroups.forEach(g -> g.getAllBaseFiles().forEach(b -> LoggerFactory.getLogger(getClass()).info(b.toString())));
-    fileGroups.forEach(g -> g.getAllFileSlices().forEach(s -> LoggerFactory.getLogger(getClass()).info(s.toString())));
-
     long numFiles = fileGroups.stream()
-        .mapToLong(g -> g.getAllBaseFiles().count() + g.getAllFileSlices().mapToLong(s -> s.getLogFiles().count()).sum())
+        .mapToLong(g -> g.getAllBaseFiles().count()
+            + g.getAllFileSlices().mapToLong(s -> s.getLogFiles().count()).sum())
         .sum();
     assertEquals(metadataFilenames.size(), numFiles);
   }
@@ -600,7 +639,7 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     HoodieWriteConfig metadataWriteConfig = metadataWriter.getWriteConfig();
     assertFalse(metadataWriteConfig.isMetadataTableEnabled(), "No metadata table for metadata table");
 
-    HoodieTableMetaClient metadataMetaClient = HoodieTableMetaClient.builder().setConf(hadoopConf).setBasePath(metadataTableBasePath).build();
+    HoodieTableMetaClient metadataMetaClient = HoodieTestUtils.createMetaClient(storageConf, metadataTableBasePath);
 
     // Metadata table is MOR
     assertEquals(metadataMetaClient.getTableType(), HoodieTableType.MERGE_ON_READ, "Metadata Table should be MOR");
@@ -608,24 +647,14 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
     // Metadata table has a fixed number of partitions
     // Cannot use FSUtils.getAllFoldersWithPartitionMetaFile for this as that function filters all directory
     // in the .hoodie folder.
-    List<String> metadataTablePartitions = FSUtils.getAllPartitionPaths(engineContext, HoodieTableMetadata.getMetadataTableBasePath(basePath), false);
-
-    List<MetadataPartitionType> enabledPartitionTypes = metadataWriter.getEnabledPartitionTypes();
-
-    assertEquals(enabledPartitionTypes.size(), metadataTablePartitions.size());
-
-    Map<String, MetadataPartitionType> partitionTypeMap = enabledPartitionTypes.stream()
-        .collect(Collectors.toMap(MetadataPartitionType::getPartitionPath, Function.identity()));
+    List<String> metadataTablePartitions = FSUtils.getAllPartitionPaths(engineContext, metadataMetaClient, false);
 
     // Metadata table should automatically compact and clean
     // versions are +1 as autoClean / compaction happens end of commits
     int numFileVersions = metadataWriteConfig.getCleanerFileVersionsRetained() + 1;
-    HoodieTableFileSystemView fsView = new HoodieTableFileSystemView(metadataMetaClient, metadataMetaClient.getActiveTimeline());
+    HoodieTableFileSystemView fsView = HoodieTableFileSystemView.fileListingBasedFileSystemView(engineContext, metadataMetaClient, metadataMetaClient.getActiveTimeline());
     metadataTablePartitions.forEach(partition -> {
-      MetadataPartitionType partitionType = partitionTypeMap.get(partition);
-
       List<FileSlice> latestSlices = fsView.getLatestFileSlices(partition).collect(Collectors.toList());
-
       assertTrue(latestSlices.stream().map(FileSlice::getBaseFile).filter(Objects::nonNull).count() > 0, "Should have a single latest base file");
       assertTrue(latestSlices.size() > 0, "Should have a single latest file slice");
       assertTrue(latestSlices.size() <= numFileVersions, "Should limit file slice to "
@@ -643,7 +672,7 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
 
   public HoodieInstant createCleanMetadata(String instantTime, boolean inflightOnly, boolean isEmptyForAll, boolean isEmptyCompleted) throws IOException {
     HoodieCleanerPlan cleanerPlan = new HoodieCleanerPlan(new HoodieActionInstant("", "", ""), "", "",
-            new HashMap<>(), CleanPlanV2MigrationHandler.VERSION, new HashMap<>(), new ArrayList<>());
+            new HashMap<>(), CleanPlanV2MigrationHandler.VERSION, new HashMap<>(), new ArrayList<>(), Collections.EMPTY_MAP);
     if (inflightOnly) {
       HoodieTestTable.of(metaClient).addInflightClean(instantTime, cleanerPlan);
     } else {
@@ -655,9 +684,17 @@ public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTes
               Collections.emptyList(),
               instantTime,
               "");
-      HoodieCleanMetadata cleanMetadata = convertCleanMetadata(instantTime, Option.of(0L), Collections.singletonList(cleanStats));
+      HoodieCleanMetadata cleanMetadata = convertCleanMetadata(instantTime, Option.of(0L), Collections.singletonList(cleanStats), Collections.EMPTY_MAP);
       HoodieTestTable.of(metaClient).addClean(instantTime, cleanerPlan, cleanMetadata, isEmptyForAll, isEmptyCompleted);
     }
-    return new HoodieInstant(inflightOnly, "clean", instantTime);
+    return INSTANT_GENERATOR.createNewInstant(inflightOnly ? HoodieInstant.State.INFLIGHT : HoodieInstant.State.COMPLETED, "clean", instantTime);
+  }
+
+  protected HoodieTableMetaClient createMetaClient(SparkSession spark, String basePath) {
+    return HoodieClientTestUtils.createMetaClient(spark, basePath);
+  }
+
+  protected HoodieTableMetaClient createMetaClient(JavaSparkContext context, String basePath) {
+    return HoodieClientTestUtils.createMetaClient(context, basePath);
   }
 }

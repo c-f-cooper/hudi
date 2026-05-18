@@ -21,14 +21,14 @@ package org.apache.hudi.common.table.log;
 import org.apache.hudi.common.model.HoodieAvroIndexedRecord;
 import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.model.HoodieRecord.HoodieRecordType;
+import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.table.log.block.HoodieDataBlock;
 import org.apache.hudi.common.util.collection.ClosableIterator;
 import org.apache.hudi.common.util.collection.CloseableMappingIterator;
 import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.storage.HoodieStorage;
 
-import org.apache.avro.Schema;
 import org.apache.avro.generic.IndexedRecord;
-import org.apache.hadoop.fs.FileSystem;
 
 import java.io.IOException;
 import java.util.Arrays;
@@ -39,9 +39,9 @@ import java.util.Iterator;
  */
 public class HoodieCDCLogRecordIterator implements ClosableIterator<IndexedRecord> {
 
-  private final FileSystem fs;
+  private final HoodieStorage storage;
 
-  private final Schema cdcSchema;
+  private final HoodieSchema cdcSchema;
 
   private final Iterator<HoodieLogFile> cdcLogFileIter;
 
@@ -51,8 +51,8 @@ public class HoodieCDCLogRecordIterator implements ClosableIterator<IndexedRecor
 
   private IndexedRecord record;
 
-  public HoodieCDCLogRecordIterator(FileSystem fs, HoodieLogFile[] cdcLogFiles, Schema cdcSchema) {
-    this.fs = fs;
+  public HoodieCDCLogRecordIterator(HoodieStorage storage, HoodieLogFile[] cdcLogFiles, HoodieSchema cdcSchema) {
+    this.storage = storage;
     this.cdcSchema = cdcSchema;
     this.cdcLogFileIter = Arrays.stream(cdcLogFiles).iterator();
   }
@@ -82,8 +82,7 @@ public class HoodieCDCLogRecordIterator implements ClosableIterator<IndexedRecor
     try {
       closeReader();
       if (cdcLogFileIter.hasNext()) {
-        reader = new HoodieLogFileReader(fs, cdcLogFileIter.next(), cdcSchema,
-            HoodieLogFileReader.DEFAULT_BUFFER_SIZE, false);
+        reader = new HoodieLogFileReader(storage, cdcLogFileIter.next(), cdcSchema, HoodieLogFileReader.DEFAULT_BUFFER_SIZE);
         return reader.hasNext();
       }
       return false;

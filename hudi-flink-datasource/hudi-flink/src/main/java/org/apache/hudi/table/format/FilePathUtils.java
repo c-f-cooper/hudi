@@ -20,7 +20,7 @@ package org.apache.hudi.table.format;
 
 import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.hadoop.fs.HadoopFSUtils;
-import org.apache.hudi.storage.HoodieLocation;
+import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.util.DataTypeUtils;
 
 import org.apache.flink.api.java.tuple.Tuple2;
@@ -99,7 +99,7 @@ public class FilePathUtils {
     int i = 0;
     for (Map.Entry<String, String> e : partitionKVs.entrySet()) {
       if (i > 0) {
-        suffixBuf.append(HoodieLocation.SEPARATOR);
+        suffixBuf.append(StoragePath.SEPARATOR);
       }
       if (hivePartition) {
         suffixBuf.append(escapePathName(e.getKey()));
@@ -109,7 +109,7 @@ public class FilePathUtils {
       i++;
     }
     if (sepSuffix) {
-      suffixBuf.append(HoodieLocation.SEPARATOR);
+      suffixBuf.append(StoragePath.SEPARATOR);
     }
     return suffixBuf.toString();
   }
@@ -403,8 +403,8 @@ public class FilePathUtils {
     if (partitionKeys.isEmpty()) {
       return new Path[] {path};
     } else {
-      final String defaultParName = conf.getString(FlinkOptions.PARTITION_DEFAULT_NAME);
-      final boolean hivePartition = conf.getBoolean(FlinkOptions.HIVE_STYLE_PARTITIONING);
+      final String defaultParName = conf.get(FlinkOptions.PARTITION_DEFAULT_NAME);
+      final boolean hivePartition = conf.get(FlinkOptions.HIVE_STYLE_PARTITIONING);
       List<Map<String, String>> partitionPaths =
           getPartitions(path, hadoopConf, partitionKeys, defaultParName, hivePartition);
       return partitionPath2ReadPath(path, partitionKeys, partitionPaths, hivePartition);
@@ -466,6 +466,10 @@ public class FilePathUtils {
     return new org.apache.flink.core.fs.Path(path.toUri());
   }
 
+  public static org.apache.flink.core.fs.Path toFlinkPath(StoragePath path) {
+    return new org.apache.flink.core.fs.Path(path.toUri());
+  }
+
   /**
    * Extracts the partition keys with given configuration.
    *
@@ -476,7 +480,7 @@ public class FilePathUtils {
     if (FlinkOptions.isDefaultValueDefined(conf, FlinkOptions.PARTITION_PATH_FIELD)) {
       return new String[0];
     }
-    return conf.getString(FlinkOptions.PARTITION_PATH_FIELD).split(",");
+    return conf.get(FlinkOptions.PARTITION_PATH_FIELD).split(",");
   }
 
   /**
@@ -489,7 +493,7 @@ public class FilePathUtils {
     if (FlinkOptions.isDefaultValueDefined(conf, FlinkOptions.HIVE_SYNC_PARTITION_FIELDS)) {
       return extractPartitionKeys(conf);
     }
-    return conf.getString(FlinkOptions.HIVE_SYNC_PARTITION_FIELDS).split(",");
+    return conf.get(FlinkOptions.HIVE_SYNC_PARTITION_FIELDS).split(",");
   }
 
   public static boolean isHiveStylePartitioning(String path) {

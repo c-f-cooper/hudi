@@ -19,13 +19,16 @@
 package org.apache.hudi.sink.bucket;
 
 import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.index.bucket.BucketIdentifier;
+import org.apache.hudi.index.bucket.partition.NumBucketsFunction;
 import org.apache.hudi.io.storage.row.HoodieRowDataCreateHandle;
 import org.apache.hudi.sink.bulk.BulkInsertWriterHelper;
 import org.apache.hudi.sink.bulk.RowDataKeyGen;
 import org.apache.hudi.sink.bulk.sort.SortOperatorGen;
 import org.apache.hudi.table.HoodieTable;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.data.GenericRowData;
@@ -33,8 +36,6 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Map;
@@ -42,8 +43,8 @@ import java.util.Map;
 /**
  * Helper class for bucket index bulk insert used by Flink.
  */
+@Slf4j
 public class BucketBulkInsertWriterHelper extends BulkInsertWriterHelper {
-  private static final Logger LOG = LoggerFactory.getLogger(BucketBulkInsertWriterHelper.class);
   public static final String FILE_GROUP_META_FIELD = "_fg";
 
   private final int recordArity;
@@ -63,14 +64,14 @@ public class BucketBulkInsertWriterHelper extends BulkInsertWriterHelper {
       String partitionPath = keyGen.getPartitionPath(record);
       String fileId = tuple.getString(0).toString();
       if ((lastFileId == null) || !lastFileId.equals(fileId)) {
-        LOG.info("Creating new file for partition path " + partitionPath);
+        log.info("Creating new file for partition path " + partitionPath);
         handle = getRowCreateHandle(partitionPath, fileId);
         lastFileId = fileId;
       }
       handle.write(recordKey, partitionPath, record);
     } catch (Throwable throwable) {
       IOException ioException = new IOException("Exception happened when bulk insert.", throwable);
-      LOG.error("Global error thrown while trying to write records in HoodieRowDataCreateHandle", ioException);
+      log.error("Global error thrown while trying to write records in HoodieRowDataCreateHandle", ioException);
       throw ioException;
     }
   }
@@ -82,7 +83,7 @@ public class BucketBulkInsertWriterHelper extends BulkInsertWriterHelper {
         close();
       }
       HoodieRowDataCreateHandle rowCreateHandle = new HoodieRowDataCreateHandle(hoodieTable, writeConfig, partitionPath, fileId,
-          instantTime, taskPartitionId, totalSubtaskNum, taskEpochId, rowType, preserveHoodieMetadata);
+          instantTime, taskPartitionId, totalSubtaskNum, taskEpochId, rowType, preserveHoodieMetadata, isAppendMode && !populateMetaFields);
       handles.put(fileId, rowCreateHandle);
     }
     return handles.get(fileId);
@@ -92,16 +93,20 @@ public class BucketBulkInsertWriterHelper extends BulkInsertWriterHelper {
     return new SortOperatorGen(rowType, new String[] {FILE_GROUP_META_FIELD});
   }
 
-  private static String getFileId(Map<String, String> bucketIdToFileId, RowDataKeyGen keyGen, RowData record, String indexKeys, int numBuckets, boolean needFixedFileIdSuffix) {
+  private static String getFileId(Map<String, String> bucketIdToFileId, RowDataKeyGen keyGen, RowData record, String indexKeys, Configuration conf, boolean needFixedFileIdSuffix) {
     String recordKey = keyGen.getRecordKey(record);
     String partition = keyGen.getPartitionPath(record);
+    NumBucketsFunction numBucketsFunction = new NumBucketsFunction(conf.get(FlinkOptions.BUCKET_INDEX_PARTITION_EXPRESSIONS), conf.get(FlinkOptions.BUCKET_INDEX_PARTITION_RULE),
+        conf.get(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS));
+
+    final int numBuckets = numBucketsFunction.getNumBuckets(partition);
     final int bucketNum = BucketIdentifier.getBucketId(recordKey, indexKeys, numBuckets);
     String bucketId = partition + bucketNum;
-    return bucketIdToFileId.computeIfAbsent(bucketId, k -> BucketIdentifier.newBucketFileIdPrefix(bucketNum, needFixedFileIdSuffix));
+    return bucketIdToFileId.computeIfAbsent(bucketId, k -> needFixedFileIdSuffix ? BucketIdentifier.newBucketFileIdForNBCC(bucketNum) : BucketIdentifier.newBucketFileIdPrefix(bucketNum));
   }
 
-  public static RowData rowWithFileId(Map<String, String> bucketIdToFileId, RowDataKeyGen keyGen, RowData record, String indexKeys, int numBuckets, boolean needFixedFileIdSuffix) {
-    final String fileId = getFileId(bucketIdToFileId, keyGen, record, indexKeys, numBuckets, needFixedFileIdSuffix);
+  public static RowData rowWithFileId(Map<String, String> bucketIdToFileId, RowDataKeyGen keyGen, RowData record, String indexKeys, Configuration conf, boolean needFixedFileIdSuffix) {
+    final String fileId = getFileId(bucketIdToFileId, keyGen, record, indexKeys, conf, needFixedFileIdSuffix);
     return GenericRowData.of(StringData.fromString(fileId), record);
   }
 

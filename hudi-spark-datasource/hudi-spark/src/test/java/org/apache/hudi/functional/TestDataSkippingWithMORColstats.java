@@ -24,6 +24,8 @@ import org.apache.hudi.DataSourceWriteOptions;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
 import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.util.Option;
@@ -54,7 +56,8 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static org.apache.hudi.common.testutils.RawTripTestPayload.recordToString;
+import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.recordToString;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.INSTANT_FILE_NAME_GENERATOR;
 import static org.apache.hudi.config.HoodieCompactionConfig.INLINE_COMPACT_NUM_DELTA_COMMITS;
 import static org.apache.spark.sql.SaveMode.Append;
 import static org.apache.spark.sql.SaveMode.Overwrite;
@@ -91,7 +94,10 @@ public class TestDataSkippingWithMORColstats extends HoodieSparkClientTestBase {
     Properties props = new Properties();
     props.putAll(options);
     try {
-      metaClient = HoodieTableMetaClient.initTableAndGetMetaClient(hadoopConf, basePath.toString(), props);
+      metaClient = HoodieTableMetaClient.newTableBuilder()
+          .fromProperties(props)
+          .setTableType(HoodieTableType.MERGE_ON_READ.name())
+          .initTable(storageConf.newInstance(), basePath.toString());
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
@@ -109,6 +115,10 @@ public class TestDataSkippingWithMORColstats extends HoodieSparkClientTestBase {
    */
   @Test
   public void testBaseFileOnly() {
+    // note that this config is here just to test that it does nothing since
+    // we have specified which columns to index
+    options.put(HoodieMetadataConfig.COLUMN_STATS_INDEX_MAX_COLUMNS.key(), "1");
+
     Dataset<Row> inserts = makeInsertDf("000", 100);
     Dataset<Row> batch1 = inserts.where(matchCond);
     Dataset<Row> batch2 = inserts.where(nonMatchCond);
@@ -321,7 +331,7 @@ public class TestDataSkippingWithMORColstats extends HoodieSparkClientTestBase {
     options.put(DataSourceReadOptions.ENABLE_DATA_SKIPPING().key(), "true");
     options.put(DataSourceWriteOptions.TABLE_TYPE().key(), DataSourceWriteOptions.MOR_TABLE_TYPE_OPT_VAL());
     options.put(HoodieWriteConfig.TBL_NAME.key(), "testTable");
-    options.put(DataSourceWriteOptions.PRECOMBINE_FIELD().key(), "timestamp");
+    options.put(HoodieTableConfig.ORDERING_FIELDS.key(), "timestamp");
     options.put(DataSourceWriteOptions.RECORDKEY_FIELD().key(), "_row_key");
     options.put("hoodie.datasource.write.keygenerator.class", "org.apache.hudi.keygen.NonpartitionedKeyGenerator");
     options.put(HoodieCompactionConfig.PARQUET_SMALL_FILE_LIMIT.key(), "0");
@@ -333,7 +343,6 @@ public class TestDataSkippingWithMORColstats extends HoodieSparkClientTestBase {
   private void scheduleCompaction() {
     HoodieWriteConfig cfg = HoodieWriteConfig.newBuilder().withPath(basePath.toString())
         .withRollbackUsingMarkers(false)
-        .withAutoCommit(false)
         .withMetadataConfig(HoodieMetadataConfig.newBuilder()
             .enable(true)
             .withMetadataIndexColumnStats(true)
@@ -344,7 +353,7 @@ public class TestDataSkippingWithMORColstats extends HoodieSparkClientTestBase {
         .withKeyGenerator("org.apache.hudi.keygen.NonpartitionedKeyGenerator")
         .build();
     try (SparkRDDWriteClient client = getHoodieWriteClient(cfg)) {
-      client.scheduleCompactionAtInstant(client.createNewInstantTime(), Option.empty());
+      client.scheduleCompaction(Option.empty());
     }
   }
 
@@ -468,8 +477,8 @@ public class TestDataSkippingWithMORColstats extends HoodieSparkClientTestBase {
   }
 
   public void deleteLatestDeltacommit() {
-    String filename = metaClient.getActiveTimeline().lastInstant().get().getFileName();
-    File deltacommit = new File(metaClient.getBasePathV2() + "/.hoodie/" + filename);
+    String filename = INSTANT_FILE_NAME_GENERATOR.getFileName(metaClient.getActiveTimeline().lastInstant().get());
+    File deltacommit = new File(metaClient.getBasePath() + "/.hoodie/timeline/" + filename);
     deltacommit.delete();
   }
 

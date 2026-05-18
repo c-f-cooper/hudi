@@ -19,14 +19,19 @@
 package org.apache.hudi.utilities.sources;
 
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
+import org.apache.hudi.utilities.config.ORCDFSSourceConfig;
 import org.apache.hudi.utilities.schema.SchemaProvider;
 import org.apache.hudi.utilities.sources.helpers.DFSPathSelector;
+
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+
+import static org.apache.hudi.common.util.ConfigUtils.getBooleanWithAltKeys;
 
 /**
  * DFS Source that reads ORC data.
@@ -42,15 +47,16 @@ public class ORCDFSSource extends RowSource {
   }
 
   @Override
-  public Pair<Option<Dataset<Row>>, String> fetchNextBatch(Option<String> lastCkptStr, long sourceLimit) {
-    Pair<Option<String>, String> selectPathsWithMaxModificationTime =
-        pathSelector.getNextFilePathsAndMaxModificationTime(sparkContext, lastCkptStr, sourceLimit);
+  public Pair<Option<Dataset<Row>>, Checkpoint> fetchNextBatch(Option<Checkpoint> lastCheckpoint, long sourceLimit) {
+    Pair<Option<String>, Checkpoint> selectPathsWithMaxModificationTime =
+        pathSelector.getNextFilePathsAndMaxModificationTime(sparkContext, lastCheckpoint, sourceLimit);
     return selectPathsWithMaxModificationTime.getLeft()
         .map(pathStr -> Pair.of(Option.of(fromFiles(pathStr)), selectPathsWithMaxModificationTime.getRight()))
         .orElseGet(() -> Pair.of(Option.empty(), selectPathsWithMaxModificationTime.getRight()));
   }
 
   private Dataset<Row> fromFiles(String pathStr) {
-    return sparkSession.read().orc(pathStr.split(","));
+    boolean mergeSchemaEnabled = getBooleanWithAltKeys(this.props, ORCDFSSourceConfig.ORC_DFS_MERGE_SCHEMA);
+    return sparkSession.read().option("mergeSchema", mergeSchemaEnabled).orc(pathStr.split(","));
   }
 }

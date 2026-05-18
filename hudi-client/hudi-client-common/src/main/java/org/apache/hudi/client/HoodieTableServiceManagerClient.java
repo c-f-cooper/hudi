@@ -28,10 +28,9 @@ import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.exception.HoodieRemoteException;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.http.client.fluent.Request;
 import org.apache.http.client.utils.URIBuilder;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
@@ -41,6 +40,7 @@ import java.util.Map;
 /**
  * Client that sends the table service action instants to the table service manager.
  */
+@Slf4j
 public class HoodieTableServiceManagerClient {
 
   public enum Action {
@@ -79,10 +79,8 @@ public class HoodieTableServiceManagerClient {
   private final String dbName;
   private final String tableName;
 
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieTableServiceManagerClient.class);
-
   public HoodieTableServiceManagerClient(HoodieTableMetaClient metaClient, HoodieTableServiceManagerConfig config) {
-    this.basePath = metaClient.getBasePathV2().toString();
+    this.basePath = metaClient.getBasePath().toString();
     this.dbName = metaClient.getTableConfig().getDatabaseName();
     this.tableName = metaClient.getTableConfig().getTableName();
     this.uri = config.getTableServiceManagerURIs();
@@ -95,7 +93,7 @@ public class HoodieTableServiceManagerClient {
     queryParameters.forEach(builder::addParameter);
 
     String url = builder.toString();
-    LOG.info("Sending request to table management service : (" + url + ")");
+    log.info("Sending request to table management service : (" + url + ")");
     int timeoutMs = this.config.getConnectionTimeoutSec() * 1000;
     int requestRetryLimit = config.getConnectionRetryLimit();
     int connectionRetryDelay = config.getConnectionRetryDelay();
@@ -119,7 +117,7 @@ public class HoodieTableServiceManagerClient {
       String instantRange = StringUtils.join(metaClient.reloadActiveTimeline()
           .filterPendingCompactionTimeline()
           .getInstantsAsStream()
-          .map(HoodieInstant::getTimestamp)
+          .map(HoodieInstant::requestedTime)
           .toArray(String[]::new), ",");
 
       executeRequest(EXECUTE_COMPACTION, getDefaultParams(Action.REQUEST, instantRange));
@@ -135,7 +133,7 @@ public class HoodieTableServiceManagerClient {
           .getCleanerTimeline()
           .filterInflightsAndRequested()
           .getInstantsAsStream()
-          .map(HoodieInstant::getTimestamp)
+          .map(HoodieInstant::requestedTime)
           .toArray(String[]::new), ",");
 
       executeRequest(EXECUTE_CLEAN, getDefaultParams(Action.REQUEST, instantRange));
@@ -150,7 +148,7 @@ public class HoodieTableServiceManagerClient {
       metaClient.reloadActiveTimeline();
       String instantRange = StringUtils.join(ClusteringUtils.getPendingClusteringInstantTimes(metaClient)
           .stream()
-          .map(HoodieInstant::getTimestamp)
+          .map(HoodieInstant::requestedTime)
           .toArray(String[]::new), ",");
 
       executeRequest(EXECUTE_CLUSTERING, getDefaultParams(Action.REQUEST, instantRange));

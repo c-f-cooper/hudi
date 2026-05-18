@@ -17,8 +17,9 @@
 
 package org.apache.hudi.functional
 
-import org.apache.hudi.common.util.FileIOUtils
-import org.apache.spark.sql.hudi.HoodieSparkSqlTestBase
+import org.apache.hudi.io.util.FileIOUtils
+
+import org.apache.spark.sql.hudi.common.HoodieSparkSqlTestBase
 
 class TestSqlStatement extends HoodieSparkSqlTestBase {
   val STATE_INIT = 0

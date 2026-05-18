@@ -23,11 +23,11 @@ import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.io.storage.HoodieFileReader;
-import org.apache.hudi.io.storage.HoodieFileReaderFactory;
+import org.apache.hudi.io.storage.HoodieIOFactory;
+import org.apache.hudi.storage.HoodieStorage;
 import org.apache.hudi.table.HoodieTable;
 
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
+import lombok.Getter;
 
 import java.io.IOException;
 
@@ -36,6 +36,7 @@ import java.io.IOException;
  */
 public abstract class HoodieReadHandle<T, I, K, O> extends HoodieIOHandle<T, I, K, O> {
 
+  @Getter
   protected final Pair<String, String> partitionPathFileIDPair;
 
   public HoodieReadHandle(HoodieWriteConfig config, HoodieTable<T, I, K, O> hoodieTable,
@@ -53,12 +54,8 @@ public abstract class HoodieReadHandle<T, I, K, O> extends HoodieIOHandle<T, I, 
   }
 
   @Override
-  public FileSystem getFileSystem() {
-    return hoodieTable.getMetaClient().getFs();
-  }
-
-  public Pair<String, String> getPartitionPathFileIDPair() {
-    return partitionPathFileIDPair;
+  public HoodieStorage getStorage() {
+    return hoodieTable.getStorage();
   }
 
   public String getFileId() {
@@ -71,12 +68,14 @@ public abstract class HoodieReadHandle<T, I, K, O> extends HoodieIOHandle<T, I, 
   }
 
   protected HoodieFileReader createNewFileReader() throws IOException {
-    return HoodieFileReaderFactory.getReaderFactory(this.config.getRecordMerger().getRecordType())
-        .getFileReader(config, hoodieTable.getHadoopConf(), new Path(getLatestBaseFile().getPath()));
+    return HoodieIOFactory.getIOFactory(hoodieTable.getStorage())
+        .getReaderFactory(this.config.getRecordMerger().getRecordType())
+        .getFileReader(config, getLatestBaseFile().getStoragePath());
   }
 
   protected HoodieFileReader createNewFileReader(HoodieBaseFile hoodieBaseFile) throws IOException {
-    return HoodieFileReaderFactory.getReaderFactory(this.config.getRecordMerger().getRecordType())
-        .getFileReader(config, hoodieTable.getHadoopConf(), new Path(hoodieBaseFile.getPath()));
+    return HoodieIOFactory.getIOFactory(hoodieTable.getStorage())
+        .getReaderFactory(this.config.getRecordMerger().getRecordType())
+        .getFileReader(config, hoodieBaseFile.getStoragePath());
   }
 }

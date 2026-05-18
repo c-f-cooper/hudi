@@ -19,9 +19,11 @@
 package org.apache.hudi.common.table.timeline;
 
 import org.apache.hudi.common.model.HoodieTimelineTimeZone;
+import org.apache.hudi.common.util.VisibleForTesting;
 import org.apache.hudi.exception.HoodieException;
 
 import java.text.ParseException;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -31,6 +33,9 @@ import java.time.temporal.ChronoField;
 import java.time.temporal.TemporalAccessor;
 import java.util.Date;
 import java.util.concurrent.atomic.AtomicReference;
+
+import static org.apache.hudi.common.table.timeline.InstantComparison.LESSER_THAN_OR_EQUALS;
+import static org.apache.hudi.common.table.timeline.InstantComparison.compareTimestamps;
 
 /**
  * Utility class to generate and parse timestamps used in Instants.
@@ -44,13 +49,13 @@ public class HoodieInstantTimeGenerator {
   public static final int MILLIS_INSTANT_TIMESTAMP_FORMAT_LENGTH = MILLIS_INSTANT_TIMESTAMP_FORMAT.length();
   // Formatter to generate Instant timestamps
   // Unfortunately millisecond format is not parsable as is https://bugs.openjdk.java.net/browse/JDK-8031085. hence have to do appendValue()
-  private static DateTimeFormatter MILLIS_INSTANT_TIME_FORMATTER = new DateTimeFormatterBuilder().appendPattern(SECS_INSTANT_TIMESTAMP_FORMAT)
+  public static final DateTimeFormatter MILLIS_INSTANT_TIME_FORMATTER = new DateTimeFormatterBuilder().appendPattern(SECS_INSTANT_TIMESTAMP_FORMAT)
       .appendValue(ChronoField.MILLI_OF_SECOND, 3).toFormatter();
   private static final String MILLIS_GRANULARITY_DATE_FORMAT = "yyyy-MM-dd HH:mm:ss.SSS";
-  private static DateTimeFormatter MILLIS_GRANULARITY_DATE_FORMATTER = DateTimeFormatter.ofPattern(MILLIS_GRANULARITY_DATE_FORMAT);
+  private static final DateTimeFormatter MILLIS_GRANULARITY_DATE_FORMATTER = DateTimeFormatter.ofPattern(MILLIS_GRANULARITY_DATE_FORMAT);
 
   // The last Instant timestamp generated
-  private static AtomicReference<String> lastInstantTime = new AtomicReference<>(String.valueOf(Integer.MIN_VALUE));
+  private static final AtomicReference<String> LAST_INSTANT_TIME = new AtomicReference<>(String.valueOf(Integer.MIN_VALUE));
 
   // The default number of milliseconds that we add if they are not present
   // We prefer the max timestamp as it mimics the current behavior with second granularity
@@ -68,18 +73,12 @@ public class HoodieInstantTimeGenerator {
    * @param milliseconds  Milliseconds to add to current time while generating the new instant time
    */
   public static String createNewInstantTime(boolean shouldLock, TimeGenerator timeGenerator, long milliseconds) {
-    return lastInstantTime.updateAndGet((oldVal) -> {
+    return LAST_INSTANT_TIME.updateAndGet((oldVal) -> {
       String newCommitTime;
       do {
-        Date d = new Date(timeGenerator.currentTimeMillis(!shouldLock) + milliseconds);
-
-        if (commitTimeZone.equals(HoodieTimelineTimeZone.UTC)) {
-          newCommitTime = d.toInstant().atZone(HoodieTimelineTimeZone.UTC.getZoneId())
-              .toLocalDateTime().format(MILLIS_INSTANT_TIME_FORMATTER);
-        } else {
-          newCommitTime = MILLIS_INSTANT_TIME_FORMATTER.format(convertDateToTemporalAccessor(d));
-        }
-      } while (HoodieTimeline.compareTimestamps(newCommitTime, HoodieActiveTimeline.LESSER_THAN_OR_EQUALS, oldVal));
+        Date d = new Date(timeGenerator.generateTime(!shouldLock) + milliseconds);
+        newCommitTime = formatDateBasedOnTimeZone(d);
+      } while (compareTimestamps(newCommitTime, LESSER_THAN_OR_EQUALS, oldVal));
       return newCommitTime;
     });
   }
@@ -95,28 +94,38 @@ public class HoodieInstantTimeGenerator {
   }
 
   public static String instantTimePlusMillis(String timestamp, long milliseconds) {
+    final String timestampInMillis = fixInstantTimeCompatibility(timestamp);
     try {
-      String timestampInMillis = fixInstantTimeCompatibility(timestamp);
       LocalDateTime dt = LocalDateTime.parse(timestampInMillis, MILLIS_INSTANT_TIME_FORMATTER);
       ZoneId zoneId = HoodieTimelineTimeZone.UTC.equals(commitTimeZone) ? ZoneId.of("UTC") : ZoneId.systemDefault();
       return MILLIS_INSTANT_TIME_FORMATTER.format(dt.atZone(zoneId).toInstant().plusMillis(milliseconds).atZone(zoneId).toLocalDateTime());
     } catch (DateTimeParseException e) {
-      throw new HoodieException(e);
+      // To work with tests, that generate arbitrary timestamps, we need to pad the timestamp with 0s.
+      if (isValidInstantTime(timestamp)) {
+        return String.format("%0" + MILLIS_INSTANT_TIMESTAMP_FORMAT_LENGTH + "d", Long.parseLong(timestamp) + milliseconds);
+      } else {
+        throw new HoodieException(e);
+      }
     }
   }
 
   public static String instantTimeMinusMillis(String timestamp, long milliseconds) {
+    final String timestampInMillis = fixInstantTimeCompatibility(timestamp);
     try {
-      String timestampInMillis = fixInstantTimeCompatibility(timestamp);
       LocalDateTime dt = LocalDateTime.parse(timestampInMillis, MILLIS_INSTANT_TIME_FORMATTER);
       ZoneId zoneId = HoodieTimelineTimeZone.UTC.equals(commitTimeZone) ? ZoneId.of("UTC") : ZoneId.systemDefault();
       return MILLIS_INSTANT_TIME_FORMATTER.format(dt.atZone(zoneId).toInstant().minusMillis(milliseconds).atZone(zoneId).toLocalDateTime());
     } catch (DateTimeParseException e) {
-      throw new HoodieException(e);
+      // To work with tests, that generate arbitrary timestamps, we need to pad the timestamp with 0s.
+      if (isValidInstantTime(timestamp)) {
+        return String.format("%0" + MILLIS_INSTANT_TIMESTAMP_FORMAT_LENGTH + "d", Long.parseLong(timestamp) - milliseconds);
+      } else {
+        throw new HoodieException(e);
+      }
     }
   }
 
-  private static String fixInstantTimeCompatibility(String instantTime) {
+  public static String fixInstantTimeCompatibility(String instantTime) {
     // Enables backwards compatibility with non-millisecond granularity instants
     if (isSecondGranularity(instantTime)) {
       // Add milliseconds to the instant in order to parse successfully
@@ -137,8 +146,26 @@ public class HoodieInstantTimeGenerator {
     return getInstantFromTemporalAccessor(convertDateToTemporalAccessor(timestamp));
   }
 
+  public static String formatDateBasedOnTimeZone(Date timestamp) {
+    if (commitTimeZone.equals(HoodieTimelineTimeZone.UTC)) {
+      return timestamp.toInstant().atZone(HoodieTimelineTimeZone.UTC.getZoneId())
+          .toLocalDateTime().format(MILLIS_INSTANT_TIME_FORMATTER);
+    } else {
+      return MILLIS_INSTANT_TIME_FORMATTER.format(convertDateToTemporalAccessor(timestamp));
+    }
+  }
+
   public static String getInstantFromTemporalAccessor(TemporalAccessor temporalAccessor) {
     return MILLIS_INSTANT_TIME_FORMATTER.format(temporalAccessor);
+  }
+
+  public static String getCurrentInstantTimeStr() {
+    return Instant.now().atZone(commitTimeZone.getZoneId()).toLocalDateTime().format(MILLIS_INSTANT_TIME_FORMATTER);
+  }
+
+  @VisibleForTesting
+  public static String getLastInstantTime() {
+    return LAST_INSTANT_TIME.get();
   }
 
   /**

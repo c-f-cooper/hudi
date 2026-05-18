@@ -18,16 +18,24 @@
 
 package org.apache.hudi.configuration;
 
-import org.apache.flink.configuration.Configuration;
+import org.apache.hudi.common.model.HoodieFailedWritesCleaningPolicy;
 import org.apache.hudi.common.model.WriteConcurrencyMode;
+import org.apache.hudi.common.model.WriteOperationType;
+import org.apache.hudi.config.HoodieCleanConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.index.HoodieIndex;
+
+import org.apache.flink.configuration.Configuration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Test for {@link OptionsResolver}
@@ -40,17 +48,79 @@ public class TestOptionsResolver {
   void testGetIndexType() {
     Configuration conf = getConf();
     // set uppercase index
-    conf.setString(FlinkOptions.INDEX_TYPE, "BLOOM");
+    conf.set(FlinkOptions.INDEX_TYPE, "BLOOM");
     assertEquals(HoodieIndex.IndexType.BLOOM, OptionsResolver.getIndexType(conf));
     // set lowercase index
-    conf.setString(FlinkOptions.INDEX_TYPE, "bloom");
+    conf.set(FlinkOptions.INDEX_TYPE, "bloom");
     assertEquals(HoodieIndex.IndexType.BLOOM, OptionsResolver.getIndexType(conf));
   }
-  
+
+  @Test
+  void testRecordLevelIndexStreamingWrite() {
+    Configuration conf = getConf();
+    conf.set(FlinkOptions.METADATA_ENABLED, true);
+    conf.set(FlinkOptions.INDEX_TYPE, HoodieIndex.IndexType.RECORD_LEVEL_INDEX.name());
+
+    assertTrue(OptionsResolver.isRecordLevelIndex(conf));
+    assertTrue(OptionsResolver.isStreamingIndexWriteEnabled(conf));
+
+    conf.set(FlinkOptions.OPERATION, WriteOperationType.INSERT_OVERWRITE.value());
+    assertFalse(OptionsResolver.isStreamingIndexWriteEnabled(conf));
+
+    conf.set(FlinkOptions.OPERATION, WriteOperationType.UPSERT.value());
+    conf.set(FlinkOptions.INDEX_TYPE, HoodieIndex.IndexType.BUCKET.name());
+    assertFalse(OptionsResolver.isRecordLevelIndex(conf));
+    assertFalse(OptionsResolver.isStreamingIndexWriteEnabled(conf));
+  }
+
+  @Test
+  void testGetRecordKeys() {
+    Configuration conf = new Configuration();
+    assertNull(OptionsResolver.getRecordKeyStr(conf));
+    assertArrayEquals(new String[]{}, OptionsResolver.getRecordKeys(conf));
+
+    conf.set(FlinkOptions.RECORD_KEY_FIELD, "");
+    assertArrayEquals(new String[]{}, OptionsResolver.getRecordKeys(conf));
+
+    conf.set(FlinkOptions.RECORD_KEY_FIELD, "uuid, name");
+    assertArrayEquals(new String[]{"uuid", " name"}, OptionsResolver.getRecordKeys(conf));
+  }
+
+  @Test
+  void testGetBucketIndexKeys() {
+    Configuration conf = new Configuration();
+    assertArrayEquals(new String[]{}, OptionsResolver.getBucketIndexKeys(conf));
+
+    conf.set(FlinkOptions.INDEX_KEY_FIELD, "");
+    assertArrayEquals(new String[]{}, OptionsResolver.getBucketIndexKeys(conf));
+
+    conf.set(FlinkOptions.INDEX_KEY_FIELD, "uuid, name");
+    assertArrayEquals(new String[]{"uuid", " name"}, OptionsResolver.getBucketIndexKeys(conf));
+  }
+
+  @Test
+  void testIsLazyFailedWritesCleanPolicy() {
+    Configuration conf = new Configuration();
+    // add any parameter
+    conf.set(FlinkOptions.CLEAN_ASYNC_ENABLED, true);
+    // add value for FAILED_WRITES_CLEANER_POLICY using default key
+    conf.setString(HoodieCleanConfig.FAILED_WRITES_CLEANER_POLICY.key(), HoodieFailedWritesCleaningPolicy.NEVER.name());
+    assertFalse(OptionsResolver.isLazyFailedWritesCleanPolicy(conf));
+
+    if (!HoodieCleanConfig.FAILED_WRITES_CLEANER_POLICY.getAlternatives().isEmpty()) {
+      conf = new Configuration();
+      // add any parameter
+      conf.set(FlinkOptions.CLEAN_ASYNC_ENABLED, true);
+      // add value for FAILED_WRITES_CLEANER_POLICY using alternative key
+      conf.setString(HoodieCleanConfig.FAILED_WRITES_CLEANER_POLICY.getAlternatives().get(0), HoodieFailedWritesCleaningPolicy.LAZY.name());
+      assertTrue(OptionsResolver.isLazyFailedWritesCleanPolicy(conf));
+    }
+  }
+
   private Configuration getConf() {
     Configuration conf = new Configuration();
     conf.setString(HoodieWriteConfig.WRITE_CONCURRENCY_MODE.key(), WriteConcurrencyMode.OPTIMISTIC_CONCURRENCY_CONTROL.name());
-    conf.setString(FlinkOptions.PATH, tempFile.getAbsolutePath());
+    conf.set(FlinkOptions.PATH, tempFile.getAbsolutePath());
     return conf;
   }
 }

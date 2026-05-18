@@ -20,8 +20,9 @@
 package org.apache.hudi
 
 import org.apache.hudi.SparkFilterHelper.convertFilter
-import org.apache.hudi.expression.{Expression, NameReference, Predicates, Literal => HLiteral}
+import org.apache.hudi.expression.{Expression, Literal => HLiteral, NameReference, Predicates}
 import org.apache.hudi.testutils.HoodieSparkClientTestHarness
+
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.functions._
@@ -29,14 +30,14 @@ import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 import org.junit.jupiter.api.{Assertions, Test}
 
-import scala.jdk.CollectionConverters.seqAsJavaListConverter
+import scala.collection.JavaConverters._
 
 class TestSparkFilterHelper extends HoodieSparkClientTestHarness with SparkAdapterSupport  {
 
   @Test
   def testConvertInExpression(): Unit = {
     val filterExpr = sparkAdapter.translateFilter(
-      expr("col1 IN (1, 2, 3)").expr.transformUp {
+      sparkAdapter.getExpressionFromColumn(expr("col1 IN (1, 2, 3)")).transformUp {
         case UnresolvedAttribute(nameParts) => AttributeReference(nameParts.mkString("."), IntegerType)()
       })
 

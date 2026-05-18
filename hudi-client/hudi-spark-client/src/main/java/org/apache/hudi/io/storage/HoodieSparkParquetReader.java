@@ -19,139 +19,243 @@
 package org.apache.hudi.io.storage;
 
 import org.apache.hudi.SparkAdapterSupport$;
-import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.common.bloom.BloomFilter;
 import org.apache.hudi.common.model.HoodieFileFormat;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieSparkRecord;
-import org.apache.hudi.common.util.BaseFileUtils;
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.schema.HoodieSchemaUtils;
+import org.apache.hudi.common.util.FileFormatUtils;
+import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ParquetReaderIterator;
 import org.apache.hudi.common.util.ParquetUtils;
 import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.collection.ClosableIterator;
 import org.apache.hudi.common.util.collection.CloseableMappingIterator;
 import org.apache.hudi.common.util.collection.Pair;
+import org.apache.hudi.storage.HoodieStorage;
+import org.apache.hudi.storage.StoragePath;
 
-import org.apache.avro.Schema;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.parquet.filter2.predicate.FilterApi;
+import org.apache.parquet.filter2.predicate.FilterPredicate;
+import org.apache.parquet.hadoop.ParquetInputFormat;
 import org.apache.parquet.hadoop.ParquetReader;
-import org.apache.parquet.hadoop.api.ReadSupport;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.SchemaRepair;
 import org.apache.spark.sql.HoodieInternalRowUtils;
+import org.apache.spark.sql.avro.HoodieSparkSchemaConverters;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.UnsafeProjection;
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow;
+import org.apache.spark.sql.catalyst.util.RebaseDateTime;
+import org.apache.spark.sql.execution.datasources.parquet.HoodieParquetReadSupport;
+import org.apache.spark.sql.execution.datasources.parquet.ParquetFilters;
 import org.apache.spark.sql.execution.datasources.parquet.ParquetReadSupport;
 import org.apache.spark.sql.execution.datasources.parquet.ParquetToSparkSchemaConverter;
+import org.apache.spark.sql.execution.datasources.parquet.SparkBasicSchemaEvolution;
 import org.apache.spark.sql.internal.SQLConf;
+import org.apache.spark.sql.sources.Filter;
+import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
+
+import scala.Option$;
 
 import static org.apache.hudi.common.util.TypeUtils.unsafeCast;
 import static org.apache.parquet.avro.AvroSchemaConverter.ADD_LIST_ELEMENT_RECORDS;
+import static org.apache.parquet.avro.HoodieAvroParquetSchemaConverter.getAvroSchemaConverter;
+import static org.apache.parquet.hadoop.ParquetInputFormat.RECORD_FILTERING_ENABLED;
 
 public class HoodieSparkParquetReader implements HoodieSparkFileReader {
 
-  private final Path path;
-  private final Configuration conf;
-  private final BaseFileUtils parquetUtils;
-  private List<ParquetReaderIterator> readerIterators = new ArrayList<>();
+  public static final String ENABLE_LOGICAL_TIMESTAMP_REPAIR = "spark.hudi.logicalTimestampField.repair.enable";
+  private final StoragePath path;
+  private final HoodieStorage storage;
+  private final FileFormatUtils parquetUtils;
+  private final List<ClosableIterator> readerIterators = new ArrayList<>();
+  private Option<MessageType> fileSchemaOption = Option.empty();
+  private Option<StructType> structTypeOption = Option.empty();
+  private Option<HoodieSchema> schemaOption = Option.empty();
 
-  public HoodieSparkParquetReader(Configuration conf, Path path) {
+  public HoodieSparkParquetReader(HoodieStorage storage, StoragePath path) {
     this.path = path;
-    this.conf = new Configuration(conf);
+    this.storage = storage.newInstance(path, storage.getConf().newInstance());
     // Avoid adding record in list element when convert parquet schema to avro schema
-    conf.set(ADD_LIST_ELEMENT_RECORDS, "false");
-    this.parquetUtils = BaseFileUtils.getInstance(HoodieFileFormat.PARQUET);
+    this.storage.getConf().set(ADD_LIST_ELEMENT_RECORDS, "false");
+    this.parquetUtils = HoodieIOFactory.getIOFactory(storage)
+        .getFileFormatUtils(HoodieFileFormat.PARQUET);
   }
 
   @Override
   public String[] readMinMaxRecordKeys() {
-    return parquetUtils.readMinMaxRecordKeys(conf, path);
+    return parquetUtils.readMinMaxRecordKeys(storage, path);
   }
 
   @Override
   public BloomFilter readBloomFilter() {
-    return parquetUtils.readBloomFilterFromMetadata(conf, path);
+    return parquetUtils.readBloomFilterFromMetadata(storage, path);
   }
 
   @Override
   public Set<Pair<String, Long>> filterRowKeys(Set<String> candidateRowKeys) {
-    return parquetUtils.filterRowKeys(conf, path, candidateRowKeys);
+    return parquetUtils.filterRowKeys(storage, path, candidateRowKeys);
   }
 
   @Override
-  public ClosableIterator<HoodieRecord<InternalRow>> getRecordIterator(Schema readerSchema, Schema requestedSchema) throws IOException {
-    ClosableIterator<InternalRow> iterator = getInternalRowIterator(readerSchema, requestedSchema);
-    StructType structType = HoodieInternalRowUtils.getCachedSchema(requestedSchema);
-    UnsafeProjection projection = HoodieInternalRowUtils.getCachedUnsafeProjection(structType, structType);
+  public ClosableIterator<HoodieRecord<InternalRow>> getRecordIterator(HoodieSchema readerSchema, HoodieSchema requestedSchema) throws IOException {
+    return getRecordIterator(requestedSchema);
+  }
 
-    return new CloseableMappingIterator<>(iterator, data -> {
-      // NOTE: We have to do [[UnsafeProjection]] of incoming [[InternalRow]] to convert
-      //       it to [[UnsafeRow]] holding just raw bytes
-      UnsafeRow unsafeRow = projection.apply(data);
-      return unsafeCast(new HoodieSparkRecord(unsafeRow));
-    });
+  @Override
+  public ClosableIterator<HoodieRecord<InternalRow>> getRecordIterator(HoodieSchema schema) throws IOException {
+    ClosableIterator<UnsafeRow> iterator = getUnsafeRowIterator(schema);
+    return new CloseableMappingIterator<>(iterator, data -> unsafeCast(new HoodieSparkRecord(data)));
   }
 
   @Override
   public ClosableIterator<String> getRecordKeyIterator() throws IOException {
-    Schema schema = HoodieAvroUtils.getRecordKeySchema();
-    ClosableIterator<InternalRow> iterator = getInternalRowIterator(schema, schema);
-    StructType structType = HoodieInternalRowUtils.getCachedSchema(schema);
-    UnsafeProjection projection = HoodieInternalRowUtils.getCachedUnsafeProjection(structType, structType);
-
+    HoodieSchema schema = HoodieSchemaUtils.getRecordKeySchema();
+    ClosableIterator<UnsafeRow> iterator = getUnsafeRowIterator(schema);
     return new CloseableMappingIterator<>(iterator, data -> {
-      // NOTE: We have to do [[UnsafeProjection]] of incoming [[InternalRow]] to convert
-      //       it to [[UnsafeRow]] holding just raw bytes
-      UnsafeRow unsafeRow = projection.apply(data);
-      HoodieSparkRecord record = unsafeCast(new HoodieSparkRecord(unsafeRow));
+      HoodieSparkRecord record = unsafeCast(new HoodieSparkRecord(data));
       return record.getRecordKey();
     });
   }
 
-  public ClosableIterator<InternalRow> getInternalRowIterator(Schema readerSchema, Schema requestedSchema) throws IOException {
-    if (requestedSchema == null) {
-      requestedSchema = readerSchema;
+  public ClosableIterator<UnsafeRow> getUnsafeRowIterator(HoodieSchema requestedSchema) throws IOException {
+    return getUnsafeRowIterator(requestedSchema, Collections.emptyList());
+  }
+
+  /**
+   * Read parquet with requested schema and filters.
+   * WARN:
+   * Currently, the filter must only contain field references related to the primary key, as the primary key does not involve schema evolution.
+   * If it is necessary to expand to push down more fields in the future, please consider the issue of schema evolution carefully
+   */
+  public ClosableIterator<UnsafeRow> getUnsafeRowIterator(HoodieSchema requestedSchema, List<Filter> readFilters) throws IOException {
+    HoodieSchema nonNullSchema = requestedSchema.getNonNullType();
+    StructType structSchema = HoodieInternalRowUtils.getCachedSchema(nonNullSchema);
+
+    // Detect vector columns: ordinal → Vector schema
+    Map<Integer, HoodieSchema.Vector> vectorColumnInfo = VectorConversionUtils.detectVectorColumns(nonNullSchema);
+
+    // For vector columns, replace ArrayType(FloatType) with BinaryType in the read schema
+    // so SparkBasicSchemaEvolution sees matching types (file has FIXED_LEN_BYTE_ARRAY → BinaryType)
+    StructType readStructSchema = vectorColumnInfo.isEmpty()
+        ? structSchema
+        : VectorConversionUtils.replaceVectorColumnsWithBinary(structSchema, vectorColumnInfo);
+
+    Option<MessageType> messageSchema = Option.of(getAvroSchemaConverter(storage.getConf().unwrapAs(Configuration.class)).convert(nonNullSchema));
+    boolean enableTimestampFieldRepair = storage.getConf().getBoolean(ENABLE_LOGICAL_TIMESTAMP_REPAIR, true);
+    StructType dataStructType = convertToStruct(enableTimestampFieldRepair ? SchemaRepair.repairLogicalTypes(getFileSchema(), messageSchema) : getFileSchema());
+    SparkBasicSchemaEvolution evolution = new SparkBasicSchemaEvolution(dataStructType, readStructSchema, SQLConf.get().sessionLocalTimeZone());
+    String readSchemaJson = evolution.getRequestSchema().json();
+    SQLConf sqlConf = SQLConf.get();
+    storage.getConf().set(ParquetReadSupport.PARQUET_READ_SCHEMA, readSchemaJson);
+    storage.getConf().set(ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA(), readSchemaJson);
+    storage.getConf().set(SQLConf.PARQUET_BINARY_AS_STRING().key(), sqlConf.getConf(SQLConf.PARQUET_BINARY_AS_STRING()).toString());
+    storage.getConf().set(SQLConf.PARQUET_INT96_AS_TIMESTAMP().key(), sqlConf.getConf(SQLConf.PARQUET_INT96_AS_TIMESTAMP()).toString());
+    RebaseDateTime.RebaseSpec rebaseDateSpec = SparkAdapterSupport$.MODULE$.sparkAdapter().getRebaseSpec("CORRECTED");
+    boolean parquetFilterPushDown = storage.getConf().getBoolean(SQLConf.PARQUET_FILTER_PUSHDOWN_ENABLED().key(), sqlConf.parquetFilterPushDown());
+    if (parquetFilterPushDown && readFilters != null && !readFilters.isEmpty()) {
+      ParquetFilters parquetFilters = SparkAdapterSupport$.MODULE$.sparkAdapter().createParquetFilters(
+          getFileSchema(),
+          storage.getConf(),
+          sqlConf
+      );
+      Option<FilterPredicate> predicateOpt = Option.fromJavaOptional(readFilters
+          .stream()
+          .map(filter -> parquetFilters.createFilter(filter))
+          .filter(opt -> opt.isDefined())
+          .map(opt -> opt.get())
+          .reduce(FilterApi::and));
+      predicateOpt
+          .ifPresent(predicate -> {
+            // set the filter predicate, it will be used to filter row groups and records(may be)
+            ParquetInputFormat.setFilterPredicate(storage.getConf().unwrapAs(Configuration.class), predicate);
+            // explicitly specify whether to filter records
+            storage.getConf().set(RECORD_FILTERING_ENABLED.toString(),
+                String.valueOf(storage.getConf().getBoolean(SQLConf.PARQUET_RECORD_FILTER_ENABLED().key(), sqlConf.parquetRecordFilterEnabled())));
+          });
     }
-    StructType readerStructType = HoodieInternalRowUtils.getCachedSchema(readerSchema);
-    StructType requestedStructType = HoodieInternalRowUtils.getCachedSchema(requestedSchema);
-    conf.set(ParquetReadSupport.PARQUET_READ_SCHEMA, readerStructType.json());
-    conf.set(ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA(), requestedStructType.json());
-    conf.setBoolean(SQLConf.PARQUET_BINARY_AS_STRING().key(), (Boolean) SQLConf.get().getConf(SQLConf.PARQUET_BINARY_AS_STRING()));
-    conf.setBoolean(SQLConf.PARQUET_INT96_AS_TIMESTAMP().key(), (Boolean) SQLConf.get().getConf(SQLConf.PARQUET_INT96_AS_TIMESTAMP()));
-    ParquetReader<InternalRow> reader = ParquetReader.<InternalRow>builder((ReadSupport) new ParquetReadSupport(), path)
-        .withConf(conf)
+    // Via SparkAdapter so Spark 4.0 picks up its variant-reordering ReadSupport subclass
+    // (#18334); constructing the base class here would MALFORMED_VARIANT on Spark 4.0.
+    HoodieParquetReadSupport readSupport = SparkAdapterSupport$.MODULE$.sparkAdapter().createParquetReadSupport(
+        Option$.MODULE$.empty(), true, true,
+        rebaseDateSpec,
+        messageSchema);
+    ParquetReader<InternalRow> reader = ParquetReader.builder(readSupport, new Path(path.toUri()))
+        .withConf(storage.getConf().unwrapAs(Configuration.class))
         .build();
+    UnsafeProjection projection = evolution.generateUnsafeProjection();
     ParquetReaderIterator<InternalRow> parquetReaderIterator = new ParquetReaderIterator<>(reader);
-    readerIterators.add(parquetReaderIterator);
-    return parquetReaderIterator;
+    CloseableMappingIterator<InternalRow, UnsafeRow> projectedIterator = new CloseableMappingIterator<>(parquetReaderIterator, projection::apply);
+
+    if (!vectorColumnInfo.isEmpty()) {
+      // Post-process: convert binary VECTOR columns back to typed arrays
+      UnsafeProjection vectorProjection = UnsafeProjection.create(structSchema);
+      Function<InternalRow, InternalRow> mapper =
+          VectorConversionUtils.buildRowMapper(readStructSchema, vectorColumnInfo, vectorProjection::apply);
+      CloseableMappingIterator<UnsafeRow, UnsafeRow> vectorIterator =
+          new CloseableMappingIterator<>(projectedIterator, row -> (UnsafeRow) mapper.apply(row));
+      readerIterators.add(vectorIterator);
+      return vectorIterator;
+    }
+
+    readerIterators.add(projectedIterator);
+    return projectedIterator;
+  }
+
+  private MessageType getFileSchema() {
+    if (fileSchemaOption.isEmpty()) {
+      MessageType messageType = ((ParquetUtils) parquetUtils).readMessageType(storage, path);
+      fileSchemaOption = Option.of(messageType);
+    }
+    return fileSchemaOption.get();
   }
 
   @Override
-  public Schema getSchema() {
-    // Some types in avro are not compatible with parquet.
-    // Avro only supports representing Decimals as fixed byte array
-    // and therefore if we convert to Avro directly we'll lose logical type-info.
-    MessageType messageType = ((ParquetUtils) parquetUtils).readSchema(conf, path);
-    StructType structType = new ParquetToSparkSchemaConverter(conf).convert(messageType);
-    return SparkAdapterSupport$.MODULE$.sparkAdapter()
-        .getAvroSchemaConverters()
-        .toAvroType(structType, true, messageType.getName(), StringUtils.EMPTY_STRING);
+  public HoodieSchema getSchema() {
+    if (schemaOption.isEmpty()) {
+      // Some types in avro are not compatible with parquet.
+      // Avro only supports representing Decimals as fixed byte array
+      // and therefore if we convert to Avro directly we'll lose logical type-info.
+      MessageType messageType = getFileSchema();
+      StructType structType = getStructSchema();
+      schemaOption = Option.of(HoodieSparkSchemaConverters.toHoodieType(
+          structType, true, messageType.getName(), StringUtils.EMPTY_STRING, Metadata.empty()));
+    }
+    return schemaOption.get();
+  }
+
+  protected StructType getStructSchema() {
+    if (structTypeOption.isEmpty()) {
+      MessageType messageType = getFileSchema();
+      structTypeOption = Option.of(convertToStruct(messageType));
+    }
+    return structTypeOption.get();
+  }
+
+  private StructType convertToStruct(MessageType messageType) {
+    return new ParquetToSparkSchemaConverter(storage.getConf().unwrapAs(Configuration.class)).convert(messageType);
   }
 
   @Override
   public void close() {
-    readerIterators.forEach(ParquetReaderIterator::close);
+    readerIterators.forEach(ClosableIterator::close);
   }
 
   @Override
   public long getTotalRecords() {
-    return parquetUtils.getRowCount(conf, path);
+    return parquetUtils.getRowCount(storage, path);
   }
 }

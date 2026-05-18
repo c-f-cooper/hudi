@@ -19,13 +19,16 @@
 package org.apache.hudi.client.functional;
 
 import org.apache.hudi.client.timeline.HoodieTimelineArchiver;
+import org.apache.hudi.client.timeline.versioning.v2.TimelineArchiverV2;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
 import org.apache.hudi.common.config.HoodieStorageConfig;
+import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieFailedWritesCleaningPolicy;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.HoodieTableVersion;
 import org.apache.hudi.common.table.view.FileSystemViewStorageConfig;
 import org.apache.hudi.common.testutils.HoodieMetadataTestTable;
 import org.apache.hudi.common.testutils.HoodieTestTable;
@@ -41,14 +44,13 @@ import org.apache.hudi.metadata.HoodieTableMetadata;
 import org.apache.hudi.metadata.HoodieTableMetadataWriter;
 import org.apache.hudi.metadata.SparkHoodieBackedTableMetadataWriter;
 import org.apache.hudi.metrics.MetricsReporterType;
+import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.table.HoodieSparkTable;
 import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.testutils.HoodieSparkClientTestHarness;
 
-import org.apache.hadoop.fs.Path;
+import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.AfterEach;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Arrays;
@@ -62,9 +64,8 @@ import static org.apache.hudi.common.model.WriteOperationType.INSERT;
 import static org.apache.hudi.common.model.WriteOperationType.UPSERT;
 import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.TRIP_EXAMPLE_SCHEMA;
 
+@Slf4j
 public class TestHoodieMetadataBase extends HoodieSparkClientTestHarness {
-
-  private static final Logger LOG = LoggerFactory.getLogger(TestHoodieMetadataBase.class);
 
   protected static HoodieTestTable testTable;
   protected String metadataTableBasePath;
@@ -99,10 +100,10 @@ public class TestHoodieMetadataBase extends HoodieSparkClientTestHarness {
     this.tableType = tableType;
     initPath();
     initSparkContexts("TestHoodieMetadata");
-    initFileSystem();
-    fs.mkdirs(new Path(basePath));
+    initHoodieStorage();
+    storage.createDirectory(new StoragePath(basePath));
     initTimelineService();
-    initMetaClient(tableType);
+    initMetaClient(tableType, writeConfig.map(conf -> conf.getProps()).orElse(new TypedProperties()));
     initTestDataGenerator();
     metadataTableBasePath = HoodieTableMetadata.getMetadataTableBasePath(basePath);
     this.writeConfig = writeConfig.isPresent()
@@ -116,7 +117,7 @@ public class TestHoodieMetadataBase extends HoodieSparkClientTestHarness {
   protected void initWriteConfigAndMetatableWriter(HoodieWriteConfig writeConfig, boolean enableMetadataTable) throws IOException {
     this.writeConfig = writeConfig;
     if (enableMetadataTable) {
-      metadataWriter = SparkHoodieBackedTableMetadataWriter.create(hadoopConf, writeConfig, context);
+      metadataWriter = SparkHoodieBackedTableMetadataWriter.create(storageConf, writeConfig, context);
       // reload because table configs could have been updated
       metaClient = HoodieTableMetaClient.reload(metaClient);
       testTable = HoodieMetadataTestTable.of(metaClient, metadataWriter, Option.of(context));
@@ -290,7 +291,7 @@ public class TestHoodieMetadataBase extends HoodieSparkClientTestHarness {
 
   protected void archiveDataTable(HoodieWriteConfig writeConfig, HoodieTableMetaClient metaClient) throws IOException {
     HoodieTable table = HoodieSparkTable.create(writeConfig, context, metaClient);
-    HoodieTimelineArchiver archiver = new HoodieTimelineArchiver(writeConfig, table);
+    HoodieTimelineArchiver archiver = new TimelineArchiverV2(writeConfig, table);
     archiver.archiveIfRequired(context);
   }
 
@@ -329,7 +330,6 @@ public class TestHoodieMetadataBase extends HoodieSparkClientTestHarness {
     Properties properties = new Properties();
     return HoodieWriteConfig.newBuilder().withPath(basePath).withSchema(TRIP_EXAMPLE_SCHEMA)
         .withParallelism(2, 2).withDeleteParallelism(2).withRollbackParallelism(2).withFinalizeWriteParallelism(2)
-        .withAutoCommit(autoCommit)
         .withCompactionConfig(HoodieCompactionConfig.newBuilder().compactionSmallFileSize(0)
             .withInlineCompaction(false).withMaxNumDeltaCommitsBeforeCompaction(1).build())
         .withCleanConfig(HoodieCleanConfig.newBuilder()
@@ -353,6 +353,7 @@ public class TestHoodieMetadataBase extends HoodieSparkClientTestHarness {
   }
 
   protected HoodieWriteConfig getMetadataWriteConfig(HoodieWriteConfig writeConfig) {
-    return HoodieMetadataWriteUtils.createMetadataWriteConfig(writeConfig, HoodieFailedWritesCleaningPolicy.LAZY);
+    return HoodieMetadataWriteUtils.createMetadataWriteConfig(writeConfig,
+        HoodieFailedWritesCleaningPolicy.LAZY, HoodieTableVersion.EIGHT);
   }
 }

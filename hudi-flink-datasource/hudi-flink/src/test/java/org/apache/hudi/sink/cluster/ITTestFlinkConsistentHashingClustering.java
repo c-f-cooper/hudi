@@ -20,6 +20,7 @@ package org.apache.hudi.sink.cluster;
 
 import org.apache.hudi.avro.model.HoodieClusteringPlan;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
+import org.apache.hudi.client.clustering.plan.strategy.FlinkConsistentBucketClusteringPlanStrategy;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
@@ -33,7 +34,6 @@ import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.sink.clustering.FlinkClusteringConfig;
 import org.apache.hudi.table.HoodieFlinkTable;
-import org.apache.hudi.client.clustering.plan.strategy.FlinkConsistentBucketClusteringPlanStrategy;
 import org.apache.hudi.util.CompactionUtil;
 import org.apache.hudi.util.FlinkWriteClients;
 import org.apache.hudi.util.StreamerUtil;
@@ -114,7 +114,7 @@ public class ITTestFlinkConsistentHashingClustering {
     HoodieFlinkTable<?> table = writeClient.getHoodieTable();
     table.getMetaClient().reloadActiveTimeline();
     Option<Pair<HoodieInstant, HoodieClusteringPlan>> clusteringPlanOption = ClusteringUtils.getClusteringPlan(
-        table.getMetaClient(), table.getMetaClient().getActiveTimeline().filterPendingReplaceTimeline().lastInstant().get());
+        table.getMetaClient(), table.getMetaClient().getActiveTimeline().filterPendingClusteringTimeline().lastInstant().get());
     return clusteringPlanOption.get().getRight();
   }
 
@@ -134,7 +134,7 @@ public class ITTestFlinkConsistentHashingClustering {
     EnvironmentSettings settings = EnvironmentSettings.newInstance().inBatchMode().build();
     TableEnvironment tableEnv = TableEnvironmentImpl.create(settings);
     tableEnv.getConfig().getConfiguration()
-        .setInteger(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 4);
+        .set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 4);
     return tableEnv;
   }
 
@@ -145,9 +145,9 @@ public class ITTestFlinkConsistentHashingClustering {
 
     HoodieTableMetaClient metaClient = StreamerUtil.createMetaClient(conf);
 
-    conf.setString(FlinkOptions.TABLE_NAME, metaClient.getTableConfig().getTableName());
-    conf.setString(FlinkOptions.RECORD_KEY_FIELD, metaClient.getTableConfig().getRecordKeyFieldProp());
-    conf.setString(FlinkOptions.PARTITION_PATH_FIELD, metaClient.getTableConfig().getPartitionFieldProp());
+    conf.set(FlinkOptions.TABLE_NAME, metaClient.getTableConfig().getTableName());
+    conf.set(FlinkOptions.RECORD_KEY_FIELD, metaClient.getTableConfig().getRecordKeyFieldProp());
+    conf.set(FlinkOptions.PARTITION_PATH_FIELD, metaClient.getTableConfig().getPartitionFieldProp());
     for (Map.Entry<String, String> e : getDefaultConsistentHashingOption().entrySet()) {
       conf.setString(e.getKey(), e.getValue());
     }

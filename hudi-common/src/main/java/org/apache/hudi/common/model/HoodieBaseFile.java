@@ -20,18 +20,19 @@ package org.apache.hudi.common.model;
 
 import org.apache.hudi.common.util.ExternalFilePathUtil;
 import org.apache.hudi.common.util.Option;
-import org.apache.hudi.hadoop.fs.CachingPath;
+import org.apache.hudi.storage.StoragePathInfo;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.Path;
-
-import static org.apache.hudi.hadoop.fs.CachingPath.createRelativePathUnsafe;
+import lombok.Getter;
+import lombok.ToString;
 
 /**
  * Hoodie base file - Represents metadata about Hudi file in DFS.
  * Supports APIs to get Hudi FileId, Commit Time and bootstrap file (if any).
  */
+@Getter
+@ToString
 public class HoodieBaseFile extends BaseFile {
+
   private static final long serialVersionUID = 1L;
   private static final char UNDERSCORE = '_';
   private static final char DOT = '.';
@@ -47,12 +48,13 @@ public class HoodieBaseFile extends BaseFile {
     this.commitTime = dataFile.getCommitTime();
   }
 
-  public HoodieBaseFile(FileStatus fileStatus) {
-    this(fileStatus, null);
+  public HoodieBaseFile(StoragePathInfo pathInfo) {
+    this(pathInfo, null);
   }
 
-  public HoodieBaseFile(FileStatus fileStatus, BaseFile bootstrapBaseFile) {
-    this(fileStatus, getFileIdAndCommitTimeFromFileName(fileStatus.getPath().getName()), bootstrapBaseFile);
+  public HoodieBaseFile(StoragePathInfo pathInfo, BaseFile bootstrapBaseFile) {
+    this(pathInfo, getFileIdAndCommitTimeFromFileName(pathInfo.getPath().getName()),
+        bootstrapBaseFile);
   }
 
   public HoodieBaseFile(String filePath) {
@@ -74,12 +76,14 @@ public class HoodieBaseFile extends BaseFile {
     this.commitTime = commitTime;
   }
 
-  private HoodieBaseFile(FileStatus fileStatus, String[] fileIdAndCommitTime, BaseFile bootstrapBaseFile) {
-    this(fileStatus, fileIdAndCommitTime[0], fileIdAndCommitTime[1], bootstrapBaseFile);
+  private HoodieBaseFile(StoragePathInfo pathInfo, String[] fileIdAndCommitTime,
+                         BaseFile bootstrapBaseFile) {
+    this(pathInfo, fileIdAndCommitTime[0], fileIdAndCommitTime[1], bootstrapBaseFile);
   }
 
-  public HoodieBaseFile(FileStatus fileStatus, String fileId, String commitTime, BaseFile bootstrapBaseFile) {
-    super(maybeHandleExternallyGeneratedFileName(fileStatus, fileId));
+  public HoodieBaseFile(StoragePathInfo pathInfo, String fileId, String commitTime,
+                        BaseFile bootstrapBaseFile) {
+    super(ExternalFilePathUtil.maybeHandleExternallyGeneratedFileName(pathInfo, fileId));
     this.bootstrapBaseFile = Option.ofNullable(bootstrapBaseFile);
     this.fileId = fileId;
     this.commitTime = commitTime;
@@ -119,57 +123,10 @@ public class HoodieBaseFile extends BaseFile {
   }
 
   private static String[] handleExternallyGeneratedFile(String fileName) {
-    String[] values = new String[2];
-    // file name has format <originalFileName>_<commitTime>_hudiext and originalFileName is used as fileId
-    int lastUnderscore = fileName.lastIndexOf(UNDERSCORE);
-    int secondToLastUnderscore = fileName.lastIndexOf(UNDERSCORE, lastUnderscore - 1);
-    values[0] = fileName.substring(0, secondToLastUnderscore);
-    values[1] = fileName.substring(secondToLastUnderscore + 1, lastUnderscore);
-    return values;
-  }
-
-  /**
-   * If the file was created externally, the original file path will have a '_[commitTime]_hudiext' suffix when stored in the metadata table. That suffix needs to be removed from the FileStatus so
-   * that the actual file can be found and read.
-   * @param fileStatus an input file status that may require updating
-   * @param fileId the fileId for the file
-   * @return the original file status if it was not externally created, or a new FileStatus with the original file name if it was externally created
-   */
-  private static FileStatus maybeHandleExternallyGeneratedFileName(FileStatus fileStatus, String fileId) {
-    if (fileStatus == null) {
-      return null;
-    }
-    if (ExternalFilePathUtil.isExternallyCreatedFile(fileStatus.getPath().getName())) {
-      // fileId is the same as the original file name for externally created files
-      Path parent = fileStatus.getPath().getParent();
-      return new FileStatus(fileStatus.getLen(), fileStatus.isDirectory(), fileStatus.getReplication(),
-          fileStatus.getBlockSize(), fileStatus.getModificationTime(), fileStatus.getAccessTime(),
-          fileStatus.getPermission(), fileStatus.getOwner(), fileStatus.getGroup(),
-          new CachingPath(parent, createRelativePathUnsafe(fileId)));
-    } else {
-      return fileStatus;
-    }
-  }
-
-  public String getFileId() {
-    return fileId;
-  }
-
-  public String getCommitTime() {
-    return commitTime;
-  }
-
-  public Option<BaseFile> getBootstrapBaseFile() {
-    return bootstrapBaseFile;
+    return ExternalFilePathUtil.parseFileIdAndCommitTimeFromExternalFile(fileName);
   }
 
   public void setBootstrapBaseFile(BaseFile bootstrapBaseFile) {
     this.bootstrapBaseFile = Option.ofNullable(bootstrapBaseFile);
-  }
-
-  @Override
-  public String toString() {
-    return "HoodieBaseFile{fullPath=" + getPath() + ", fileLen=" + getFileLen()
-        + ", BootstrapBaseFile=" + bootstrapBaseFile.orElse(null) + '}';
   }
 }

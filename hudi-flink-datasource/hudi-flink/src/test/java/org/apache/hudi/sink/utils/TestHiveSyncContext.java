@@ -18,6 +18,8 @@
 
 package org.apache.hudi.sink.utils;
 
+import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.hive.HiveSyncConfig;
 
@@ -44,10 +46,10 @@ public class TestHiveSyncContext {
     String hiveSyncPartitionField = "hiveSyncPartitionField";
     String partitionPathField = "partitionPathField";
 
-    configuration1.setString(FlinkOptions.HIVE_SYNC_PARTITION_FIELDS, hiveSyncPartitionField);
-    configuration1.setString(FlinkOptions.PARTITION_PATH_FIELD, partitionPathField);
+    configuration1.set(FlinkOptions.HIVE_SYNC_PARTITION_FIELDS, hiveSyncPartitionField);
+    configuration1.set(FlinkOptions.PARTITION_PATH_FIELD, partitionPathField);
 
-    configuration2.setString(FlinkOptions.PARTITION_PATH_FIELD, partitionPathField);
+    configuration2.set(FlinkOptions.PARTITION_PATH_FIELD, partitionPathField);
 
     Properties props1 = HiveSyncContext.buildSyncConfig(configuration1);
     Properties props2 = HiveSyncContext.buildSyncConfig(configuration2);
@@ -62,8 +64,22 @@ public class TestHiveSyncContext {
   @Test
   void testOptionWithoutShortcutKey() {
     Configuration configuration3 = new Configuration();
-    configuration3.setBoolean(HiveSyncConfig.HIVE_CREATE_MANAGED_TABLE.key(), true);
+    configuration3.setString(HiveSyncConfig.HIVE_CREATE_MANAGED_TABLE.key(), "true");
     Properties props3 = HiveSyncContext.buildSyncConfig(configuration3);
     assertTrue(Boolean.parseBoolean(props3.getProperty(HiveSyncConfig.HIVE_CREATE_MANAGED_TABLE.key(), "false")));
+  }
+
+  /**
+   * Pins the constructor signature {@link HiveSyncContext#hiveSyncTool()} relies on via reflection.
+   * End-to-end instantiation is covered in {@code hudi-aws}'s {@code TestAwsGlueSyncTool}.
+   */
+  @Test
+  void testAwsGlueSyncToolReflectionConstructorExists() {
+    assertTrue(
+        ReflectionUtils.hasConstructor(
+            HiveSyncContext.AWS_GLUE_CATALOG_SYNC_TOOL_CLASS,
+            new Class<?>[] {Properties.class, org.apache.hadoop.conf.Configuration.class, Option.class}),
+        "AwsGlueCatalogSyncTool must expose the constructor used by HiveSyncContext#hiveSyncTool() "
+            + "via reflection; otherwise Flink GLUE sync fails with NoSuchMethodException.");
   }
 }

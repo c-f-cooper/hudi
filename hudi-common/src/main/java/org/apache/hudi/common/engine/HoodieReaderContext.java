@@ -19,22 +19,51 @@
 
 package org.apache.hudi.common.engine;
 
+import org.apache.hudi.common.config.HoodieConfig;
+import org.apache.hudi.common.config.RecordMergeMode;
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.model.HoodieFileFormat;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieRecordMerger;
+import org.apache.hudi.common.model.HoodieRecordPayload;
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.schema.HoodieSchemaField;
+import org.apache.hudi.common.serialization.CustomSerializer;
+import org.apache.hudi.common.serialization.DefaultSerializer;
+import org.apache.hudi.common.table.HoodieTableConfig;
+import org.apache.hudi.common.table.HoodieTableVersion;
+import org.apache.hudi.common.table.log.InstantRange;
+import org.apache.hudi.common.table.read.BufferedRecord;
+import org.apache.hudi.common.table.read.FileGroupReaderSchemaHandler;
+import org.apache.hudi.common.table.read.IteratorMode;
+import org.apache.hudi.common.util.ConfigUtils;
+import org.apache.hudi.common.util.HoodieRecordSizeEstimator;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.SizeEstimator;
+import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.common.util.collection.ClosableIterator;
-
-import org.apache.avro.Schema;
-import org.apache.avro.generic.IndexedRecord;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
+import org.apache.hudi.common.util.collection.CloseableFilterIterator;
+import org.apache.hudi.common.util.collection.Pair;
+import org.apache.hudi.common.util.collection.Triple;
+import org.apache.hudi.expression.Predicate;
+import org.apache.hudi.internal.schema.HoodieSchemaException;
+import org.apache.hudi.metadata.HoodieTableMetadata;
+import org.apache.hudi.storage.HoodieStorage;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathInfo;
 
 import java.io.IOException;
-import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.function.UnaryOperator;
+import java.util.function.Function;
+
+import static org.apache.hudi.common.config.HoodieReaderConfig.RECORD_MERGE_IMPL_CLASSES_DEPRECATED_WRITE_CONFIG_KEY;
+import static org.apache.hudi.common.config.HoodieReaderConfig.RECORD_MERGE_IMPL_CLASSES_WRITE_CONFIG_KEY;
+import static org.apache.hudi.common.model.HoodieRecordMerger.PAYLOAD_BASED_MERGE_STRATEGY_UUID;
+import static org.apache.hudi.common.table.HoodieTableConfig.RECORD_MERGE_MODE;
+import static org.apache.hudi.common.table.HoodieTableConfig.RECORD_MERGE_STRATEGY_ID;
+import static org.apache.hudi.common.table.HoodieTableConfig.inferMergingConfigsForPreV9Table;
 
 /**
  * An abstract reader context class for {@code HoodieFileGroupReader} to use, containing APIs for
@@ -48,147 +77,294 @@ import java.util.function.UnaryOperator;
  *            and {@code RowData} in Flink.
  */
 public abstract class HoodieReaderContext<T> {
-  // These internal key names are only used in memory for record metadata and merging,
-  // and should not be persisted to storage.
-  public static final String INTERNAL_META_RECORD_KEY = "_0";
-  public static final String INTERNAL_META_PARTITION_PATH = "_1";
-  public static final String INTERNAL_META_ORDERING_FIELD = "_2";
-  public static final String INTERNAL_META_OPERATION = "_3";
-  public static final String INTERNAL_META_INSTANT_TIME = "_4";
-  public static final String INTERNAL_META_SCHEMA = "_5";
+  private final StorageConfiguration<?> storageConfiguration;
+  protected final HoodieFileFormat baseFileFormat;
+  // For general predicate pushdown.
+  protected final Option<Predicate> keyFilterOpt;
+  protected final HoodieTableConfig tableConfig;
+  private String tablePath = null;
+  private String latestCommitTime = null;
+  private Option<HoodieRecordMerger> recordMerger = null;
+  private Boolean hasLogFiles = null;
+  private Boolean hasBootstrapBaseFile = null;
+  private Boolean needsBootstrapMerge = null;
 
-  /**
-   * Gets the file system based on the file path and configuration.
-   *
-   * @param path File path to get the file system.
-   * @param conf Hadoop {@link Configuration} instance.
-   * @return The {@link FileSystem} instance to use.
-   */
-  public abstract FileSystem getFs(String path, Configuration conf);
+  // should we do position based merging for mor
+  private Boolean shouldMergeUseRecordPosition = null;
+  protected Option<InstantRange> instantRangeOpt;
+  private RecordMergeMode mergeMode;
+  protected RecordContext<T> recordContext;
+  private FileGroupReaderSchemaHandler<T> schemaHandler = null;
+  // the default iterator mode is engine-specific record mode
+  private IteratorMode iteratorMode = IteratorMode.ENGINE_RECORD;
+  protected final HoodieConfig hoodieReaderConfig;
+  private boolean enableLogicalTimestampFieldRepair = true;
+
+  protected HoodieReaderContext(StorageConfiguration<?> storageConfiguration,
+      HoodieTableConfig tableConfig,
+      Option<InstantRange> instantRangeOpt,
+      Option<Predicate> keyFilterOpt,
+      RecordContext<T> recordContext) {
+    this(storageConfiguration, tableConfig, instantRangeOpt, keyFilterOpt, recordContext, ConfigUtils.DEFAULT_HUDI_CONFIG_FOR_READER);
+  }
+
+  protected HoodieReaderContext(StorageConfiguration<?> storageConfiguration,
+                                HoodieTableConfig tableConfig,
+                                Option<InstantRange> instantRangeOpt,
+                                Option<Predicate> keyFilterOpt,
+                                RecordContext<T> recordContext,
+                                HoodieConfig hoodieReaderConfig) {
+    this.tableConfig = tableConfig;
+    this.storageConfiguration = storageConfiguration;
+    this.baseFileFormat = tableConfig.getBaseFileFormat();
+    this.instantRangeOpt = instantRangeOpt;
+    this.keyFilterOpt = keyFilterOpt;
+    this.recordContext = recordContext;
+    this.hoodieReaderConfig = hoodieReaderConfig;
+  }
+
+  // Getter and Setter for schemaHandler
+  public FileGroupReaderSchemaHandler<T> getSchemaHandler() {
+    return schemaHandler;
+  }
+
+  public void setSchemaHandler(FileGroupReaderSchemaHandler<T> schemaHandler) {
+    this.schemaHandler = schemaHandler;
+  }
+
+  public void setIteratorMode(IteratorMode iteratorMode) {
+    this.iteratorMode = iteratorMode;
+  }
+
+  public IteratorMode getIteratorMode() {
+    ValidationUtils.checkArgument(iteratorMode != null, "iterator mode should not be null!");
+    return this.iteratorMode;
+  }
+
+  public String getTablePath() {
+    if (tablePath == null) {
+      throw new IllegalStateException("Table path not set in reader context.");
+    }
+    return tablePath;
+  }
+
+  public void setEnableLogicalTimestampFieldRepair(boolean enableLogicalTimestampFieldRepair) {
+    this.enableLogicalTimestampFieldRepair = enableLogicalTimestampFieldRepair;
+  }
+
+  public void setTablePath(String tablePath) {
+    this.tablePath = tablePath;
+  }
+
+  public String getLatestCommitTime() {
+    return latestCommitTime;
+  }
+
+  public void setLatestCommitTime(String latestCommitTime) {
+    this.latestCommitTime = latestCommitTime;
+  }
+
+  public Option<HoodieRecordMerger> getRecordMerger() {
+    return recordMerger;
+  }
+
+  public void setRecordMerger(Option<HoodieRecordMerger> recordMerger) {
+    this.recordMerger = recordMerger;
+  }
+
+  // Getter and Setter for hasLogFiles
+  public boolean getHasLogFiles() {
+    return hasLogFiles;
+  }
+
+  public void setHasLogFiles(boolean hasLogFiles) {
+    this.hasLogFiles = hasLogFiles;
+  }
+
+  // Getter and Setter for hasBootstrapBaseFile
+  public boolean getHasBootstrapBaseFile() {
+    return hasBootstrapBaseFile;
+  }
+
+  public void setHasBootstrapBaseFile(boolean hasBootstrapBaseFile) {
+    this.hasBootstrapBaseFile = hasBootstrapBaseFile;
+  }
+
+  // Getter and Setter for needsBootstrapMerge
+  public boolean getNeedsBootstrapMerge() {
+    return needsBootstrapMerge;
+  }
+
+  public boolean enableLogicalTimestampFieldRepair() {
+    return enableLogicalTimestampFieldRepair;
+  }
+
+  public void setNeedsBootstrapMerge(boolean needsBootstrapMerge) {
+    this.needsBootstrapMerge = needsBootstrapMerge;
+  }
+
+  // Getter and Setter for useRecordPosition
+  public boolean getShouldMergeUseRecordPosition() {
+    return shouldMergeUseRecordPosition;
+  }
+
+  public void setShouldMergeUseRecordPosition(boolean shouldMergeUseRecordPosition) {
+    this.shouldMergeUseRecordPosition = shouldMergeUseRecordPosition;
+  }
+
+  public StorageConfiguration<?> getStorageConfiguration() {
+    return storageConfiguration;
+  }
+
+  public TypedProperties getMergeProps(TypedProperties props) {
+    return ConfigUtils.getMergeProps(props, this.tableConfig);
+  }
+
+  public Option<Predicate> getKeyFilterOpt() {
+    return keyFilterOpt;
+  }
+
+  public SizeEstimator<BufferedRecord<T>> getRecordSizeEstimator() {
+    return new HoodieRecordSizeEstimator<>(getSchemaHandler().getSchemaForUpdates());
+  }
+
+  public CustomSerializer<BufferedRecord<T>> getRecordSerializer() {
+    return new DefaultSerializer<>();
+  }
+
+  public RecordContext<T> getRecordContext() {
+    return recordContext;
+  }
+
+  public HoodieConfig getHoodieReaderConfig() {
+    return hoodieReaderConfig;
+  }
 
   /**
    * Gets the record iterator based on the type of engine-specific record representation from the
    * file.
    *
-   * @param filePath       {@link Path} instance of a file.
+   * @param filePath       {@link StoragePath} instance of a file.
    * @param start          Starting byte to start reading.
    * @param length         Bytes to read.
-   * @param dataSchema     Schema of records in the file in {@link Schema}.
-   * @param requiredSchema Schema containing required fields to read in {@link Schema} for projection.
-   * @param conf           {@link Configuration} for reading records.
+   * @param dataSchema     Schema of records in the file in {@link HoodieSchema}.
+   * @param requiredSchema Schema containing required fields to read in {@link HoodieSchema} for projection.
+   * @param storage        {@link HoodieStorage} for reading records.
    * @return {@link ClosableIterator<T>} that can return all records through iteration.
    */
   public abstract ClosableIterator<T> getFileRecordIterator(
-      Path filePath, long start, long length, Schema dataSchema, Schema requiredSchema, Configuration conf) throws IOException;
+      StoragePath filePath, long start, long length, HoodieSchema dataSchema, HoodieSchema requiredSchema,
+      HoodieStorage storage) throws IOException;
 
   /**
-   * Converts an Avro record, e.g., serialized in the log files, to an engine-specific record.
+   * Gets the record iterator based on the type of engine-specific record representation from the
+   * file.
    *
-   * @param avroRecord The Avro record.
-   * @return An engine-specific record in Type {@link T}.
+   * @param storagePathInfo {@link StoragePathInfo} instance of a file.
+   * @param start           Starting byte to start reading.
+   * @param length          Bytes to read.
+   * @param dataSchema      Schema of records in the file in {@link HoodieSchema}.
+   * @param requiredSchema  Schema containing required fields to read in {@link HoodieSchema} for projection.
+   * @param storage         {@link HoodieStorage} for reading records.
+   * @return {@link ClosableIterator<T>} that can return all records through iteration.
    */
-  public abstract T convertAvroRecord(IndexedRecord avroRecord);
+  public ClosableIterator<T> getFileRecordIterator(
+      StoragePathInfo storagePathInfo, long start, long length, HoodieSchema dataSchema, HoodieSchema requiredSchema,
+      HoodieStorage storage) throws IOException {
+    return getFileRecordIterator(storagePathInfo.getPath(), start, length, dataSchema, requiredSchema, storage);
+  }
 
   /**
-   * @param mergerStrategy Merger strategy UUID.
+   * @param mergeMode        record merge mode
+   * @param mergeStrategyId  record merge strategy ID
+   * @param mergeImplClasses custom implementation classes for record merging
+   *
    * @return {@link HoodieRecordMerger} to use.
    */
-  public abstract HoodieRecordMerger getRecordMerger(String mergerStrategy);
+  protected abstract Option<HoodieRecordMerger> getRecordMerger(RecordMergeMode mergeMode, String mergeStrategyId, String mergeImplClasses);
 
   /**
-   * Gets the field value.
-   *
-   * @param record    The record in engine-specific type.
-   * @param schema    The Avro schema of the record.
-   * @param fieldName The field name.
-   * @return The field value.
+   * Initializes the record merger based on the table configuration and properties.
+   * @param properties the properties for the reader.
    */
-  public abstract Object getValue(T record, Schema schema, String fieldName);
+  public void initRecordMerger(TypedProperties properties) {
+    initRecordMerger(properties, false);
+  }
 
-  /**
-   * Gets the record key in String.
-   *
-   * @param record The record in engine-specific type.
-   * @param schema The Avro schema of the record.
-   * @return The record key in String.
-   */
-  public abstract String getRecordKey(T record, Schema schema);
-
-  /**
-   * Gets the ordering value in particular type.
-   *
-   * @param recordOption An option of record.
-   * @param metadataMap  A map containing the record metadata.
-   * @param schema       The Avro schema of the record.
-   * @param props        Properties.
-   * @return The ordering value.
-   */
-  public abstract Comparable getOrderingValue(Option<T> recordOption,
-                                              Map<String, Object> metadataMap,
-                                              Schema schema,
-                                              TypedProperties props);
-
-  /**
-   * Constructs a new {@link HoodieRecord} based on the record of engine-specific type and metadata for merging.
-   *
-   * @param recordOption An option of the record in engine-specific type if exists.
-   * @param metadataMap  The record metadata.
-   * @return A new instance of {@link HoodieRecord}.
-   */
-  public abstract HoodieRecord<T> constructHoodieRecord(Option<T> recordOption,
-                                                        Map<String, Object> metadataMap);
-
-  /**
-   * Seals the engine-specific record to make sure the data referenced in memory do not change.
-   *
-   * @param record The record.
-   * @return The record containing the same data that do not change in memory over time.
-   */
-  public abstract T seal(T record);
-
-  /**
-   * Generates metadata map based on the information.
-   *
-   * @param recordKey     Record key in String.
-   * @param partitionPath Partition path in String.
-   * @param orderingVal   Ordering value in String.
-   * @return A mapping containing the metadata.
-   */
-  public Map<String, Object> generateMetadataForRecord(
-      String recordKey, String partitionPath, Comparable orderingVal) {
-    Map<String, Object> meta = new HashMap<>();
-    meta.put(INTERNAL_META_RECORD_KEY, recordKey);
-    meta.put(INTERNAL_META_PARTITION_PATH, partitionPath);
-    meta.put(INTERNAL_META_ORDERING_FIELD, orderingVal);
-    return meta;
+  public void initRecordMergerForIngestion(TypedProperties properties) {
+    initRecordMerger(properties, true);
   }
 
   /**
-   * Generates metadata of the record. Only fetches record key that is necessary for merging.
-   *
-   * @param record The record.
-   * @param schema The Avro schema of the record.
-   * @return A mapping containing the metadata.
+   * Initializes the record merger based on the table configuration and properties.
+   * @param properties the properties for the reader.
+   * @param isIngestion indicates if the context is used in ingestion path.
    */
-  public Map<String, Object> generateMetadataForRecord(T record, Schema schema) {
-    Map<String, Object> meta = new HashMap<>();
-    meta.put(INTERNAL_META_RECORD_KEY, getRecordKey(record, schema));
-    meta.put(INTERNAL_META_SCHEMA, schema);
-    return meta;
+  private void initRecordMerger(TypedProperties properties, boolean isIngestion) {
+    if (recordMerger != null && mergeMode != null) {
+      // already initialized
+      return;
+    }
+    Option<String> writerPayloadClass = HoodieRecordPayload.getWriterPayloadOverride(properties);
+    RecordMergeMode recordMergeMode = tableConfig.getRecordMergeMode();
+    String mergeStrategyId = tableConfig.getRecordMergeStrategyId();
+    HoodieTableVersion tableVersion = tableConfig.getTableVersion();
+    // If the provided payload class differs from the table's payload class, we need to infer the correct merging behavior.
+    if (isIngestion && writerPayloadClass.map(className -> !className.equals(tableConfig.getPayloadClass())).orElse(false)) {
+      if (tableVersion.greaterThanOrEquals(HoodieTableVersion.NINE)) {
+        Map<String, String> mergeProperties = HoodieTableConfig.inferMergingConfigsForV9TableCreation(
+            null, writerPayloadClass.get(), null, tableConfig.getOrderingFieldsStr().orElse(null), tableVersion);
+        recordMergeMode = RecordMergeMode.valueOf(mergeProperties.get(RECORD_MERGE_MODE.key()));
+        mergeStrategyId = mergeProperties.get(RECORD_MERGE_STRATEGY_ID.key());
+      } else {
+        Triple<RecordMergeMode, String, String> triple = HoodieTableConfig.inferMergingConfigsForWrites(
+            null, writerPayloadClass.get(), null, tableConfig.getOrderingFieldsStr().orElse(null), tableVersion);
+        recordMergeMode = triple.getLeft();
+        mergeStrategyId = triple.getRight();
+      }
+    } else if (tableVersion.lesserThan(HoodieTableVersion.EIGHT)) {
+      Triple<RecordMergeMode, String, String> triple = inferMergingConfigsForPreV9Table(
+          recordMergeMode, tableConfig.getPayloadClass(),
+          mergeStrategyId, tableConfig.getOrderingFieldsStr().orElse(null), tableVersion);
+      recordMergeMode = triple.getLeft();
+      mergeStrategyId = triple.getRight();
+    }
+    this.mergeMode = recordMergeMode;
+    this.recordMerger = getRecordMerger(recordMergeMode, mergeStrategyId,
+        properties.getString(RECORD_MERGE_IMPL_CLASSES_WRITE_CONFIG_KEY,
+            properties.getString(RECORD_MERGE_IMPL_CLASSES_DEPRECATED_WRITE_CONFIG_KEY, "")));
+  }
+
+  public RecordMergeMode getMergeMode() {
+    return mergeMode;
   }
 
   /**
-   * Updates the schema and reset the ordering value in existing metadata mapping of a record.
-   *
-   * @param meta   Metadata in a mapping.
-   * @param schema New schema to set.
-   * @return The input metadata mapping.
+   * Get the {@link InstantRange} filter.
    */
-  public Map<String, Object> updateSchemaAndResetOrderingValInMetadata(Map<String, Object> meta,
-                                                                       Schema schema) {
-    meta.remove(INTERNAL_META_ORDERING_FIELD);
-    meta.put(INTERNAL_META_SCHEMA, schema);
-    return meta;
+  public Option<InstantRange> getInstantRange() {
+    return instantRangeOpt;
+  }
+
+  /**
+   * Apply the {@link InstantRange} filter to the file record iterator.
+   *
+   * @param fileRecordIterator File record iterator.
+   *
+   * @return File record iterator filter by {@link InstantRange}.
+   */
+  public ClosableIterator<T> applyInstantRangeFilter(ClosableIterator<T> fileRecordIterator) {
+    // For metadata table, no need to apply instant range to base file.
+    if (HoodieTableMetadata.isMetadataTable(tablePath)) {
+      return fileRecordIterator;
+    }
+    InstantRange instantRange = getInstantRange().get();
+    final Option<HoodieSchemaField> commitTimeFieldOpt = getSchemaHandler().getRequiredSchema().getField(HoodieRecord.COMMIT_TIME_METADATA_FIELD);
+    final int commitTimePos = commitTimeFieldOpt.orElseThrow(() ->
+        new HoodieSchemaException("Commit time metadata field '" + HoodieRecord.COMMIT_TIME_METADATA_FIELD + "' not found in required schema")).pos();
+    java.util.function.Predicate<T> instantFilter =
+        row -> instantRange.isInRange(recordContext.getMetaFieldValue(row, commitTimePos));
+    return new CloseableFilterIterator<>(fileRecordIterator, instantFilter);
   }
 
   /**
@@ -196,27 +372,34 @@ public abstract class HoodieReaderContext<T> {
    * skeleton file iterator, followed by all columns in the data file iterator
    *
    * @param skeletonFileIterator iterator over bootstrap skeleton files that contain hudi metadata columns
+   * @param skeletonRequiredSchema the HoodieSchema of the skeleton file iterator
    * @param dataFileIterator iterator over data files that were bootstrapped into the hudi table
+   * @param dataRequiredSchema the HoodieSchema of the data file iterator
+   * @param requiredPartitionFieldAndValues the partition field names and their values that are required by the query
    * @return iterator that concatenates the skeletonFileIterator and dataFileIterator
    */
-  public abstract ClosableIterator<T> mergeBootstrapReaders(ClosableIterator<T> skeletonFileIterator, ClosableIterator<T> dataFileIterator);
+  public abstract ClosableIterator<T> mergeBootstrapReaders(ClosableIterator<T> skeletonFileIterator,
+                                                            HoodieSchema skeletonRequiredSchema,
+                                                            ClosableIterator<T> dataFileIterator,
+                                                            HoodieSchema dataRequiredSchema,
+                                                            List<Pair<String, Object>> requiredPartitionFieldAndValues);
 
   /**
-   * Creates a function that will reorder records of schema "from" to schema of "to"
-   * all fields in "to" must be in "from", but not all fields in "from" must be in "to"
-   *
-   * @param from the schema of records to be passed into UnaryOperator
-   * @param to the schema of records produced by UnaryOperator
-   * @return a function that takes in a record and returns the record with reordered columns
+   * Optional per-row transformer applied to log-block records before they reach the merger.
+   * Engines override this to align records with a projected read schema (e.g. Spark 4.1's
+   * PushVariantIntoScan). Default is no projection.
    */
-  public abstract UnaryOperator<T> projectRecord(Schema from, Schema to);
+  public Option<Function<T, T>> getLogBlockRecordProjection(HoodieSchema dataBlockSchema) {
+    return Option.empty();
+  }
 
-  /**
-   * Extracts the record position value from the record itself.
-   *
-   * @return the record position in the base file.
-   */
-  public long extractRecordPosition(T record, Schema schema, String fieldName, long providedPositionIfNeeded) {
-    return providedPositionIfNeeded;
+  public Option<Pair<String, String>> getPayloadClasses(TypedProperties props) {
+    return getRecordMerger().map(merger -> {
+      if (merger.getMergingStrategy().equals(PAYLOAD_BASED_MERGE_STRATEGY_UUID)) {
+        String incomingPayloadClass = HoodieRecordPayload.getWriterPayloadOverride(props).orElseGet(tableConfig::getPayloadClass);
+        return Pair.of(tableConfig.getPayloadClass(), incomingPayloadClass);
+      }
+      return null;
+    });
   }
 }

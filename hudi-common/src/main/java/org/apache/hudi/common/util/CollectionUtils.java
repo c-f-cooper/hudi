@@ -22,6 +22,7 @@ import org.apache.hudi.common.util.collection.Pair;
 
 import java.lang.reflect.Array;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -69,6 +70,14 @@ public class CollectionUtils {
     return !isNullOrEmpty(c);
   }
 
+  public static boolean nonEmpty(Map<?, ?> m) {
+    return !isNullOrEmpty(m);
+  }
+
+  public static boolean containsAll(Map<?, ?> m1, Map<?, ?> m2) {
+    return m1.entrySet().containsAll(m2.entrySet());
+  }
+
   /**
    * Reduces provided {@link Collection} using provided {@code reducer} applied to
    * every element of the collection like following
@@ -114,6 +123,13 @@ public class CollectionUtils {
         Spliterators.spliteratorUnknownSize(iterator, Spliterator.ORDERED),
         false
     );
+  }
+
+  /**
+   * Collects provided {@link Iterator} to a {@link List}
+   */
+  public static <T> List<T> toList(Iterator<T> iterator) {
+    return toStream(iterator).collect(Collectors.toList());
   }
 
   /**
@@ -245,7 +261,7 @@ public class CollectionUtils {
 
   @SafeVarargs
   public static <T> List<T> createImmutableList(final T... elements) {
-    return Collections.unmodifiableList(Stream.of(elements).collect(Collectors.toList()));
+    return Collections.unmodifiableList(new ArrayList<>(Arrays.asList(elements)));
   }
 
   public static <T> List<T> createImmutableList(final List<T> list) {
@@ -259,6 +275,11 @@ public class CollectionUtils {
       map.put(pair.getLeft(), pair.getRight());
     }
     return Collections.unmodifiableMap(map);
+  }
+
+  public static <K, V> Map<V, K> reverseMap(final Map<K, V> map) {
+    return map.entrySet().stream().collect(Collectors.collectingAndThen(
+        Collectors.toMap(Map.Entry::getValue, Map.Entry::getKey), Collections::unmodifiableMap));
   }
 
   public static <K, V> Map<K, V> createImmutableMap(final Map<K, V> map) {

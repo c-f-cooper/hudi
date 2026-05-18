@@ -25,6 +25,9 @@ import org.apache.hudi.internal.schema.Type;
 import org.apache.hudi.internal.schema.Types;
 import org.apache.hudi.internal.schema.Types.Field;
 
+import lombok.AccessLevel;
+import lombok.NoArgsConstructor;
+
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
@@ -39,10 +42,8 @@ import java.util.stream.Collectors;
  * Util methods to help us do some operations on InternalSchema.
  * eg: column prune, filter rebuild for query engine...
  */
+@NoArgsConstructor(access = AccessLevel.PRIVATE)
 public class InternalSchemaUtils {
-
-  private InternalSchemaUtils() {
-  }
 
   /**
    * Create project internalSchema, based on the project names which produced by query engine.
@@ -90,7 +91,7 @@ public class InternalSchemaUtils {
         if (f != null) {
           newFields.add(f);
         } else {
-          throw new HoodieSchemaException(String.format("cannot find pruned id %s in currentSchema %s", id, schema.toString()));
+          throw new HoodieSchemaException(String.format("cannot find pruned id %s in currentSchema %s", id, schema));
         }
       }
     }
@@ -111,10 +112,8 @@ public class InternalSchemaUtils {
           Type newType = pruneType(f.type(), fieldIds);
           if (fieldIds.contains(f.fieldId())) {
             newTypes.add(f.type());
-          } else if (newType != null) {
-            newTypes.add(newType);
           } else {
-            newTypes.add(null);
+            newTypes.add(newType);
           }
         }
         boolean changed = false;

@@ -31,63 +31,54 @@ if [ ! -d "$CURR_DIR/packaging" ] ; then
   exit 1
 fi
 
+# Validate Java version (expects Java 11, matching <java.version> in pom.xml)
+EXPECTED_JAVA_VERSION=11
+JAVA_VERSION_OUTPUT=$("${JAVA_HOME:+$JAVA_HOME/bin/}java" -version 2>&1)
+JAVA_MAJOR_VERSION=$(echo "$JAVA_VERSION_OUTPUT" | awk -F[\".] '/version/ {print ($2 == "1" ? $3 : $2); exit}')
+if [ "$JAVA_MAJOR_VERSION" != "$EXPECTED_JAVA_VERSION" ]; then
+  echo "Error: Java $EXPECTED_JAVA_VERSION is required for this script, but found:"
+  echo "$JAVA_VERSION_OUTPUT"
+  echo "Set JAVA_HOME to a Java $EXPECTED_JAVA_VERSION installation and retry."
+  exit 1
+fi
+
 if [ "$#" -gt "1" ]; then
   echo "Only accept 0 or 1 argument. Use -h to see examples."
   exit 1
 fi
 
 declare -a ALL_VERSION_OPTS=(
-# Upload Spark specific modules and bundle jars
-# For Spark 2.4, Scala 2.11:
-# hudi-spark-common_2.11
-# hudi-spark_2.11
-# hudi-spark2_2.11
-# hudi-utilities_2.11
-# hudi-cli-bundle_2.11
-# hudi-spark2.4-bundle_2.11
-# hudi-utilities-bundle_2.11
-# hudi-utilities-slim-bundle_2.11
-"-Dscala-2.11 -Dspark2.4 -pl hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark2,hudi-spark-datasource/hudi-spark,hudi-utilities,packaging/hudi-spark-bundle,packaging/hudi-cli-bundle,packaging/hudi-utilities-bundle,packaging/hudi-utilities-slim-bundle -am"
-# For Spark 2.4, Scala 2.12:
-# hudi-spark2.4-bundle_2.12
-"-Dscala-2.12 -Dspark2.4 -pl packaging/hudi-spark-bundle -am"
-# For Spark 3.0, Scala 2.12:
-# hudi-spark3.0.x_2.12
-# hudi-spark3.0-bundle_2.12
-"-Dscala-2.12 -Dspark3.0 -pl hudi-spark-datasource/hudi-spark3.0.x,packaging/hudi-spark-bundle -am"
-# For Spark 3.2, Scala 2.12:
-# hudi-spark3.2.x_2.12
-# hudi-spark3.2plus-common
-# hudi-spark3.2-bundle_2.12
-"-Dscala-2.12 -Dspark3.2 -pl hudi-spark-datasource/hudi-spark3.2.x,hudi-spark-datasource/hudi-spark3.2plus-common,packaging/hudi-spark-bundle -am"
+# For Spark 3.5, Scala 2.13:
+# hudi-spark-common_2.13
+# hudi-spark_2.13
+# hudi-spark3.5.x_2.13
+# hudi-utilities_2.13
+# hudi-spark3.5-bundle_2.13
+# hudi-utilities-bundle_2.13
+# hudi-utilities-slim-bundle_2.13
+# hudi-cli-bundle_2.13
+"-T 1C -Dscala-2.13 -Dspark3.5 -pl hudi-spark-datasource/hudi-spark-common,hudi-spark-datasource/hudi-spark3.5.x,hudi-spark-datasource/hudi-spark,hudi-utilities,packaging/hudi-spark-bundle,packaging/hudi-utilities-bundle,packaging/hudi-utilities-slim-bundle,packaging/hudi-cli-bundle -am"
 # For Spark 3.3, Scala 2.12:
 # hudi-spark3.3.x_2.12
-# hudi-spark3.2-bundle_2.12
-"-Dscala-2.12 -Dspark3.3 -pl hudi-spark-datasource/hudi-spark3.3.x,packaging/hudi-spark-bundle -am"
+# hudi-spark3.3-bundle_2.12
+"-T 1C -Dscala-2.12 -Dspark3.3 -pl hudi-spark-datasource/hudi-spark3.3.x,packaging/hudi-spark-bundle -am"
 # For Spark 3.4, Scala 2.12:
 # hudi-spark3.4.x_2.12
 # hudi-spark3.4-bundle_2.12
-"-Dscala-2.12 -Dspark3.4 -pl hudi-spark-datasource/hudi-spark3.4.x,packaging/hudi-spark-bundle -am"
-# For Spark 3.5, Scala 2.12:
-# hudi-spark3.5.x_2.12
-# hudi-cli-bundle_2.12
-# hudi-spark3.5-bundle_2.12
-"-Dscala-2.12 -Dspark3.5 -pl hudi-spark-datasource/hudi-spark3.5.x,packaging/hudi-spark-bundle,packaging/hudi-cli-bundle -am"
-# For Spark 3.1, Scala 2.12:
-# All other modules and bundles using avro 1.8
-"-Dscala-2.12 -Dspark3.1"
+"-T 1C -Dscala-2.12 -Dspark3.4 -pl hudi-spark-datasource/hudi-spark3.4.x,packaging/hudi-spark-bundle -am"
+# For all modules spark3.5
+"-Dscala-2.12 -Dspark3.5 -Dflink1.20 -Ddocker.compose.skip=true"
 
 # Upload legacy Spark bundles (not overwriting previous uploads as these jar names are unique)
-"-Dscala-2.11 -Dspark2 -pl packaging/hudi-spark-bundle -am" # for legacy bundle name hudi-spark-bundle_2.11
-"-Dscala-2.12 -Dspark2 -pl packaging/hudi-spark-bundle -am" # for legacy bundle name hudi-spark-bundle_2.12
-"-Dscala-2.12 -Dspark3 -pl packaging/hudi-spark-bundle -am" # for legacy bundle name hudi-spark3-bundle_2.12
+"-T 1C -Dscala-2.12 -Dspark3 -pl packaging/hudi-spark-bundle -am" # for legacy bundle name hudi-spark3-bundle_2.12
 
 # Upload Flink bundles (overwriting previous uploads)
-"-Dscala-2.12 -Dflink1.14 -Davro.version=1.10.0 -pl packaging/hudi-flink-bundle -am"
-"-Dscala-2.12 -Dflink1.15 -Davro.version=1.10.0 -pl packaging/hudi-flink-bundle -am"
-"-Dscala-2.12 -Dflink1.16 -Davro.version=1.11.1 -pl packaging/hudi-flink-bundle -am"
-"-Dscala-2.12 -Dflink1.17 -Davro.version=1.11.1 -pl packaging/hudi-flink-bundle -am"
-"-Dscala-2.12 -Dflink1.18 -Davro.version=1.11.1 -pl packaging/hudi-flink-bundle -am"
+"-T 1C -Dscala-2.12 -Dspark3.5 -Dflink1.17 -Davro.version=1.11.4 -Dparquet.version=1.12.3 -pl packaging/hudi-flink-bundle -am"
+"-T 1C -Dscala-2.12 -Dspark3.5 -Dflink1.18 -Davro.version=1.11.4 -Dparquet.version=1.13.1 -pl packaging/hudi-flink-bundle -am"
+"-T 1C -Dscala-2.12 -Dspark3.5 -Dflink1.19 -Davro.version=1.11.4 -Dparquet.version=1.13.1 -pl packaging/hudi-flink-bundle -am"
+"-T 1C -Dscala-2.12 -Dspark3.5 -Dflink1.20 -Davro.version=1.11.4 -Dparquet.version=1.13.1 -pl packaging/hudi-flink-bundle -am"
+"-T 1C -Dscala-2.12 -Dspark3.5 -Dflink2.0 -Davro.version=1.11.4 -Dparquet.version=1.14.4 -pl packaging/hudi-flink-bundle -am"
+"-T 1C -Dscala-2.12 -Dspark3.5 -Dflink2.1 -Davro.version=1.11.4 -Dparquet.version=1.15.2 -pl packaging/hudi-flink-bundle -am"
 )
 printf -v joined "'%s'\n" "${ALL_VERSION_OPTS[@]}"
 

@@ -20,6 +20,7 @@ package org.apache.hudi.metaserver.client;
 
 import org.apache.hudi.common.config.HoodieMetaserverConfig;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.timeline.versioning.DefaultInstantGenerator;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.common.util.RetryHelper;
@@ -28,16 +29,17 @@ import org.apache.hudi.metaserver.thrift.Table;
 import org.apache.hudi.metaserver.thrift.ThriftHoodieMetaserver;
 import org.apache.hudi.metaserver.util.EntityConversions;
 
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TSocket;
 import org.apache.thrift.transport.TTransport;
 import org.apache.thrift.transport.TTransportException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.util.Comparator;
 import java.util.List;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -45,16 +47,19 @@ import java.util.stream.Collectors;
 /**
  * HoodieMetaserverClientImp based on thrift.
  */
+@Slf4j
 public class HoodieMetaserverClientImp implements HoodieMetaserverClient {
 
-  private static final Logger LOG =  LoggerFactory.getLogger(HoodieMetaserverClientImp.class);
   private final HoodieMetaserverConfig config;
   private final int retryLimit;
   private final long retryDelayMs;
+  @Getter
   private boolean isConnected;
+  @Getter
   private boolean isLocal;
-  private ThriftHoodieMetaserver.Iface client;
+  private final ThriftHoodieMetaserver.Iface client;
   private TTransport transport;
+  private final DefaultInstantGenerator instantGenerator = new DefaultInstantGenerator();
 
   public HoodieMetaserverClientImp(HoodieMetaserverConfig config) {
     this.config = config;
@@ -79,7 +84,7 @@ public class HoodieMetaserverClientImp implements HoodieMetaserverClient {
             .tryWith(() -> {
               transport.open();
               this.isConnected = true;
-              LOG.info("Connected to meta server: " + msUri);
+              log.info("Connected to meta server: {}", msUri);
               return null;
             }).start();
       } catch (TTransportException e) {
@@ -109,7 +114,8 @@ public class HoodieMetaserverClientImp implements HoodieMetaserverClient {
   @Override
   public List<HoodieInstant> listInstants(String db, String tb, int commitNum) {
     return exceptionWrapper(() -> this.client.listInstants(db, tb, commitNum).stream()
-        .map(EntityConversions::fromTHoodieInstant)
+        .map(instant -> EntityConversions.fromTHoodieInstant(instant, instantGenerator))
+        .sorted(Comparator.comparing(HoodieInstant::requestedTime).reversed())
         .collect(Collectors.toList())).get();
   }
 
@@ -132,11 +138,12 @@ public class HoodieMetaserverClientImp implements HoodieMetaserverClient {
   }
 
   @Override
-  public void transitionInstantState(String db, String tb, HoodieInstant fromInstant, HoodieInstant toInstant, Option<byte[]> content) {
+  public HoodieInstant transitionInstantState(String db, String tb, HoodieInstant fromInstant, HoodieInstant toInstant, Option<byte[]> content) {
     exceptionWrapper(() -> this.client.transitionInstantState(db, tb,
         EntityConversions.toTHoodieInstant(fromInstant),
         EntityConversions.toTHoodieInstant(toInstant),
         getByteBuffer(content))).get();
+    return toInstant;
   }
 
   @Override
@@ -152,17 +159,6 @@ public class HoodieMetaserverClientImp implements HoodieMetaserverClient {
       byteBuffer = ByteBuffer.allocate(0);
     }
     return byteBuffer;
-  }
-
-  // used for test
-  @Override
-  public boolean isLocal() {
-    return isLocal;
-  }
-
-  @Override
-  public boolean isConnected() {
-    return isConnected;
   }
 
   @Override

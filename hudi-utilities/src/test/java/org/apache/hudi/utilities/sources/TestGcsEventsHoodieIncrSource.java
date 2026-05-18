@@ -19,6 +19,7 @@
 package org.apache.hudi.utilities.sources;
 
 import org.apache.hudi.client.SparkRDDWriteClient;
+import org.apache.hudi.client.WriteClientTestUtils;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
 import org.apache.hudi.common.config.TypedProperties;
@@ -26,7 +27,11 @@ import org.apache.hudi.common.model.HoodieAvroPayload;
 import org.apache.hudi.common.model.HoodieAvroRecord;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
+import org.apache.hudi.common.table.checkpoint.StreamerCheckpointV1;
+import org.apache.hudi.common.table.checkpoint.StreamerCheckpointV2;
 import org.apache.hudi.common.table.timeline.versioning.TimelineLayoutVersion;
 import org.apache.hudi.common.testutils.SchemaTestUtil;
 import org.apache.hudi.common.util.Option;
@@ -36,17 +41,22 @@ import org.apache.hudi.config.HoodieArchivalConfig;
 import org.apache.hudi.config.HoodieCleanConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.testutils.SparkClientFunctionalTestHarness;
+import org.apache.hudi.utilities.UtilHelpers;
+import org.apache.hudi.utilities.config.CloudSourceConfig;
+import org.apache.hudi.utilities.ingestion.HoodieIngestionMetrics;
 import org.apache.hudi.utilities.schema.FilebasedSchemaProvider;
 import org.apache.hudi.utilities.schema.SchemaProvider;
+import org.apache.hudi.utilities.sources.S3EventsHoodieIncrSourceHarness.TestSourceProfile;
 import org.apache.hudi.utilities.sources.helpers.CloudDataFetcher;
+import org.apache.hudi.utilities.sources.helpers.CloudObjectsSelectorCommon;
 import org.apache.hudi.utilities.sources.helpers.IncrSourceHelper;
 import org.apache.hudi.utilities.sources.helpers.QueryInfo;
 import org.apache.hudi.utilities.sources.helpers.QueryRunner;
-import org.apache.hudi.utilities.sources.helpers.gcs.GcsObjectMetadataFetcher;
+import org.apache.hudi.utilities.streamer.DefaultStreamContext;
+import org.apache.hudi.utilities.streamer.SourceProfileSupplier;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.spark.api.java.JavaRDD;
@@ -59,8 +69,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
-import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,23 +79,28 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.stream.Collectors;
 
+import static org.apache.hudi.common.table.timeline.HoodieTimeline.COMMIT_ACTION;
 import static org.apache.hudi.testutils.Assertions.assertNoWriteErrors;
 import static org.apache.hudi.utilities.sources.helpers.IncrSourceHelper.MissingCheckpointStrategy.READ_UPTO_LATEST_COMMIT;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.times;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarness {
 
-  private static final Schema GCS_METADATA_SCHEMA = SchemaTestUtil.getSchemaFromResource(
-      TestGcsEventsHoodieIncrSource.class, "/streamer-config/gcs-metadata.avsc", true);
+  private static final HoodieSchema GCS_METADATA_SCHEMA = SchemaTestUtil.getSchemaFromResource(
+      TestGcsEventsHoodieIncrSource.class, "/streamer-config/gcs-metadata.avsc", false);
+  private static final String IGNORE_FILE_EXTENSION = ".ignore";
 
   private ObjectMapper mapper = new ObjectMapper();
 
@@ -92,12 +108,15 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
   protected java.nio.file.Path tempDir;
 
   @Mock
-  CloudDataFetcher gcsObjectDataFetcher;
-
-  @Mock
   QueryRunner queryRunner;
   @Mock
   QueryInfo queryInfo;
+  @Mock
+  CloudObjectsSelectorCommon cloudObjectsSelectorCommon;
+  @Mock
+  HoodieIngestionMetrics metrics;
+  @Mock
+  SourceProfileSupplier sourceProfileSupplier;
 
   protected Option<SchemaProvider> schemaProvider;
   private HoodieTableMetaClient metaClient;
@@ -107,12 +126,12 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
 
   @BeforeEach
   public void setUp() throws IOException {
-    metaClient = getHoodieMetaClient(hadoopConf(), basePath());
+    metaClient = getHoodieMetaClient(storageConf(), basePath());
     jsc = JavaSparkContext.fromSparkContext(spark().sparkContext());
     String schemaFilePath = TestGcsEventsHoodieIncrSource.class.getClassLoader().getResource("schema/sample_gcs_data.avsc").getPath();
     TypedProperties props = new TypedProperties();
-    props.put("hoodie.deltastreamer.schemaprovider.source.schema.file", schemaFilePath);
-    props.put("hoodie.deltastreamer.schema.provider.class.name", FilebasedSchemaProvider.class.getName());
+    props.put("hoodie.streamer.schemaprovider.source.schema.file", schemaFilePath);
+    props.put("hoodie.streamer.schema.provider.class.name", FilebasedSchemaProvider.class.getName());
     this.schemaProvider = Option.of(new FilebasedSchemaProvider(props, jsc));
     MockitoAnnotations.initMocks(this);
   }
@@ -130,9 +149,6 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
     Pair<String, List<HoodieRecord>> inserts = writeGcsMetadataRecords(commitTimeForWrites);
 
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of(commitTimeForReads), 100L, inserts.getKey());
-
-    verify(gcsObjectDataFetcher, times(0)).getCloudObjectDataDF(
-        Mockito.any(), Mockito.any(), Mockito.any(), eq(schemaProvider));
   }
 
   @Test
@@ -148,7 +164,7 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
     Dataset<Row> inputDs = generateDataset(filePathSizeAndCommitTime);
 
     setMockQueryRunner(inputDs);
-
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(null);
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of(commitTimeForReads), 100L, "1#path/to/file1.json");
   }
 
@@ -167,7 +183,7 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
     Dataset<Row> inputDs = generateDataset(filePathSizeAndCommitTime);
 
     setMockQueryRunner(inputDs);
-
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(null);
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of(commitTimeForReads), 250L, "1#path/to/file2.json");
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of("1#path/to/file2.json"), 250L, "1#path/to/file3.json");
   }
@@ -190,40 +206,61 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
     Dataset<Row> inputDs = generateDataset(filePathSizeAndCommitTime);
 
     setMockQueryRunner(inputDs);
-
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(null);
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of(commitTimeForReads), 250L, "1#path/to/file10006.json");
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of("1#path/to/file10006.json"), 250L, "1#path/to/file10007.json");
   }
 
-  @Test
-  public void testTwoFilesAndContinueAcrossCommits() throws IOException {
+  @ParameterizedTest
+  @ValueSource(strings = {
+      ".json",
+      ".gz"
+  })
+  public void testTwoFilesAndContinueAcrossCommits(String extension) throws IOException {
     String commitTimeForWrites = "2";
     String commitTimeForReads = "1";
 
     Pair<String, List<HoodieRecord>> inserts = writeGcsMetadataRecords(commitTimeForWrites);
+
+    TypedProperties typedProperties = setProps(READ_UPTO_LATEST_COMMIT);
+    // In the case the extension is explicitly set to something other than the file format.
+    if (!extension.endsWith("json")) {
+      typedProperties.setProperty(CloudSourceConfig.CLOUD_DATAFILE_EXTENSION.key(), extension);
+    }
+
     List<Triple<String, Long, String>> filePathSizeAndCommitTime = new ArrayList<>();
-    // Add file paths and sizes to the list
-    filePathSizeAndCommitTime.add(Triple.of("path/to/file1.json", 100L, "1"));
-    filePathSizeAndCommitTime.add(Triple.of("path/to/file3.json", 200L, "1"));
-    filePathSizeAndCommitTime.add(Triple.of("path/to/file2.json", 150L, "1"));
-    filePathSizeAndCommitTime.add(Triple.of("path/to/file4.json", 50L, "2"));
-    filePathSizeAndCommitTime.add(Triple.of("path/to/file5.json", 150L, "2"));
+    // Add file paths and sizes to the list.
+    // Check with a couple of invalid file extensions to ensure they are filtered out.
+    filePathSizeAndCommitTime.add(Triple.of(String.format("path/to/file1%s", extension), 100L, "1"));
+    filePathSizeAndCommitTime.add(Triple.of(String.format("path/to/file2%s", IGNORE_FILE_EXTENSION), 800L, "1"));
+    filePathSizeAndCommitTime.add(Triple.of(String.format("path/to/file3%s", extension), 200L, "1"));
+    filePathSizeAndCommitTime.add(Triple.of(String.format("path/to/file2%s", extension), 150L, "1"));
+    filePathSizeAndCommitTime.add(Triple.of(String.format("path/to/file4%s", extension), 50L, "2"));
+    filePathSizeAndCommitTime.add(Triple.of(String.format("path/to/file4%s", IGNORE_FILE_EXTENSION), 200L, "2"));
+    filePathSizeAndCommitTime.add(Triple.of(String.format("path/to/file5%s", extension), 150L, "2"));
 
     Dataset<Row> inputDs = generateDataset(filePathSizeAndCommitTime);
-
+    List<Long> bytesPerPartition = Arrays.asList(10L, 100L, -1L);
     setMockQueryRunner(inputDs);
 
-    readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of(commitTimeForReads), 100L, "1#path/to/file1.json");
-    readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of("1#path/to/file1.json"), 100L, "1#path/to/file2.json");
-    readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of("1#path/to/file2.json"), 1000L, "2#path/to/file5.json");
-    readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of(commitTimeForReads), 100L, "1#path/to/file1.json");
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(new TestSourceProfile(100L, 0, bytesPerPartition.get(0)));
+    readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of("1"), 100L, "1#path/to/file1" + extension, typedProperties);
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(new TestSourceProfile(100L, 0, bytesPerPartition.get(1)));
+    readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of("1#path/to/file1" + extension), 100L, "1#path/to/file2" + extension, typedProperties);
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(new TestSourceProfile(1000L, 0, bytesPerPartition.get(2)));
+    readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of("1#path/to/file2" + extension), 1000L, "2#path/to/file5" + extension, typedProperties);
+    // Verify the partitions being passed in getCloudObjectDataDF are correct.
+    List<Integer> numPartitions = Arrays.asList(12, 2, 1);
+    ArgumentCaptor<Integer> argumentCaptor = ArgumentCaptor.forClass(Integer.class);
+    verify(cloudObjectsSelectorCommon, atLeastOnce()).loadAsDataset(any(), any(), any(), eq(schemaProvider), argumentCaptor.capture());
+    Assertions.assertEquals(numPartitions, argumentCaptor.getAllValues());
   }
 
   @ParameterizedTest
   @CsvSource({
       "1,1#path/to/file2.json,3#path/to/file4.json,1#path/to/file1.json,1",
       "2,1#path/to/file2.json,3#path/to/file4.json,1#path/to/file1.json,2",
-      "3,3#path/to/file5.json,3,1#path/to/file1.json,3"
+      "3,3#path/to/file5.json,3#path/to/file5.json,1#path/to/file1.json,3"
   })
   public void testSplitSnapshotLoad(String snapshotCheckPoint, String exptected1, String exptected2, String exptected3, String exptected4) throws IOException {
 
@@ -244,16 +281,64 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
 
     setMockQueryRunner(inputDs, Option.of(snapshotCheckPoint));
     TypedProperties typedProperties = setProps(READ_UPTO_LATEST_COMMIT);
-    typedProperties.setProperty("hoodie.deltastreamer.source.cloud.data.ignore.relpath.prefix", "path/to/skip");
+    typedProperties.setProperty("hoodie.streamer.source.cloud.data.ignore.relpath.prefix", "path/to/skip");
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(null);
+    List<Long> bytesPerPartition = Arrays.asList(10L, 20L, -1L, 1000L * 1000L * 1000L);
+
+    // If the computed number of partitions based on bytes is less than this value, it should use this value for num partitions.
+    int sourcePartitions = 2;
     //1. snapshot query, read all records
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(new TestSourceProfile(50000L, sourcePartitions, bytesPerPartition.get(0)));
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.empty(), 50000L, exptected1, typedProperties);
     //2. incremental query, as commit is present in timeline
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(new TestSourceProfile(10L, sourcePartitions, bytesPerPartition.get(1)));
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.of(exptected1), 10L, exptected2, typedProperties);
     //3. snapshot query with source limit less than first commit size
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(new TestSourceProfile(50L, sourcePartitions, bytesPerPartition.get(2)));
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.empty(), 50L, exptected3, typedProperties);
-    typedProperties.setProperty("hoodie.deltastreamer.source.cloud.data.ignore.relpath.prefix", "path/to");
+    typedProperties.setProperty("hoodie.streamer.source.cloud.data.ignore.relpath.prefix", "path/to");
     //4. As snapshotQuery will return 1 -> same would be return as nextCheckpoint (dataset is empty due to ignore prefix).
+    when(sourceProfileSupplier.getSourceProfile()).thenReturn(new TestSourceProfile(50L, sourcePartitions, bytesPerPartition.get(3)));
     readAndAssert(READ_UPTO_LATEST_COMMIT, Option.empty(), 50L, exptected4, typedProperties);
+    // Verify the partitions being passed in getCloudObjectDataDF are correct.
+    ArgumentCaptor<Integer> argumentCaptor = ArgumentCaptor.forClass(Integer.class);
+    ArgumentCaptor<Integer> argumentCaptorForMetrics = ArgumentCaptor.forClass(Integer.class);
+    verify(cloudObjectsSelectorCommon, atLeastOnce()).loadAsDataset(any(), any(), any(), eq(schemaProvider), argumentCaptor.capture());
+    verify(metrics, atLeastOnce()).updateStreamerSourceParallelism(argumentCaptorForMetrics.capture());
+    List<Integer> numPartitions;
+    if (snapshotCheckPoint.equals("1") || snapshotCheckPoint.equals("2")) {
+      numPartitions = Arrays.asList(12, 3, sourcePartitions);
+    } else {
+      numPartitions = Arrays.asList(23, sourcePartitions);
+    }
+    Assertions.assertEquals(numPartitions, argumentCaptor.getAllValues());
+    Assertions.assertEquals(numPartitions, argumentCaptorForMetrics.getAllValues());
+  }
+
+  @Test
+  public void testUnsupportedCheckpoint() {
+    TypedProperties typedProperties = setProps(READ_UPTO_LATEST_COMMIT);
+    GcsEventsHoodieIncrSource incrSource = new GcsEventsHoodieIncrSource(typedProperties, jsc(),
+        spark(),
+        new CloudDataFetcher(typedProperties, jsc(), spark(), metrics, cloudObjectsSelectorCommon),
+        queryRunner,
+        new DefaultStreamContext(schemaProvider.orElse(null), Option.of(sourceProfileSupplier)));
+
+    Exception exception = assertThrows(IllegalArgumentException.class,
+        () -> incrSource.translateCheckpoint(Option.of(new StreamerCheckpointV2("1"))));
+    assertEquals("For GcsEventsHoodieIncrSource, only StreamerCheckpointV1, i.e., requested time-based "
+            + "checkpoint, is supported. Checkpoint provided is: StreamerCheckpointV2{checkpointKey='1'}",
+        exception.getMessage());
+  }
+
+  @Test
+  public void testCreateSource() throws IOException {
+    TypedProperties typedProperties = setProps(READ_UPTO_LATEST_COMMIT);
+    Source gcsSource = UtilHelpers.createSource(GcsEventsHoodieIncrSource.class.getName(), typedProperties, jsc(), spark(), metrics,
+        new DefaultStreamContext(schemaProvider.orElse(null), Option.of(sourceProfileSupplier)));
+    assertEquals(Source.SourceType.ROW, gcsSource.getSourceType());
+    assertThrows(IOException.class, () -> UtilHelpers.createSource(GcsEventsHoodieIncrSource.class.getName(), new TypedProperties(), jsc(), spark(), metrics,
+        new DefaultStreamContext(schemaProvider.orElse(null), Option.of(sourceProfileSupplier))));
   }
 
   private void setMockQueryRunner(Dataset<Row> inputDs) {
@@ -262,7 +347,7 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
 
   private void setMockQueryRunner(Dataset<Row> inputDs, Option<String> nextCheckPointOpt) {
 
-    when(queryRunner.run(Mockito.any(QueryInfo.class), Mockito.any())).thenAnswer(invocation -> {
+    when(queryRunner.run(any(QueryInfo.class), any())).thenAnswer(invocation -> {
       QueryInfo queryInfo = invocation.getArgument(0);
       QueryInfo updatedQueryInfo = nextCheckPointOpt.map(nextCheckPoint ->
               queryInfo.withUpdatedEndInstant(nextCheckPoint))
@@ -283,21 +368,23 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
                              TypedProperties typedProperties) {
 
     GcsEventsHoodieIncrSource incrSource = new GcsEventsHoodieIncrSource(typedProperties, jsc(),
-        spark(), schemaProvider.orElse(null), new GcsObjectMetadataFetcher(typedProperties, "json"), gcsObjectDataFetcher, queryRunner);
+        spark(), new CloudDataFetcher(typedProperties, jsc(), spark(), metrics, cloudObjectsSelectorCommon), queryRunner,
+        new DefaultStreamContext(schemaProvider.orElse(null), Option.of(sourceProfileSupplier)));
 
-    Pair<Option<Dataset<Row>>, String> dataAndCheckpoint = incrSource.fetchNextBatch(checkpointToPull, sourceLimit);
+    Pair<Option<Dataset<Row>>, Checkpoint> dataAndCheckpoint = incrSource.fetchNextBatch(
+        checkpointToPull.isPresent() ? Option.of(new StreamerCheckpointV1(checkpointToPull.get())) : Option.empty(), sourceLimit);
 
     Option<Dataset<Row>> datasetOpt = dataAndCheckpoint.getLeft();
-    String nextCheckPoint = dataAndCheckpoint.getRight();
+    Checkpoint nextCheckPoint = dataAndCheckpoint.getRight();
 
     Assertions.assertNotNull(nextCheckPoint);
-    Assertions.assertEquals(expectedCheckpoint, nextCheckPoint);
+    Assertions.assertEquals(new StreamerCheckpointV1(expectedCheckpoint), nextCheckPoint);
   }
 
   private void readAndAssert(IncrSourceHelper.MissingCheckpointStrategy missingCheckpointStrategy,
                              Option<String> checkpointToPull, long sourceLimit, String expectedCheckpoint) {
     TypedProperties typedProperties = setProps(missingCheckpointStrategy);
-    typedProperties.put("hoodie.deltastreamer.source.hoodieincr.file.format", "json");
+    typedProperties.put("hoodie.streamer.source.hoodieincr.file.format", "json");
     readAndAssert(missingCheckpointStrategy, checkpointToPull, sourceLimit, expectedCheckpoint, typedProperties);
   }
 
@@ -309,7 +396,7 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
         + "?generation=%s&alt=media", bucketName, filename, generation);
     String selfLink = String.format("https://www.googleapis.com/storage/v1/b/%s/o/%s", bucketName, filename);
 
-    GenericRecord rec = new GenericData.Record(GCS_METADATA_SCHEMA);
+    GenericRecord rec = new GenericData.Record(GCS_METADATA_SCHEMA.toAvroSchema());
     rec.put("_row_key", id);
     rec.put("partition_path", bucketName);
     rec.put("timestamp", Long.parseLong(commitTime));
@@ -350,32 +437,30 @@ public class TestGcsEventsHoodieIncrSource extends SparkClientFunctionalTestHarn
     HoodieWriteConfig writeConfig = getWriteConfig();
     try (SparkRDDWriteClient writeClient = getHoodieWriteClient(writeConfig)) {
 
-      writeClient.startCommitWithTime(commitTime);
+      WriteClientTestUtils.startCommitWithTime(writeClient, commitTime);
       List<HoodieRecord> gcsMetadataRecords = Arrays.asList(
           getGcsMetadataRecord(commitTime, "data-file-1.json", "bucket-1", "1"),
           getGcsMetadataRecord(commitTime, "data-file-2.json", "bucket-1", "1"),
           getGcsMetadataRecord(commitTime, "data-file-3.json", "bucket-1", "1"),
           getGcsMetadataRecord(commitTime, "data-file-4.json", "bucket-1", "1")
       );
-      JavaRDD<WriteStatus> result = writeClient.upsert(jsc().parallelize(gcsMetadataRecords, 1), commitTime);
-
-      List<WriteStatus> statuses = result.collect();
-      assertNoWriteErrors(statuses);
-
+      List<WriteStatus> statusList = writeClient.upsert(jsc().parallelize(gcsMetadataRecords, 1), commitTime).collect();
+      writeClient.commit(commitTime, jsc.parallelize(statusList), Option.empty(), COMMIT_ACTION, Collections.emptyMap(), Option.empty());
+      assertNoWriteErrors(statusList);
       return Pair.of(commitTime, gcsMetadataRecords);
     }
   }
 
   private TypedProperties setProps(IncrSourceHelper.MissingCheckpointStrategy missingCheckpointStrategy) {
-    Properties properties = new Properties();
+    TypedProperties properties = new TypedProperties();
     //String schemaFilePath = TestGcsEventsHoodieIncrSource.class.getClassLoader().getResource("schema/sample_gcs_data.avsc").getPath();
-    //properties.put("hoodie.deltastreamer.schemaprovider.source.schema.file", schemaFilePath);
-    properties.put("hoodie.deltastreamer.schema.provider.class.name", FilebasedSchemaProvider.class.getName());
-    properties.setProperty("hoodie.deltastreamer.source.hoodieincr.path", basePath());
-    properties.setProperty("hoodie.deltastreamer.source.hoodieincr.missing.checkpoint.strategy",
+    //properties.put("hoodie.streamer.schemaprovider.source.schema.file", schemaFilePath);
+    properties.put("hoodie.streamer.schema.provider.class.name", FilebasedSchemaProvider.class.getName());
+    properties.setProperty("hoodie.streamer.source.hoodieincr.path", basePath());
+    properties.setProperty("hoodie.streamer.source.hoodieincr.missing.checkpoint.strategy",
         missingCheckpointStrategy.name());
-    properties.setProperty("hoodie.deltastreamer.source.gcsincr.datafile.format", "json");
-    return new TypedProperties(properties);
+    properties.setProperty(CloudSourceConfig.DATAFILE_FORMAT.key(), "json");
+    return properties;
   }
 
   private HoodieWriteConfig.Builder getConfigBuilder(String basePath, HoodieTableMetaClient metaClient) {

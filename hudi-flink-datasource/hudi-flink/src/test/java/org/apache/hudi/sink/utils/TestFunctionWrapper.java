@@ -21,7 +21,9 @@ package org.apache.hudi.sink.utils;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.sink.StreamWriteOperatorCoordinator;
+import org.apache.hudi.sink.common.AbstractWriteFunction;
 import org.apache.hudi.sink.event.WriteMetadataEvent;
+import org.apache.hudi.sink.partitioner.BucketAssignFunction;
 
 import org.apache.flink.runtime.operators.coordination.MockOperatorCoordinatorContext;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
@@ -44,14 +46,40 @@ public interface TestFunctionWrapper<I> {
   void invoke(I record) throws Exception;
 
   /**
-   * Returns the event buffer sent by the write tasks.
+   * Whether the function wrapper support streaming write index data to metadata table.
+   */
+  default boolean supportStreamingWriteIndex() {
+    return false;
+  }
+
+  /**
+   * Returns the latest index event buffer sent by the index write tasks.
+   */
+  default WriteMetadataEvent[] getIndexEventBuffer() {
+    throw new UnsupportedOperationException("Not supported yet.");
+  }
+
+  /**
+   * Returns the latest event buffer sent by the write tasks.
    */
   WriteMetadataEvent[] getEventBuffer();
 
   /**
-   * Returns the next event.
+   * Returns the event buffer sent by the write tasks with given checkpoint ID.
+   */
+  WriteMetadataEvent[] getEventBuffer(long checkpointId);
+
+  /**
+   * Returns the next event sent to Coordinator.
    */
   OperatorEvent getNextEvent();
+
+  /**
+   * Returns the next event sent to subtask.
+   */
+  default OperatorEvent getNextSubTaskEvent() {
+    throw new UnsupportedOperationException();
+  }
 
   /**
    * Snapshot all the functions in the wrapper.
@@ -69,6 +97,14 @@ public interface TestFunctionWrapper<I> {
   void checkpointComplete(long checkpointId);
 
   /**
+   * Keep this interface for batch inline compaction job. The batch pipeline triggers the commit of Hudi table
+   * with "endInput" events in the coordinator whereas there is no good chance to plug in the compaction sub-pipeline.
+   */
+  default void inlineCompaction() {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
    * Triggers the job failover, including the coordinator and the write tasks.
    */
   default void jobFailover() throws Exception {
@@ -83,14 +119,41 @@ public interface TestFunctionWrapper<I> {
   }
 
   /**
+   * Triggers Job level fail, so the coordinator need re-create a new instance.
+   * @throws Exception
+   */
+  default void restartCoordinator() throws Exception {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
    * Returns the operator coordinator.
    */
   StreamWriteOperatorCoordinator getCoordinator();
 
   /**
+   * Returns the write function.
+   */
+  AbstractWriteFunction getWriteFunction();
+
+  /**
+   * Returns the bucket assigner function
+   */
+  default BucketAssignFunction getBucketAssignFunction() {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
    * Returns the data buffer of the write task.
    */
   default Map<String, List<HoodieRecord>> getDataBuffer() {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
+   * Returns the data buffer of the index write task.
+   */
+  default List<HoodieRecord> getIndexDataBuffer() {
     throw new UnsupportedOperationException();
   }
 
@@ -126,13 +189,6 @@ public interface TestFunctionWrapper<I> {
    * Returns whether the bootstrap function already bootstrapped.
    */
   default boolean isAlreadyBootstrap() throws Exception {
-    throw new UnsupportedOperationException();
-  }
-
-  /**
-   * Returns whether the write task is confirming.
-   */
-  default boolean isConforming() {
     throw new UnsupportedOperationException();
   }
 

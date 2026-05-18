@@ -18,23 +18,27 @@
 
 package org.apache.hudi.functional
 
-import org.apache.hadoop.fs.Path
 import org.apache.hudi.DataSourceWriteOptions._
 import org.apache.hudi.common.config.{HoodieMetadataConfig, TypedProperties}
+import org.apache.hudi.common.data.HoodieListData
 import org.apache.hudi.common.model.HoodieTableType
-import org.apache.hudi.common.table.timeline.HoodieInstant
 import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient}
-import org.apache.hudi.common.testutils.RawTripTestPayload.recordsToStrings
+import org.apache.hudi.common.table.timeline.HoodieInstant
+import org.apache.hudi.common.testutils.HoodieTestDataGenerator.recordsToStrings
+import org.apache.hudi.common.util.HoodieDataUtils
+import org.apache.hudi.common.util.Option
 import org.apache.hudi.config.{HoodieClusteringConfig, HoodieWriteConfig}
 import org.apache.hudi.metadata.{HoodieBackedTableMetadata, HoodieTableMetadataUtil, MetadataPartitionType}
 import org.apache.hudi.testutils.HoodieSparkClientTestBase
+
 import org.apache.spark.sql._
-import org.junit.jupiter.api.Assertions.{assertEquals, assertTrue}
 import org.junit.jupiter.api._
+import org.junit.jupiter.api.Assertions.{assertEquals, assertTrue}
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
 
 import java.util.concurrent.atomic.AtomicInteger
+
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 
@@ -44,7 +48,7 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
   var instantTime: AtomicInteger = _
   val metadataOpts = Map(
     HoodieMetadataConfig.ENABLE.key -> "true",
-    HoodieMetadataConfig.RECORD_INDEX_ENABLE_PROP.key -> "true"
+    HoodieMetadataConfig.GLOBAL_RECORD_LEVEL_INDEX_ENABLE_PROP.key -> "true"
   )
   val commonOpts = Map(
     "hoodie.insert.shuffle.parallelism" -> "4",
@@ -52,7 +56,7 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
     HoodieWriteConfig.TBL_NAME.key -> "hoodie_test",
     RECORDKEY_FIELD.key -> "_row_key",
     PARTITIONPATH_FIELD.key -> "partition",
-    PRECOMBINE_FIELD.key -> "timestamp",
+    HoodieTableConfig.ORDERING_FIELDS.key -> "timestamp",
     HoodieTableConfig.POPULATE_META_FIELDS.key -> "true"
   ) ++ metadataOpts
   var mergedDfList: List[DataFrame] = List.empty
@@ -61,7 +65,7 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
   override def setUp() {
     initPath()
     initSparkContexts()
-    initFileSystem()
+    initHoodieStorage()
     initTestDataGenerator()
 
     setTableName("hoodie_test")
@@ -78,36 +82,45 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
     cleanupSparkContexts()
   }
 
-  @Test
-  def testClusteringWithRecordIndex(): Unit = {
-    val hudiOpts = commonOpts ++ Map(
-      TABLE_TYPE.key -> HoodieTableType.COPY_ON_WRITE.name(),
-      HoodieClusteringConfig.INLINE_CLUSTERING.key() -> "true",
-      HoodieClusteringConfig.INLINE_CLUSTERING_MAX_COMMITS.key() -> "2"
-    )
-
-    doWriteAndValidateDataAndRecordIndex(hudiOpts,
-      operation = INSERT_OPERATION_OPT_VAL,
-      saveMode = SaveMode.Overwrite)
-    doWriteAndValidateDataAndRecordIndex(hudiOpts,
-      operation = UPSERT_OPERATION_OPT_VAL,
-      saveMode = SaveMode.Append)
-
-    val lastClusteringInstant = getLatestClusteringInstant()
-    assertTrue(lastClusteringInstant.isPresent)
-
-    doWriteAndValidateDataAndRecordIndex(hudiOpts,
-      operation = UPSERT_OPERATION_OPT_VAL,
-      saveMode = SaveMode.Append)
-    doWriteAndValidateDataAndRecordIndex(hudiOpts,
-      operation = UPSERT_OPERATION_OPT_VAL,
-      saveMode = SaveMode.Append)
-
-    assertTrue(getLatestClusteringInstant().get().getTimestamp.compareTo(lastClusteringInstant.get().getTimestamp) > 0)
-    validateDataAndRecordIndices(hudiOpts)
+  protected def withRDDPersistenceValidation(f: => Unit): Unit = {
+    org.apache.hudi.testutils.SparkRDDValidationUtils.withRDDPersistenceValidation(spark, new org.apache.hudi.testutils.SparkRDDValidationUtils.ThrowingRunnable {
+      override def run(): Unit = f
+    })
   }
 
-  private def getLatestClusteringInstant(): org.apache.hudi.common.util.Option[HoodieInstant] = {
+  @ParameterizedTest
+  @EnumSource(classOf[HoodieTableType])
+  def testClusteringWithRecordIndex(tableType: HoodieTableType): Unit = {
+    withRDDPersistenceValidation {
+      val hudiOpts = commonOpts ++ Map(
+        TABLE_TYPE.key -> tableType.name(),
+        HoodieClusteringConfig.INLINE_CLUSTERING.key() -> "true",
+        HoodieClusteringConfig.INLINE_CLUSTERING_MAX_COMMITS.key() -> "2"
+      )
+
+      doWriteAndValidateDataAndRecordIndex(hudiOpts,
+        operation = INSERT_OPERATION_OPT_VAL,
+        saveMode = SaveMode.Overwrite)
+      doWriteAndValidateDataAndRecordIndex(hudiOpts,
+        operation = UPSERT_OPERATION_OPT_VAL,
+        saveMode = SaveMode.Append)
+
+      val lastClusteringInstant = getLatestClusteringInstant()
+      assertTrue(lastClusteringInstant.isPresent)
+
+      doWriteAndValidateDataAndRecordIndex(hudiOpts,
+        operation = UPSERT_OPERATION_OPT_VAL,
+        saveMode = SaveMode.Append)
+      doWriteAndValidateDataAndRecordIndex(hudiOpts,
+        operation = UPSERT_OPERATION_OPT_VAL,
+        saveMode = SaveMode.Append)
+
+      assertTrue(getLatestClusteringInstant().get().requestedTime.compareTo(lastClusteringInstant.get().requestedTime) > 0)
+      validateDataAndRecordIndices(hudiOpts)
+    }
+  }
+
+  private def getLatestClusteringInstant(): Option[HoodieInstant] = {
     metaClient.getActiveTimeline.getCompletedReplaceTimeline.lastInstant()
   }
 
@@ -124,7 +137,7 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
     } else {
       records1 = recordsToStrings(dataGen.generateInserts(getInstantTime(), 100)).asScala
     }
-    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(records1, 2))
+    val inputDF1 = spark.read.json(spark.sparkContext.parallelize(records1.toSeq, 2))
     inputDF1.write.format("org.apache.hudi")
       .options(hudiOpts)
       .option(OPERATION.key, operation)
@@ -145,9 +158,7 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
       val prevDf = prevDfOpt.get
       val prevDfOld = prevDf.join(inputDF1, prevDf("_row_key") === inputDF1("_row_key")
         && prevDf("partition") === inputDF1("partition"), "leftanti")
-      prevDfOld.show(500, false)
       val unionDf = prevDfOld.union(inputDF1)
-      unionDf.show(500, false)
       mergedDfList = mergedDfList :+ unionDf
     }
   }
@@ -165,7 +176,7 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
   }
 
   def getFileGroupCountForRecordIndex(writeConfig: HoodieWriteConfig): Long = {
-    val tableMetadata = getHoodieTable(metaClient, writeConfig).getMetadataTable
+    val tableMetadata = getHoodieTable(metaClient, writeConfig).getTableMetadata
     tableMetadata.asInstanceOf[HoodieBackedTableMetadata].getNumFileGroupsForPartition(MetadataPartitionType.RECORD_INDEX)
   }
 
@@ -175,8 +186,10 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
     val metadata = metadataWriter(writeConfig).getTableMetadata
     val readDf = spark.read.format("hudi").load(basePath)
     val rowArr = readDf.collect()
-    val recordIndexMap = metadata.readRecordIndex(
-      rowArr.map(row => row.getAs("_hoodie_record_key").toString).toList.asJava)
+    val res = metadata.readRecordIndexLocationsWithKeys(
+      HoodieListData.eager(rowArr.map(row => row.getAs("_hoodie_record_key").toString).toList.asJava));
+    val recordIndexMap = HoodieDataUtils.dedupeAndCollectAsMap(res);
+    res.unpersistWithDependencies()
 
     assertTrue(rowArr.length > 0)
     for (row <- rowArr) {
@@ -193,18 +206,15 @@ class TestMetadataRecordIndex extends HoodieSparkClientTestBase {
 
     assertEquals(rowArr.length, recordIndexMap.keySet.size)
     val estimatedFileGroupCount = HoodieTableMetadataUtil.estimateFileGroupCount(
-      MetadataPartitionType.RECORD_INDEX, rowArr.length, 48,
-      writeConfig.getRecordIndexMinFileGroupCount, writeConfig.getRecordIndexMaxFileGroupCount,
+      MetadataPartitionType.RECORD_INDEX, () => rowArr.length, 48,
+      writeConfig.getGlobalRecordLevelIndexMinFileGroupCount, writeConfig.getGlobalRecordLevelIndexMaxFileGroupCount,
       writeConfig.getRecordIndexGrowthFactor, writeConfig.getRecordIndexMaxFileGroupSizeBytes)
     assertEquals(estimatedFileGroupCount, getFileGroupCountForRecordIndex(writeConfig))
     val prevDf = mergedDfList.last.drop("tip_history")
     val nonMatchingRecords = readDf.drop("_hoodie_commit_time", "_hoodie_commit_seqno", "_hoodie_record_key",
       "_hoodie_partition_path", "_hoodie_file_name", "tip_history")
       .join(prevDf, prevDf.columns, "leftanti")
-    nonMatchingRecords.show(500, false)
     assertEquals(0, nonMatchingRecords.count())
-    readDf.show(500, false)
-    prevDf.show(500, false)
     assertEquals(readDf.count(), prevDf.count())
   }
 }

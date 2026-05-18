@@ -17,30 +17,32 @@
 
 package org.apache.hudi.functional
 
-import org.apache.avro.Schema
-import org.apache.calcite.runtime.SqlFunctions.abs
+import org.apache.hudi.{DataSourceReadOptions, DataSourceWriteOptions, DefaultSource, HoodieBaseRelation, HoodieUnsafeRDD, SparkAdapterSupport}
 import org.apache.hudi.HoodieBaseRelation.projectSchema
-import org.apache.hudi.common.config.{HoodieMetadataConfig, HoodieStorageConfig}
+import org.apache.hudi.common.config.{HoodieMetadataConfig, HoodieStorageConfig, RecordMergeMode}
 import org.apache.hudi.common.model.{HoodieRecord, OverwriteNonDefaultsWithLatestAvroPayload}
-import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient}
+import org.apache.hudi.common.schema.HoodieSchema
+import org.apache.hudi.common.table.HoodieTableConfig
 import org.apache.hudi.common.testutils.{HadoopMapRedUtils, HoodieTestDataGenerator}
 import org.apache.hudi.config.{HoodieCompactionConfig, HoodieWriteConfig}
+import org.apache.hudi.testutils.HoodieClientTestUtils.createMetaClient
 import org.apache.hudi.testutils.SparkClientFunctionalTestHarness
 import org.apache.hudi.testutils.SparkClientFunctionalTestHarness.getSparkSqlConf
-import org.apache.hudi.{DataSourceReadOptions, DataSourceWriteOptions, DefaultSource, HoodieBaseRelation, HoodieSparkUtils, HoodieUnsafeRDD}
+
 import org.apache.parquet.hadoop.util.counters.BenchmarkCounter
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.{Dataset, Row, SaveMode}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.sources.BaseRelation
-import org.apache.spark.sql.{Dataset, HoodieUnsafeUtils, Row, SaveMode}
-import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue, fail}
-import org.junit.jupiter.api.{Disabled, Tag, Test}
+import org.junit.jupiter.api.{Tag, Test}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue}
 
 import scala.collection.JavaConverters._
+import scala.math.abs
 
 @Tag("functional")
-class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with Logging {
+class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with Logging with SparkAdapterSupport {
 
   val defaultWriteOpts = Map(
     "hoodie.insert.shuffle.parallelism" -> "4",
@@ -48,7 +50,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     "hoodie.bulkinsert.shuffle.parallelism" -> "2",
     "hoodie.delete.shuffle.parallelism" -> "1",
     DataSourceWriteOptions.RECORDKEY_FIELD.key -> "_row_key",
-    DataSourceWriteOptions.PRECOMBINE_FIELD.key -> "timestamp",
+    HoodieTableConfig.ORDERING_FIELDS.key -> "timestamp",
     HoodieWriteConfig.TBL_NAME.key -> "hoodie_test",
     HoodieMetadataConfig.ENABLE.key -> "true"
     // NOTE: It's critical that we use non-partitioned table, since the way we track amount of bytes read
@@ -58,7 +60,6 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
 
   override def conf: SparkConf = conf(getSparkSqlConf)
 
-  @Disabled("Currently disabled b/c of the fallback to HadoopFsRelation")
   @Test
   def testBaseFileOnlyViewRelation(): Unit = {
     val tablePath = s"$basePath/cow"
@@ -70,18 +71,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     // Stats for the reads fetching only _projected_ columns (note how amount of bytes read
     // increases along w/ the # of columns)
     val projectedColumnsReadStats: Array[(String, Long)] =
-      if (HoodieSparkUtils.isSpark3)
-        Array(
-          ("rider", 2363),
-          ("rider,driver", 2463),
-          ("rider,driver,tip_history", 3428))
-      else if (HoodieSparkUtils.isSpark2)
-        Array(
-          ("rider", 2474),
-          ("rider,driver", 2614),
-          ("rider,driver,tip_history", 3629))
-      else
-        fail("Only Spark 3 and Spark 2 are currently supported")
+      Array(("rider", 2363), ("rider,driver", 2463), ("rider,driver,tip_history", 3428))
 
     // Test COW / Snapshot
     runTest(tableState, DataSourceReadOptions.QUERY_TYPE_SNAPSHOT_OPT_VAL, "", projectedColumnsReadStats)
@@ -99,19 +89,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     // Stats for the reads fetching only _projected_ columns (note how amount of bytes read
     // increases along w/ the # of columns)
     val projectedColumnsReadStats: Array[(String, Long)] =
-      if (HoodieSparkUtils.isSpark3)
-        Array(
-          ("rider", 2452),
-          ("rider,driver", 2552),
-          ("rider,driver,tip_history", 3517))
-      else if (HoodieSparkUtils.isSpark2)
-        Array(
-          ("rider", 2595),
-          ("rider,driver", 2735),
-          ("rider,driver,tip_history", 3750))
-      else
-        fail("Only Spark 3 and Spark 2 are currently supported")
-
+      Array(("rider", 2452), ("rider,driver", 2552), ("rider,driver,tip_history", 3517))
     // Test MOR / Snapshot / Skip-merge
     runTest(tableState, DataSourceReadOptions.QUERY_TYPE_SNAPSHOT_OPT_VAL, DataSourceReadOptions.REALTIME_SKIP_MERGE_OPT_VAL, projectedColumnsReadStats)
 
@@ -121,18 +99,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     // Stats for the reads fetching only _projected_ columns (note how amount of bytes read
     // increases along w/ the # of columns) in Read Optimized mode (which is essentially equivalent to COW)
     val projectedColumnsReadStatsReadOptimized: Array[(String, Long)] =
-      if (HoodieSparkUtils.isSpark3)
-        Array(
-          ("rider", 2363),
-          ("rider,driver", 2463),
-          ("rider,driver,tip_history", 3428))
-      else if (HoodieSparkUtils.isSpark2)
-        Array(
-          ("rider", 2474),
-          ("rider,driver", 2614),
-          ("rider,driver,tip_history", 3629))
-      else
-        fail("Only Spark 3 and Spark 2 are currently supported")
+      Array(("rider", 2363), ("rider,driver", 2463), ("rider,driver,tip_history", 3428))
 
     // Test MOR / Read Optimized
     // TODO(HUDI-3896) re-enable
@@ -155,18 +122,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     // Stats for the reads fetching only _projected_ columns (note how amount of bytes read
     // increases along w/ the # of columns)
     val projectedColumnsReadStats: Array[(String, Long)] =
-      if (HoodieSparkUtils.isSpark3)
-        Array(
-          ("rider", 2452),
-          ("rider,driver", 2552),
-          ("rider,driver,tip_history", 3517))
-      else if (HoodieSparkUtils.isSpark2)
-        Array(
-          ("rider", 2595),
-          ("rider,driver", 2735),
-          ("rider,driver,tip_history", 3750))
-      else
-        fail("Only Spark 3 and Spark 2 are currently supported")
+      Array(("rider", 2452), ("rider,driver", 2552), ("rider,driver,tip_history", 3517))
 
     // Test MOR / Snapshot / Skip-merge
     runTest(tableState, DataSourceReadOptions.QUERY_TYPE_SNAPSHOT_OPT_VAL, DataSourceReadOptions.REALTIME_SKIP_MERGE_OPT_VAL, projectedColumnsReadStats)
@@ -177,18 +133,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     // Stats for the reads fetching only _projected_ columns (note how amount of bytes read
     // increases along w/ the # of columns) in Read Optimized mode (which is essentially equivalent to COW)
     val projectedColumnsReadStatsReadOptimized: Array[(String, Long)] =
-      if (HoodieSparkUtils.isSpark3)
-        Array(
-          ("rider", 2363),
-          ("rider,driver", 2463),
-          ("rider,driver,tip_history", 3428))
-      else if (HoodieSparkUtils.isSpark2)
-        Array(
-          ("rider", 2474),
-          ("rider,driver", 2614),
-          ("rider,driver,tip_history", 3629))
-      else
-        fail("Only Spark 3 and Spark 2 are currently supported")
+      Array(("rider", 2363), ("rider,driver", 2463), ("rider,driver,tip_history", 3428))
 
     // Test MOR / Read Optimized
     // TODO(HUDI-3896) re-enable
@@ -216,34 +161,12 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     // Stats for the reads fetching only _projected_ columns (note how amount of bytes read
     // increases along w/ the # of columns)
     val projectedColumnsReadStats: Array[(String, Long)] =
-    if (HoodieSparkUtils.isSpark3)
-      Array(
-        ("rider", 2452),
-        ("rider,driver", 2552),
-        ("rider,driver,tip_history", 3517))
-    else if (HoodieSparkUtils.isSpark2)
-      Array(
-        ("rider", 2595),
-        ("rider,driver", 2735),
-        ("rider,driver,tip_history", 3750))
-    else
-      fail("Only Spark 3 and Spark 2 are currently supported")
+      Array(("rider", 2452), ("rider,driver", 2552), ("rider,driver,tip_history", 3517))
 
     // Stats for the reads fetching _all_ columns (note, how amount of bytes read
     // is invariant of the # of columns)
     val fullColumnsReadStats: Array[(String, Long)] =
-    if (HoodieSparkUtils.isSpark3)
-      Array(
-        ("rider", 14167),
-        ("rider,driver", 14167),
-        ("rider,driver,tip_history", 14167))
-    else if (HoodieSparkUtils.isSpark2)
-      Array(
-        ("rider", 14160),
-        ("rider,driver", 14160),
-        ("rider,driver,tip_history", 14160))
-    else
-      fail("Only Spark 3 and Spark 2 are currently supported")
+      Array(("rider", 14167), ("rider,driver", 14167), ("rider,driver,tip_history", 14167))
 
     // Test MOR / Snapshot / Skip-merge
     runTest(tableState, DataSourceReadOptions.QUERY_TYPE_SNAPSHOT_OPT_VAL, DataSourceReadOptions.REALTIME_SKIP_MERGE_OPT_VAL, projectedColumnsReadStats)
@@ -269,21 +192,10 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     // Stats for the reads fetching only _projected_ columns (note how amount of bytes read
     // increases along w/ the # of columns)
     val projectedColumnsReadStats: Array[(String, Long)] =
-      if (HoodieSparkUtils.isSpark3)
-        Array(
-          ("rider", 4219),
-          ("rider,driver", 4279),
-          ("rider,driver,tip_history", 5186))
-      else if (HoodieSparkUtils.isSpark2)
-        Array(
-          ("rider", 4430),
-          ("rider,driver", 4530),
-          ("rider,driver,tip_history", 5487))
-      else
-        fail("Only Spark 3 and Spark 2 are currently supported")
+      Array(("rider", 4219), ("rider,driver", 4279), ("rider,driver,tip_history", 5186))
 
     val incrementalOpts: Map[String, String] = Map(
-      DataSourceReadOptions.BEGIN_INSTANTTIME.key -> "001"
+      DataSourceReadOptions.START_COMMIT.key -> "001"
     )
 
     // Test MOR / Incremental / Skip-merge
@@ -301,8 +213,6 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     val targetRecordsCount = 100
 
     bootstrapMORTableWithDeltaLog(tablePath, targetRecordsCount, defaultWriteOpts, populateMetaFields = true)
-
-    println(s"Running test for $tablePath / incremental")
     /**
      * State of timeline and updated data
      * +--------------+--------------+--------------+--------------+--------------------+--------------+--------------+--------------+
@@ -311,16 +221,16 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
      * | updated data |      001     |      002     |      003     |                    |      004     |      005     |      006     |
      * +--------------+--------------+--------------+--------------+--------------------+--------------+--------------+--------------+
      */
-    val hoodieMetaClient = HoodieTableMetaClient.builder().setConf(spark.sparkContext.hadoopConfiguration).setBasePath(tablePath).setLoadActiveTimelineOnLoad(true).build()
+    val hoodieMetaClient = createMetaClient(spark, tablePath)
     val completedCommits = hoodieMetaClient.getCommitsAndCompactionTimeline.filterCompletedInstants()
-    val startUnarchivedCommitTs = completedCommits.nthInstant(1).get().getTimestamp //deltacommit2
-    val endUnarchivedCommitTs = completedCommits.nthInstant(5).get().getTimestamp //deltacommit6
+    val startUnarchivedCommitTs = completedCommits.nthInstant(1).get().requestedTime //deltacommit2
+    val endUnarchivedCommitTs = completedCommits.nthInstant(5).get().requestedTime //deltacommit6
 
     val readOpts = defaultWriteOpts ++ Map(
       "path" -> tablePath,
       DataSourceReadOptions.QUERY_TYPE.key -> DataSourceReadOptions.QUERY_TYPE_INCREMENTAL_OPT_VAL,
-      DataSourceReadOptions.BEGIN_INSTANTTIME.key -> startUnarchivedCommitTs,
-      DataSourceReadOptions.END_INSTANTTIME.key -> endUnarchivedCommitTs
+      DataSourceReadOptions.START_COMMIT.key -> startUnarchivedCommitTs,
+      DataSourceReadOptions.END_COMMIT.key -> endUnarchivedCommitTs
     )
 
     val inputDf = spark.read.format("hudi")
@@ -337,16 +247,16 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
 
     bootstrapMORTableWithDeltaLog(tablePath, targetRecordsCount, defaultWriteOpts, populateMetaFields = true, inlineCompact = true)
 
-    val hoodieMetaClient = HoodieTableMetaClient.builder().setConf(spark.sparkContext.hadoopConfiguration).setBasePath(tablePath).setLoadActiveTimelineOnLoad(true).build()
+    val hoodieMetaClient = createMetaClient(spark, tablePath)
     val completedCommits = hoodieMetaClient.getCommitsAndCompactionTimeline.filterCompletedInstants()
-    val startUnarchivedCommitTs = (completedCommits.nthInstant(1).get().getTimestamp.toLong - 1L).toString
-    val endUnarchivedCommitTs = completedCommits.nthInstant(3).get().getTimestamp //commit
+    val startUnarchivedCommitTs = (completedCommits.nthInstant(1).get().requestedTime.toLong - 1L).toString
+    val endUnarchivedCommitTs = completedCommits.nthInstant(3).get().requestedTime //commit
 
     val readOpts = defaultWriteOpts ++ Map(
       "path" -> tablePath,
       DataSourceReadOptions.QUERY_TYPE.key -> DataSourceReadOptions.QUERY_TYPE_INCREMENTAL_OPT_VAL,
-      DataSourceReadOptions.BEGIN_INSTANTTIME.key -> startUnarchivedCommitTs,
-      DataSourceReadOptions.END_INSTANTTIME.key -> endUnarchivedCommitTs
+      DataSourceReadOptions.START_COMMIT.key -> startUnarchivedCommitTs,
+      DataSourceReadOptions.END_COMMIT.key -> endUnarchivedCommitTs
     )
 
     val inputDf = spark.read.format("hudi")
@@ -388,7 +298,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
 
           val (rows, bytesRead) = measureBytesRead { () =>
             val rdd = hoodieRelation.buildScan(targetColumns, Array.empty).asInstanceOf[HoodieUnsafeRDD]
-            HoodieUnsafeUtils.collect(rdd)
+            sparkAdapter.getUnsafeUtils.collect(rdd)
           }
 
           val targetRecordCount = tableState.targetRecordCount;
@@ -421,16 +331,16 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
                              recordCount: Int,
                              opts: Map[String, String],
                              populateMetaFields: Boolean,
-                             dataGenOpt: Option[HoodieTestDataGenerator] = None): (List[HoodieRecord[_]], Schema) = {
+                             dataGenOpt: Option[HoodieTestDataGenerator] = None): (List[HoodieRecord[_]], HoodieSchema) = {
     val dataGen = dataGenOpt.getOrElse(new HoodieTestDataGenerator(0x12345))
 
     // Bulk Insert Operation
     val schema =
-      if (populateMetaFields) HoodieTestDataGenerator.AVRO_SCHEMA_WITH_METADATA_FIELDS
-      else HoodieTestDataGenerator.AVRO_SCHEMA
+      if (populateMetaFields) HoodieTestDataGenerator.HOODIE_SCHEMA_WITH_METADATA_FIELDS
+      else HoodieTestDataGenerator.HOODIE_SCHEMA
 
     val records = dataGen.generateInserts("001", recordCount)
-    val inputDF: Dataset[Row] = toDataset(records, HoodieTestDataGenerator.AVRO_SCHEMA)
+    val inputDF: Dataset[Row] = toDataset(records, HoodieTestDataGenerator.HOODIE_SCHEMA)
 
     inputDF.write.format("org.apache.hudi")
       .options(opts)
@@ -448,7 +358,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
                                 updatedRecordsRatio: Double,
                                 opts: Map[String, String],
                                 populateMetaFields: Boolean,
-                                dataGenOpt: Option[HoodieTestDataGenerator] = None): (List[HoodieRecord[_]], Schema) = {
+                                dataGenOpt: Option[HoodieTestDataGenerator] = None): (List[HoodieRecord[_]], HoodieSchema) = {
     val dataGen = dataGenOpt.getOrElse(new HoodieTestDataGenerator(0x12345))
 
     // Step 1: Bootstrap table w/ N records (t/h bulk-insert)
@@ -462,7 +372,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
       val updatedRecords = dataGen.generateUpdates("002", recordsToUpdate.asJava)
 
       // Step 2: Update M records out of those (t/h update)
-      val inputDF = toDataset(updatedRecords, HoodieTestDataGenerator.AVRO_SCHEMA)
+      val inputDF = toDataset(updatedRecords, HoodieTestDataGenerator.HOODIE_SCHEMA)
 
       inputDF.write.format("org.apache.hudi")
         .options(opts)
@@ -480,7 +390,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
                                 opts: Map[String, String],
                                 populateMetaFields: Boolean,
                                 dataGenOpt: Option[HoodieTestDataGenerator] = None,
-                                inlineCompact: Boolean = false): (List[HoodieRecord[_]], Schema) = {
+                                inlineCompact: Boolean = false): (List[HoodieRecord[_]], HoodieSchema) = {
     val dataGen = dataGenOpt.getOrElse(new HoodieTestDataGenerator(0x12345))
 
     // Step 1: Bootstrap table w/ N records (t/h bulk-insert)
@@ -492,7 +402,7 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
       val updatedRecords = dataGen.generateUpdates("%03d".format(i), recordsToUpdate.asJava)
 
       // Step 2: Update M records out of those (t/h update)
-      val inputDF = toDataset(updatedRecords, HoodieTestDataGenerator.AVRO_SCHEMA)
+      val inputDF = toDataset(updatedRecords, HoodieTestDataGenerator.HOODIE_SCHEMA)
 
       val compactScheduleInline = if (inlineCompact) "false" else "true"
       val compactInline = if (inlineCompact) "true" else "false"
@@ -520,5 +430,5 @@ class TestParquetColumnProjection extends SparkClientFunctionalTestHarness with 
     (r, bytesRead)
   }
 
-  case class TableState(path: String, schema: Schema, targetRecordCount: Long, targetUpdatedRecordsRatio: Double)
+  case class TableState(path: String, schema: HoodieSchema, targetRecordCount: Long, targetUpdatedRecordsRatio: Double)
 }

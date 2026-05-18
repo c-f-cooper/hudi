@@ -27,7 +27,9 @@ import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.common.util.hash.HashID;
 import org.apache.hudi.exception.HoodieClusteringException;
 
-import org.jetbrains.annotations.NotNull;
+import lombok.Getter;
+
+import javax.annotation.Nonnull;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -44,6 +46,7 @@ public class ConsistentBucketIdentifier extends BucketIdentifier {
   /**
    * Hashing metadata of a partition
    */
+  @Getter
   private final HoodieConsistentHashingMetadata metadata;
   /**
    * In-memory structure to speed up ring mapping (hashing value -> hashing node)
@@ -65,10 +68,6 @@ public class ConsistentBucketIdentifier extends BucketIdentifier {
     return ring.values();
   }
 
-  public HoodieConsistentHashingMetadata getMetadata() {
-    return metadata;
-  }
-
   public int getNumBuckets() {
     return ring.size();
   }
@@ -86,8 +85,12 @@ public class ConsistentBucketIdentifier extends BucketIdentifier {
     return getBucket(getHashKeys(hoodieKey.getRecordKey(), indexKeyFields));
   }
 
-  public ConsistentHashingNode getBucket(String hoodieKey, String indexKeyFields) {
-    return getBucket(getHashKeys(hoodieKey, indexKeyFields));
+  public ConsistentHashingNode getBucket(String recordKey, List<String> indexKeyFields) {
+    return getBucket(getHashKeys(recordKey, indexKeyFields));
+  }
+
+  public ConsistentHashingNode getBucket(String recordKey, String indexKeyFields) {
+    return getBucket(getHashKeys(recordKey, indexKeyFields));
   }
 
   protected ConsistentHashingNode getBucket(List<String> hashKeys) {
@@ -163,7 +166,7 @@ public class ConsistentBucketIdentifier extends BucketIdentifier {
    * @param bucket parent bucket
    * @return lists of children buckets
    */
-  public Option<List<ConsistentHashingNode>> splitBucket(@NotNull ConsistentHashingNode bucket) {
+  public Option<List<ConsistentHashingNode>> splitBucket(@Nonnull ConsistentHashingNode bucket) {
     ConsistentHashingNode formerBucket = getFormerBucket(bucket.getValue());
 
     long mid = (long) formerBucket.getValue() + bucket.getValue()

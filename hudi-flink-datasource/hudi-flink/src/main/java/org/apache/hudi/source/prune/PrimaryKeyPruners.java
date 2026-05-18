@@ -20,33 +20,30 @@ package org.apache.hudi.source.prune;
 
 import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.collection.Pair;
-import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.configuration.OptionsResolver;
 import org.apache.hudi.index.bucket.BucketIdentifier;
 import org.apache.hudi.util.ExpressionUtils;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.expressions.Expression;
 import org.apache.flink.table.expressions.FieldReferenceExpression;
 import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.expressions.ValueLiteralExpression;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
  * Utilities for primary key based file pruning.
  */
+@Slf4j
 public class PrimaryKeyPruners {
-  private static final Logger LOG = LoggerFactory.getLogger(PrimaryKeyPruners.class);
 
-  public static final int BUCKET_ID_NO_PRUNING = -1;
-
-  public static int getBucketId(List<ResolvedExpression> hashKeyFilters, Configuration conf) {
-    List<String> pkFields = Arrays.asList(conf.getString(FlinkOptions.RECORD_KEY_FIELD).split(","));
+  public static Function<Integer, Integer> getBucketIdFunc(List<ResolvedExpression> hashKeyFilters, Configuration conf) {
+    List<String> pkFields = Arrays.asList(OptionsResolver.getRecordKeys(conf));
     // step1: resolve the hash key values
     final boolean logicalTimestamp = OptionsResolver.isConsistentLogicalTimestampEnabled(conf);
     List<String> values = hashKeyFilters.stream()
@@ -60,7 +57,7 @@ public class PrimaryKeyPruners {
         .map(Pair::getValue)
         .collect(Collectors.toList());
     // step2: generate bucket id
-    return BucketIdentifier.getBucketId(values, conf.getInteger(FlinkOptions.BUCKET_INDEX_NUM_BUCKETS));
+    return (numBuckets) -> BucketIdentifier.getBucketId(values, numBuckets);
   }
 
   private static Pair<FieldReferenceExpression, ValueLiteralExpression> castChildAs(List<Expression> children) {

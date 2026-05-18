@@ -17,18 +17,19 @@
 
 package org.apache.hudi
 
-import org.apache.hadoop.fs.FileStatus
-import org.apache.hudi.common.model.{FileSlice, HoodieLogFile}
+import org.apache.hudi.common.model.HoodieLogFile
 import org.apache.hudi.common.table.HoodieTableMetaClient
+import org.apache.hudi.storage.StoragePathInfo
 import org.apache.hudi.util.JFunction
+
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.execution.datasources.{FileIndex, FileStatusCache, NoopCache, PartitionDirectory}
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 
 import java.util.stream.Collectors
+
 import scala.collection.JavaConverters._
 
 class HoodieIncrementalFileIndex(override val spark: SparkSession,
@@ -37,68 +38,19 @@ class HoodieIncrementalFileIndex(override val spark: SparkSession,
                                  override val options: Map[String, String],
                                  @transient override val fileStatusCache: FileStatusCache = NoopCache,
                                  override val includeLogFiles: Boolean,
-                                 override val shouldEmbedFileSlices: Boolean)
+                                 mergeOnReadIncrementalRelation: MergeOnReadIncrementalRelation)
   extends HoodieFileIndex(
-    spark, metaClient, schemaSpec, options, fileStatusCache, includeLogFiles, shouldEmbedFileSlices
+    spark, metaClient, schemaSpec, options, fileStatusCache, includeLogFiles, shouldEmbedFileSlices = true
   ) with FileIndex {
-  val mergeOnReadIncrementalRelation: MergeOnReadIncrementalRelation = MergeOnReadIncrementalRelation(
-    spark.sqlContext, options, metaClient, schemaSpec, schemaSpec)
 
   override def listFiles(partitionFilters: Seq[Expression], dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
-    hasPushedDownPartitionPredicates = true
-
-    val fileSlices = mergeOnReadIncrementalRelation.listFileSplits(partitionFilters, dataFilters)
-    if (fileSlices.isEmpty) {
-      Seq.empty
-    } else {
-      val prunedPartitionsAndFilteredFileSlices = fileSlices.map {
+    val fileSlices = mergeOnReadIncrementalRelation.listFileSplits(partitionFilters, dataFilters).toSeq.flatMap(
+      {
         case (partitionValues, fileSlices) =>
-          if (shouldEmbedFileSlices) {
-            val baseFileStatusesAndLogFileOnly: Seq[FileStatus] = fileSlices.map(slice => {
-              if (slice.getBaseFile.isPresent) {
-                slice.getBaseFile.get().getFileStatus
-              } else if (includeLogFiles && slice.getLogFiles.findAny().isPresent) {
-                slice.getLogFiles.findAny().get().getFileStatus
-              } else {
-                null
-              }
-            }).filter(slice => slice != null)
-            val c = fileSlices.filter(f => (includeLogFiles && f.getLogFiles.findAny().isPresent)
-              || (f.getBaseFile.isPresent && f.getBaseFile.get().getBootstrapBaseFile.isPresent)).
-              foldLeft(Map[String, FileSlice]()) { (m, f) => m + (f.getFileId -> f) }
-            if (c.nonEmpty) {
-              sparkAdapter.getSparkPartitionedFileUtils.newPartitionDirectory(
-                new HoodiePartitionFileSliceMapping(partitionValues, c), baseFileStatusesAndLogFileOnly)
-            } else {
-              sparkAdapter.getSparkPartitionedFileUtils.newPartitionDirectory(
-                partitionValues, baseFileStatusesAndLogFileOnly)
-            }
-          } else {
-            val allCandidateFiles: Seq[FileStatus] = fileSlices.flatMap(fs => {
-              val baseFileStatusOpt = getBaseFileStatus(Option.apply(fs.getBaseFile.orElse(null)))
-              val logFilesStatus = if (includeLogFiles) {
-                fs.getLogFiles.map[FileStatus](JFunction.toJavaFunction[HoodieLogFile, FileStatus](lf => lf.getFileStatus))
-              } else {
-                java.util.stream.Stream.empty()
-              }
-              val files = logFilesStatus.collect(Collectors.toList[FileStatus]).asScala
-              baseFileStatusOpt.foreach(f => files.append(f))
-              files
-            })
-            sparkAdapter.getSparkPartitionedFileUtils.newPartitionDirectory(
-              partitionValues, allCandidateFiles)
-          }
-      }.toSeq
-
-      if (shouldReadAsPartitionedTable()) {
-        prunedPartitionsAndFilteredFileSlices
-      } else if (shouldEmbedFileSlices) {
-        assert(partitionSchema.isEmpty)
-        prunedPartitionsAndFilteredFileSlices
-      } else {
-        Seq(PartitionDirectory(InternalRow.empty, prunedPartitionsAndFilteredFileSlices.flatMap(_.files)))
+          fileSlices.filter(!_.isEmpty).map(fs => ( partitionValues, fs.withLogFiles(includeLogFiles)))
       }
-    }
+    )
+    prepareFileSlices(fileSlices)
   }
 
   override def inputFiles: Array[String] = {
@@ -107,13 +59,13 @@ class HoodieIncrementalFileIndex(override val spark: SparkSession,
       Array.empty
     }
     fileSlices.values.flatten.flatMap(fs => {
-      val baseFileStatusOpt = getBaseFileStatus(Option.apply(fs.getBaseFile.orElse(null)))
+      val baseFileStatusOpt = getBaseFileInfo(Option.apply(fs.getBaseFile.orElse(null)))
       val logFilesStatus = if (includeLogFiles) {
-        fs.getLogFiles.map[FileStatus](JFunction.toJavaFunction[HoodieLogFile, FileStatus](lf => lf.getFileStatus))
+        fs.getLogFiles.map[StoragePathInfo](JFunction.toJavaFunction[HoodieLogFile, StoragePathInfo](lf => lf.getPathInfo))
       } else {
         java.util.stream.Stream.empty()
       }
-      val files = logFilesStatus.collect(Collectors.toList[FileStatus]).asScala
+      val files = logFilesStatus.collect(Collectors.toList[StoragePathInfo]).asScala
       baseFileStatusOpt.foreach(f => files.append(f))
       files
     }).map(fileStatus => fileStatus.getPath.toString).toArray

@@ -20,19 +20,20 @@ package org.apache.hudi.table.action.bootstrap;
 
 import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.avro.model.HoodieFileStatus;
+import org.apache.hudi.avro.model.HoodiePath;
 import org.apache.hudi.client.bootstrap.BootstrapWriteStatus;
-import org.apache.hudi.common.bootstrap.FileStatusUtils;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.BootstrapFileMapping;
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.schema.HoodieSchemaUtils;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.io.HoodieBootstrapHandle;
 import org.apache.hudi.keygen.KeyGeneratorInterface;
+import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.table.HoodieTable;
 
-import org.apache.avro.Schema;
-import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,15 +54,16 @@ public abstract class BaseBootstrapMetadataHandler implements BootstrapMetadataH
   }
 
   public BootstrapWriteStatus runMetadataBootstrap(String srcPartitionPath, String partitionPath, KeyGeneratorInterface keyGenerator) {
-    Path sourceFilePath = FileStatusUtils.toPath(srcFileStatus.getPath());
+    HoodiePath path = srcFileStatus.getPath();
+    StoragePath sourceFilePath = path != null ? new StoragePath(path.getUri()) : null;
     HoodieBootstrapHandle<?, ?, ?, ?> bootstrapHandle = new HoodieBootstrapHandle(config, HoodieTimeline.METADATA_BOOTSTRAP_INSTANT_TS,
         table, partitionPath, FSUtils.createNewFileIdPfx(), table.getTaskContextSupplier());
     try {
-      Schema avroSchema = getAvroSchema(sourceFilePath);
+      HoodieSchema schema = getSchema(sourceFilePath);
       List<String> recordKeyColumns = keyGenerator.getRecordKeyFieldNames().stream()
           .map(HoodieAvroUtils::getRootLevelFieldName)
           .collect(Collectors.toList());
-      Schema recordKeySchema = HoodieAvroUtils.generateProjectionSchema(avroSchema, recordKeyColumns);
+      HoodieSchema recordKeySchema = HoodieSchemaUtils.generateProjectionSchema(schema, recordKeyColumns);
 
       LOG.info("Schema to be used for reading record keys: " + recordKeySchema);
 
@@ -70,16 +72,16 @@ public abstract class BaseBootstrapMetadataHandler implements BootstrapMetadataH
       throw new HoodieException(e.getMessage(), e);
     }
 
-    BootstrapWriteStatus writeStatus = (BootstrapWriteStatus) bootstrapHandle.writeStatuses().get(0);
+    BootstrapWriteStatus writeStatus = (BootstrapWriteStatus) bootstrapHandle.getWriteStatuses().get(0);
     BootstrapFileMapping bootstrapFileMapping = new BootstrapFileMapping(
-        config.getBootstrapSourceBasePath(), srcPartitionPath, partitionPath,
-        srcFileStatus, writeStatus.getFileId());
+        config.getBootstrapSourceBasePath(), srcPartitionPath, srcFileStatus,
+        partitionPath, writeStatus.getFileId());
     writeStatus.setBootstrapSourceFileMapping(bootstrapFileMapping);
     return writeStatus;
   }
 
-  abstract Schema getAvroSchema(Path sourceFilePath) throws IOException;
+  abstract HoodieSchema getSchema(StoragePath sourceFilePath) throws IOException;
 
   abstract void executeBootstrap(HoodieBootstrapHandle<?, ?, ?, ?> bootstrapHandle,
-                                 Path sourceFilePath, KeyGeneratorInterface keyGenerator, String partitionPath, Schema avroSchema) throws Exception;
+                                 StoragePath sourceFilePath, KeyGeneratorInterface keyGenerator, String partitionPath, HoodieSchema schema) throws Exception;
 }

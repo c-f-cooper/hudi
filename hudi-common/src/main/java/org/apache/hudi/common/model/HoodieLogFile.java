@@ -21,15 +21,16 @@ package org.apache.hudi.common.model;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.table.cdc.HoodieCDCUtils;
 import org.apache.hudi.exception.InvalidHoodiePathException;
-import org.apache.hudi.hadoop.fs.CachingPath;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathInfo;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.ToString;
 
 import java.io.Serializable;
 import java.util.Comparator;
-import java.util.Objects;
 import java.util.regex.Matcher;
 
 import static org.apache.hudi.common.fs.FSUtils.LOG_FILE_PATTERN;
@@ -40,6 +41,8 @@ import static org.apache.hudi.common.fs.FSUtils.LOG_FILE_PATTERN;
  *
  * <p>Also contains logic to roll over the log file.
  */
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+@ToString(onlyExplicitlyIncluded = true)
 public class HoodieLogFile implements Serializable {
 
   private static final long serialVersionUID = 1L;
@@ -50,8 +53,12 @@ public class HoodieLogFile implements Serializable {
   private static final Comparator<HoodieLogFile> LOG_FILE_COMPARATOR = new LogFileComparator();
   private static final Comparator<HoodieLogFile> LOG_FILE_COMPARATOR_REVERSED = new LogFileComparator().reversed();
 
-  private transient FileStatus fileStatus;
-  private transient Path path;
+  @Getter
+  @Setter
+  private transient StoragePathInfo pathInfo;
+  private transient StoragePath path;
+  @EqualsAndHashCode.Include
+  @ToString.Include
   private final String pathStr;
   private String fileId;
   private String deltaCommitTime;
@@ -59,10 +66,13 @@ public class HoodieLogFile implements Serializable {
   private String logWriteToken;
   private String fileExtension;
   private String suffix;
-  private long fileLen;
+  @Getter
+  @Setter
+  @ToString.Include
+  private long fileSize;
 
   public HoodieLogFile(HoodieLogFile logFile) {
-    this.fileStatus = logFile.getFileStatus();
+    this.pathInfo = logFile.getPathInfo();
     this.path = logFile.getPath();
     this.pathStr = logFile.pathStr;
     this.fileId = logFile.getFileId();
@@ -71,38 +81,36 @@ public class HoodieLogFile implements Serializable {
     this.logWriteToken = logFile.getLogWriteToken();
     this.fileExtension = logFile.getFileExtension();
     this.suffix = logFile.getSuffix();
-    this.fileLen = logFile.getFileSize();
+    this.fileSize = logFile.getFileSize();
   }
 
-  public HoodieLogFile(FileStatus fileStatus) {
-    this(fileStatus, fileStatus.getPath(), fileStatus.getPath().toString(), fileStatus.getLen());
+  public HoodieLogFile(StoragePathInfo pathInfo) {
+    this(pathInfo, pathInfo.getPath(), pathInfo.getPath().toString(), pathInfo.getLength());
   }
 
-  public HoodieLogFile(Path logPath) {
+  public HoodieLogFile(StoragePath logPath) {
     this(null, logPath, logPath.toString(), -1);
   }
 
-  public HoodieLogFile(Path logPath, long fileLen) {
-    this(null, logPath, logPath.toString(), fileLen);
+  public HoodieLogFile(StoragePath logPath, long fileSize) {
+    this(null, logPath, logPath.toString(), fileSize);
   }
 
   public HoodieLogFile(String logPathStr) {
     this(null, null, logPathStr, -1);
   }
 
-  private HoodieLogFile(FileStatus fileStatus, Path logPath, String logPathStr, long fileLen) {
-    this.fileStatus = fileStatus;
+  private HoodieLogFile(StoragePathInfo pathInfo, StoragePath logPath, String logPathStr, long fileSize) {
+    this.pathInfo = pathInfo;
     this.pathStr = logPathStr;
-    this.fileLen = fileLen;
+    this.fileSize = fileSize;
     this.logVersion = -1; // mark version as uninitialized
-    if (logPath instanceof CachingPath) {
-      this.path = logPath;
-    }
+    this.path = logPath;
   }
 
   private void parseFieldsFromPath() {
     Matcher matcher = LOG_FILE_PATTERN.matcher(getPath().getName());
-    if (!matcher.find()) {
+    if (!matcher.matches()) {
       throw new InvalidHoodiePathException(path, "LogFile");
     }
     this.fileId = matcher.group(1);
@@ -159,9 +167,9 @@ public class HoodieLogFile implements Serializable {
     return suffix;
   }
 
-  public Path getPath() {
+  public StoragePath getPath() {
     if (path == null) {
-      path = new CachingPath(pathStr);
+      path = new StoragePath(pathStr);
     }
     return path;
   }
@@ -170,28 +178,12 @@ public class HoodieLogFile implements Serializable {
     return getPath().getName();
   }
 
-  public void setFileLen(long fileLen) {
-    this.fileLen = fileLen;
-  }
-
-  public long getFileSize() {
-    return fileLen;
-  }
-
-  public FileStatus getFileStatus() {
-    return fileStatus;
-  }
-
-  public void setFileStatus(FileStatus fileStatus) {
-    this.fileStatus = fileStatus;
-  }
-
-  public HoodieLogFile rollOver(FileSystem fs, String logWriteToken) {
+  public HoodieLogFile rollOver(String logWriteToken) {
     String fileId = getFileId();
     String deltaCommitTime = getDeltaCommitTime();
-    Path path = getPath();
+    StoragePath path = getPath();
     String extension = "." + fileExtension;
-    return new HoodieLogFile(new CachingPath(path.getParent(),
+    return new HoodieLogFile(new StoragePath(path.getParent(),
         FSUtils.makeLogFileName(fileId, extension, deltaCommitTime, logVersion + 1, logWriteToken)));
   }
 
@@ -246,27 +238,5 @@ public class HoodieLogFile implements Serializable {
       // compare by delta-commits
       return deltaCommitTime1.compareTo(deltaCommitTime2);
     }
-  }
-
-  @Override
-  public boolean equals(Object o) {
-    if (this == o) {
-      return true;
-    }
-    if (o == null || getClass() != o.getClass()) {
-      return false;
-    }
-    HoodieLogFile that = (HoodieLogFile) o;
-    return Objects.equals(pathStr, that.pathStr);
-  }
-
-  @Override
-  public int hashCode() {
-    return Objects.hash(pathStr);
-  }
-
-  @Override
-  public String toString() {
-    return "HoodieLogFile{pathStr='" + pathStr + '\'' + ", fileLen=" + fileLen + '}';
   }
 }

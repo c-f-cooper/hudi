@@ -22,7 +22,7 @@ import org.apache.spark.sql.hudi.SparkAdapter
 
 /**
  * Use the SparkAdapterSupport trait to get the SparkAdapter when we
- * need to adapt the difference between spark2 and spark3.
+ * need to adapt the difference between spark versions
  */
 trait SparkAdapterSupport {
 
@@ -33,20 +33,16 @@ trait SparkAdapterSupport {
 object SparkAdapterSupport {
 
   lazy val sparkAdapter: SparkAdapter = {
-    val adapterClass =  if (HoodieSparkUtils.isSpark3_5) {
+    val adapterClass = if (HoodieSparkUtils.isSpark4_1) {
+      "org.apache.spark.sql.adapter.Spark4_1Adapter"
+    } else if (HoodieSparkUtils.isSpark4_0) {
+      "org.apache.spark.sql.adapter.Spark4_0Adapter"
+    } else if (HoodieSparkUtils.isSpark3_5) {
       "org.apache.spark.sql.adapter.Spark3_5Adapter"
     } else if (HoodieSparkUtils.isSpark3_4) {
       "org.apache.spark.sql.adapter.Spark3_4Adapter"
-    } else if (HoodieSparkUtils.isSpark3_3) {
-      "org.apache.spark.sql.adapter.Spark3_3Adapter"
-    } else if (HoodieSparkUtils.isSpark3_2) {
-      "org.apache.spark.sql.adapter.Spark3_2Adapter"
-    } else if (HoodieSparkUtils.isSpark3_1) {
-      "org.apache.spark.sql.adapter.Spark3_1Adapter"
-    } else if (HoodieSparkUtils.isSpark3_0) {
-      "org.apache.spark.sql.adapter.Spark3_0Adapter"
     } else {
-      "org.apache.spark.sql.adapter.Spark2Adapter"
+      "org.apache.spark.sql.adapter.Spark3_3Adapter"
     }
     getClass.getClassLoader.loadClass(adapterClass)
       .newInstance().asInstanceOf[SparkAdapter]

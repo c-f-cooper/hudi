@@ -18,13 +18,17 @@
 
 package org.apache.hudi.integ.testsuite.configuration;
 
-import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.integ.testsuite.reader.DeltaInputType;
 import org.apache.hudi.integ.testsuite.writer.DeltaOutputMode;
+import org.apache.hudi.storage.StorageConfiguration;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
 import org.apache.hadoop.conf.Configuration;
 
 import java.io.Serializable;
@@ -36,29 +40,17 @@ import java.util.Map;
 /**
  * Configuration to hold the delta output type and delta input format.
  */
+@AllArgsConstructor
+@Getter
 public class DeltaConfig implements Serializable {
 
   private final DeltaOutputMode deltaOutputMode;
   private final DeltaInputType deltaInputType;
-  private final SerializableConfiguration configuration;
-
-  public DeltaConfig(DeltaOutputMode deltaOutputMode, DeltaInputType deltaInputType,
-      SerializableConfiguration configuration) {
-    this.deltaOutputMode = deltaOutputMode;
-    this.deltaInputType = deltaInputType;
-    this.configuration = configuration;
-  }
-
-  public DeltaOutputMode getDeltaOutputMode() {
-    return deltaOutputMode;
-  }
-
-  public DeltaInputType getDeltaInputType() {
-    return deltaInputType;
-  }
+  @Getter(AccessLevel.NONE)
+  private final StorageConfiguration<Configuration> storageConf;
 
   public Configuration getConfiguration() {
-    return configuration.get();
+    return storageConf.unwrap();
   }
 
   /**
@@ -370,12 +362,10 @@ public class DeltaConfig implements Serializable {
       }
     }
 
+    @NoArgsConstructor
     public static class Builder {
 
       private Map<String, Object> configsMap = new HashMap<>();
-
-      public Builder() {
-      }
 
       public Builder withNumRecordsToInsert(long numRecordsInsert) {
         this.configsMap.put(NUM_RECORDS_INSERT, numRecordsInsert);

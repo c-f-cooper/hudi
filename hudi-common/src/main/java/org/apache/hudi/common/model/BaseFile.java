@@ -18,107 +18,66 @@
 
 package org.apache.hudi.common.model;
 
-import org.apache.hudi.hadoop.fs.CachingPath;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathInfo;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.Path;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.ToString;
 
 import java.io.Serializable;
-import java.util.Objects;
 
 /**
  * Represents common metadata about base-file.
  * A base file can be Hudi base file or even an external (non-hudi) base file too.
  */
+@AllArgsConstructor(access = AccessLevel.PRIVATE)
+@Getter
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+@ToString
 public class BaseFile implements Serializable {
 
   private static final long serialVersionUID = 1L;
 
-  private transient FileStatus fileStatus;
-  private final String fullPath;
+  @ToString.Exclude
+  private transient StoragePathInfo pathInfo;
+  @EqualsAndHashCode.Include
+  // fullPath of baseFile
+  private final String path;
+  @ToString.Exclude
   protected final String fileName;
-  private long fileLen;
+  @Setter
+  private long fileSize;
 
   public BaseFile(BaseFile dataFile) {
-    this(dataFile.fileStatus,
-        dataFile.fullPath,
+    this(dataFile.pathInfo,
+        dataFile.path,
         dataFile.getFileName(),
-        dataFile.getFileLen());
+        dataFile.getFileSize());
   }
 
-  public BaseFile(FileStatus fileStatus) {
-    this(fileStatus,
-        fileStatus.getPath().toString(),
-        fileStatus.getPath().getName(),
-        fileStatus.getLen());
+  public BaseFile(StoragePathInfo pathInfo) {
+    this(pathInfo,
+        pathInfo.getPath().toString(),
+        pathInfo.getPath().getName(),
+        pathInfo.getLength());
   }
 
   public BaseFile(String filePath) {
     this(null, filePath, getFileName(filePath), -1);
   }
 
-  private BaseFile(FileStatus fileStatus, String fullPath, String fileName, long fileLen) {
-    this.fileStatus = fileStatus;
-    this.fullPath = fullPath;
-    this.fileLen = fileLen;
-    this.fileName = fileName;
-  }
-
-  public String getPath() {
-    return fullPath;
-  }
-
-  public Path getHadoopPath() {
-    if (fileStatus != null) {
-      return fileStatus.getPath();
+  public StoragePath getStoragePath() {
+    if (pathInfo != null) {
+      return pathInfo.getPath();
     }
-
-    return new CachingPath(fullPath);
-  }
-
-  public String getFileName() {
-    return fileName;
-  }
-
-  public FileStatus getFileStatus() {
-    return fileStatus;
-  }
-
-  public long getFileSize() {
-    return fileLen;
-  }
-
-  public void setFileLen(long fileLen) {
-    this.fileLen = fileLen;
-  }
-
-  public long getFileLen() {
-    return fileLen;
-  }
-
-  @Override
-  public boolean equals(Object o) {
-    if (this == o) {
-      return true;
-    }
-    if (o == null || getClass() != o.getClass()) {
-      return false;
-    }
-    BaseFile dataFile = (BaseFile) o;
-    return Objects.equals(fullPath, dataFile.fullPath);
-  }
-
-  @Override
-  public int hashCode() {
-    return Objects.hash(fullPath);
-  }
-
-  @Override
-  public String toString() {
-    return "BaseFile{fullPath=" + fullPath + ", fileLen=" + fileLen + '}';
+    return new StoragePath(path);
   }
 
   private static String getFileName(String fullPath) {
-    return new Path(fullPath).getName();
+    return new StoragePath(fullPath).getName();
   }
 }

@@ -18,9 +18,10 @@
 
 package org.apache.hudi.examples.common;
 
-import org.apache.avro.Schema;
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.utilities.schema.SchemaProvider;
+
 import org.apache.spark.api.java.JavaSparkContext;
 
 /**
@@ -33,7 +34,7 @@ public class ExampleDataSchemaProvider extends SchemaProvider {
   }
 
   @Override
-  public Schema getSourceSchema() {
-    return HoodieExampleDataGenerator.avroSchema;
+  public HoodieSchema getSourceHoodieSchema() {
+    return HoodieExampleDataGenerator.HOODIE_SCHEMA;
   }
 }

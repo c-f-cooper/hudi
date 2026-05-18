@@ -17,45 +17,46 @@
 
 package org.apache.hudi
 
-import org.apache.hudi.AvroConversionUtils.getAvroSchemaWithDefaults
-import org.apache.hudi.HoodieBaseRelation._
+import org.apache.hudi.HoodieBaseRelation.{convertToHoodieSchema, createHFileReader, isSchemaEvolutionEnabledOnRead, metaFieldNames, projectSchema, sparkAdapter, BaseFileReader}
 import org.apache.hudi.HoodieConversionUtils.toScalaOption
 import org.apache.hudi.avro.HoodieAvroUtils
 import org.apache.hudi.client.utils.SparkInternalSchemaConverter
-import org.apache.hudi.common.config.{ConfigProperty, HoodieConfig, HoodieMetadataConfig, SerializableConfiguration}
-import org.apache.hudi.common.config.HoodieReaderConfig.USE_NATIVE_HFILE_READER
+import org.apache.hudi.common.config.{ConfigProperty, HoodieMetadataConfig}
 import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.common.fs.FSUtils.getRelativePartitionPath
 import org.apache.hudi.common.model.{FileSlice, HoodieFileFormat, HoodieRecord}
 import org.apache.hudi.common.model.HoodieFileFormat.HFILE
 import org.apache.hudi.common.model.HoodieRecord.HoodieRecordType
+import org.apache.hudi.common.schema.{HoodieSchema, HoodieSchemaUtils => HoodieCommonSchemaUtils}
 import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient, TableSchemaResolver}
-import org.apache.hudi.common.table.timeline.HoodieTimeline
+import org.apache.hudi.common.table.timeline.{HoodieTimeline, TimelineLayout}
 import org.apache.hudi.common.table.timeline.TimelineUtils.validateTimestampAsOf
 import org.apache.hudi.common.table.view.HoodieTableFileSystemView
-import org.apache.hudi.common.util.{ConfigUtils, StringUtils}
+import org.apache.hudi.common.util.ConfigUtils
 import org.apache.hudi.common.util.StringUtils.isNullOrEmpty
 import org.apache.hudi.common.util.ValidationUtils.checkState
 import org.apache.hudi.config.HoodieBootstrapConfig.DATA_QUERIES_ONLY
 import org.apache.hudi.config.HoodieWriteConfig
 import org.apache.hudi.exception.HoodieException
-import org.apache.hudi.hadoop.fs.CachingPath
-import org.apache.hudi.internal.schema.{HoodieSchemaException, InternalSchema}
-import org.apache.hudi.internal.schema.convert.AvroInternalSchemaConverter
+import org.apache.hudi.hadoop.fs.HadoopFSUtils
+import org.apache.hudi.hadoop.fs.HadoopFSUtils.convertToStoragePath
+import org.apache.hudi.internal.schema.InternalSchema
+import org.apache.hudi.internal.schema.convert.InternalSchemaConverter
 import org.apache.hudi.internal.schema.utils.{InternalSchemaUtils, SerDeHelper}
-import org.apache.hudi.io.storage.HoodieFileReaderFactory
+import org.apache.hudi.io.storage.HoodieSparkIOFactory
 import org.apache.hudi.metadata.HoodieTableMetadata
+import org.apache.hudi.storage.{HoodieStorageUtils, StoragePath, StoragePathInfo}
 
-import org.apache.avro.Schema
 import org.apache.avro.generic.GenericRecord
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapred.JobConf
-import org.apache.spark.execution.datasources.HoodieInMemoryFileIndex
+import org.apache.spark.SerializableWritable
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Row, SparkSession, SQLContext}
 import org.apache.spark.sql.HoodieCatalystExpressionUtils.{convertToCatalystExpression, generateUnsafeProjection}
+import org.apache.spark.sql.avro.HoodieSparkSchemaConverters
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.expressions.{Expression, SubqueryExpression}
@@ -63,28 +64,27 @@ import org.apache.spark.sql.execution.FileRelation
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
 import org.apache.spark.sql.execution.datasources.parquet.{LegacyHoodieParquetFileFormat, ParquetFileFormat}
-import org.apache.spark.sql.hudi.HoodieSqlCommonUtils
+import org.apache.spark.sql.hudi.{HoodieSqlCommonUtils, ProvidesHoodieConfig}
 import org.apache.spark.sql.sources.{BaseRelation, Filter, PrunedFilteredScan}
 import org.apache.spark.sql.types.StructType
-
-import java.net.URI
 
 import scala.collection.JavaConverters._
 import scala.util.{Failure, Success, Try}
 
 trait HoodieFileSplit {}
 
-case class HoodieTableSchema(structTypeSchema: StructType, avroSchemaStr: String, internalSchema: Option[InternalSchema] = None)
+case class HoodieTableSchema(structTypeSchema: StructType, schema: HoodieSchema, internalSchema: Option[InternalSchema] = None)
 
 case class HoodieTableState(tablePath: String,
                             latestCommitTimestamp: Option[String],
                             recordKeyField: String,
-                            preCombineFieldOpt: Option[String],
+                            orderingFields: List[String],
                             usesVirtualKeys: Boolean,
                             recordPayloadClassName: String,
                             metadataConfig: HoodieMetadataConfig,
-                            recordMergerImpls: List[String],
-                            recordMergerStrategy: String)
+                            recordMergeImplClasses: List[String],
+                            recordMergeStrategyId: String)
+
 
 /**
  * Hoodie BaseRelation which extends [[PrunedFilteredScan]]
@@ -115,7 +115,7 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
 
   protected lazy val tableConfig: HoodieTableConfig = metaClient.getTableConfig
 
-  protected lazy val basePath: Path = metaClient.getBasePathV2
+  protected lazy val basePath: Path = new Path(metaClient.getBasePath.toUri)
 
   // NOTE: Record key-field is assumed singular here due to the either of
   //          - In case Hudi's meta fields are enabled: record key will be pre-materialized (stored) as part
@@ -132,15 +132,16 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
       keyFields.head
     }
 
-  protected lazy val preCombineFieldOpt: Option[String] =
-    Option(tableConfig.getPreCombineField)
-      .orElse(optParams.get(DataSourceWriteOptions.PRECOMBINE_FIELD.key)) match {
-      // NOTE: This is required to compensate for cases when empty string is used to stub
-      //       property value to avoid it being set with the default value
-      // TODO(HUDI-3456) cleanup
-      case Some(f) if !StringUtils.isNullOrEmpty(f) => Some(f)
-      case _ => None
+  protected lazy val orderingFields: List[String] = {
+    val tableOrderingFields = tableConfig.getOrderingFields
+    if (tableOrderingFields.isEmpty) {
+      DataSourceOptionsHelper.getPreCombineFields(optParams)
+        .orElse(java.util.Collections.emptyList[String])
+        .asScala.toList
+    } else {
+      tableOrderingFields.asScala.toList
     }
+  }
 
   protected lazy val specifiedQueryTimestamp: Option[String] =
     optParams.get(DataSourceReadOptions.TIME_TRAVEL_AS_OF_INSTANT.key)
@@ -150,7 +151,7 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
    * NOTE: Initialization of teh following members is coupled on purpose to minimize amount of I/O
    *       required to fetch table's Avro and Internal schemas
    */
-  protected lazy val (tableAvroSchema: Schema, internalSchemaOpt: Option[InternalSchema]) = {
+  protected lazy val (tableSchema: HoodieSchema, internalSchemaOpt: Option[InternalSchema]) = {
     val schemaResolver = new TableSchemaResolver(metaClient)
     val internalSchemaOpt = if (!isSchemaEvolutionEnabledOnRead(optParams, sparkSession)) {
       None
@@ -166,27 +167,25 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
       }
     }
 
-    val (name, namespace) = AvroConversionUtils.getAvroRecordNameAndNamespace(tableName)
-    val avroSchema = internalSchemaOpt.map { is =>
-      AvroInternalSchemaConverter.convert(is, namespace + "." + name)
+    val (name, namespace) = HoodieSchemaConversionUtils.getRecordNameAndNamespace(tableName)
+    val schema: HoodieSchema = internalSchemaOpt.map { is =>
+      InternalSchemaConverter.convert(is, namespace + "." + name)
     } orElse {
-      specifiedQueryTimestamp.map(schemaResolver.getTableAvroSchema)
+      specifiedQueryTimestamp.map(schemaResolver.getTableSchema)
     } orElse {
-      schemaSpec.map(s => convertToAvroSchema(s, tableName))
+      schemaSpec.map(s => convertToHoodieSchema(s, tableName))
     } getOrElse {
-      Try(schemaResolver.getTableAvroSchema) match {
+      Try(schemaResolver.getTableSchema) match {
         case Success(schema) => schema
-        case Failure(e) =>
-          logError("Failed to fetch schema from the table", e)
-          throw new HoodieSchemaException("Failed to fetch schema from the table")
+        case Failure(e) => throw e
       }
     }
 
-    (avroSchema, internalSchemaOpt)
+    (schema, internalSchemaOpt)
   }
 
   protected lazy val tableStructSchema: StructType = {
-    val converted = AvroConversionUtils.convertAvroSchemaToStructType(tableAvroSchema)
+    val converted = HoodieSchemaConversionUtils.convertHoodieSchemaToStructType(tableSchema)
     val metaFieldMetadata = sparkAdapter.createCatalystMetadataForMetaField
 
     // NOTE: Here we annotate meta-fields with corresponding metadata such that Spark (>= 3.2)
@@ -261,27 +260,23 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
       FileStatusCache.getOrCreate(sparkSession), shouldIncludeLogFiles())
 
   lazy val tableState: HoodieTableState = {
-    val recordMergerImpls = ConfigUtils.split2List(getConfigValue(HoodieWriteConfig.RECORD_MERGER_IMPLS)).asScala.toList
-    val recordMergerStrategy = getConfigValue(HoodieWriteConfig.RECORD_MERGER_STRATEGY,
-      Option(metaClient.getTableConfig.getRecordMergerStrategy))
-
+    val recordMergerImpls = optParams.get(HoodieWriteConfig.RECORD_MERGE_IMPL_CLASSES.key()).map(impls => ConfigUtils.split2List(impls).asScala.toList).getOrElse(List.empty)
     // Subset of the state of table's configuration as of at the time of the query
-    HoodieTableState(
-      tablePath = basePath.toString,
+    HoodieTableState(tablePath = basePath.toString,
       latestCommitTimestamp = queryTimestamp,
       recordKeyField = recordKeyField,
-      preCombineFieldOpt = preCombineFieldOpt,
+      orderingFields = orderingFields,
       usesVirtualKeys = !tableConfig.populateMetaFields(),
       recordPayloadClassName = tableConfig.getPayloadClass,
       metadataConfig = fileIndex.metadataConfig,
-      recordMergerImpls = recordMergerImpls,
-      recordMergerStrategy = recordMergerStrategy
+      recordMergeImplClasses = recordMergerImpls,
+      recordMergeStrategyId = tableConfig.getRecordMergeStrategyId
     )
   }
 
   /**
    * Columns that relation has to read from the storage to properly execute on its semantic: for ex,
-   * for Merge-on-Read tables key fields as well and pre-combine field comprise mandatory set of columns,
+   * for Merge-on-Read tables key fields as well and precombine field comprise mandatory set of columns,
    * meaning that regardless of whether this columns are being requested by the query they will be fetched
    * regardless so that relation is able to combine records properly (if necessary)
    *
@@ -294,7 +289,7 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
     metaClient.getCommitsAndCompactionTimeline.filterCompletedInstants
 
   private def queryTimestamp: Option[String] =
-    specifiedQueryTimestamp.orElse(toScalaOption(timeline.lastInstant()).map(_.getTimestamp))
+    specifiedQueryTimestamp.orElse(toScalaOption(timeline.lastInstant()).map(_.requestedTime))
 
   /**
    * Returns true in case table supports Schema on Read (Schema Evolution)
@@ -363,8 +358,8 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
     //       schema conversion, which is lossy in nature (for ex, it doesn't preserve original Avro type-names) and
     //       could have an effect on subsequent de-/serializing records in some exotic scenarios (when Avro unions
     //       w/ more than 2 types are involved)
-    val sourceSchema = prunedDataSchema.map(s => convertToAvroSchema(s, tableName)).getOrElse(tableAvroSchema)
-    val (requiredAvroSchema, requiredStructSchema, requiredInternalSchema) =
+    val sourceSchema = prunedDataSchema.map(s => convertToHoodieSchema(s, tableName)).getOrElse(tableSchema)
+    val (requiredProjectedSchema, requiredStructSchema, requiredInternalSchema) =
       projectSchema(Either.cond(internalSchemaOpt.isDefined, internalSchemaOpt.get, sourceSchema), targetColumns)
 
     val filterExpressions = convertToExpressions(filters)
@@ -372,15 +367,13 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
 
     val fileSplits = collectFileSplits(partitionFilters, dataFilters)
 
-    val tableAvroSchemaStr = tableAvroSchema.toString
-
-    val tableSchema = HoodieTableSchema(tableStructSchema, tableAvroSchemaStr, internalSchemaOpt)
-    val requiredSchema = HoodieTableSchema(requiredStructSchema, requiredAvroSchema.toString, Some(requiredInternalSchema))
+    val schema = HoodieTableSchema(tableStructSchema, tableSchema, internalSchemaOpt)
+    val requiredSchema = HoodieTableSchema(requiredStructSchema, requiredProjectedSchema, Some(requiredInternalSchema))
 
     if (fileSplits.isEmpty) {
       sparkSession.sparkContext.emptyRDD
     } else {
-      val rdd = composeRDD(fileSplits, tableSchema, requiredSchema, targetColumns, filters)
+      val rdd = composeRDD(fileSplits, schema, requiredSchema, targetColumns, filters)
 
       // Here we rely on a type erasure, to workaround inherited API restriction and pass [[RDD[InternalRow]]] back as [[RDD[Row]]]
       // Please check [[needConversion]] scala-doc for more details
@@ -414,25 +407,21 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
    */
   protected def collectFileSplits(partitionFilters: Seq[Expression], dataFilters: Seq[Expression]): Seq[FileSplit]
 
-  protected def listLatestFileSlices(globPaths: Seq[Path], partitionFilters: Seq[Expression], dataFilters: Seq[Expression]): Seq[FileSlice] = {
+  protected def listLatestFileSlices(partitionFilters: Seq[Expression], dataFilters: Seq[Expression]): Seq[FileSlice] = {
     queryTimestamp match {
       case Some(ts) =>
         specifiedQueryTimestamp.foreach(t => validateTimestampAsOf(metaClient, t))
 
-        val partitionDirs = if (globPaths.isEmpty) {
-          fileIndex.listFiles(partitionFilters, dataFilters)
-        } else {
-          val inMemoryFileIndex = HoodieInMemoryFileIndex.create(sparkSession, globPaths)
-          inMemoryFileIndex.listFiles(partitionFilters, dataFilters)
-        }
-
+        val partitionDirs = fileIndex.listFiles(partitionFilters, dataFilters)
         val fsView = new HoodieTableFileSystemView(
-          metaClient, timeline, sparkAdapter.getSparkPartitionedFileUtils.toFileStatuses(partitionDirs).toArray)
+          metaClient, timeline, sparkAdapter.getSparkPartitionedFileUtils.toFileStatuses(partitionDirs)
+            .map(fileStatus => HadoopFSUtils.convertToStoragePathInfo(fileStatus))
+            .asJava)
 
         fsView.getPartitionPaths.asScala.flatMap { partitionPath =>
-          val relativePath = getRelativePartitionPath(basePath, partitionPath)
-          fsView.getLatestMergedFileSlicesBeforeOrOn(relativePath, ts).iterator().asScala.toSeq
-        }
+          val relativePath = getRelativePartitionPath(convertToStoragePath(basePath), partitionPath)
+          fsView.getLatestMergedFileSlicesBeforeOrOn(relativePath, ts).iterator().asScala
+        }.toSeq
 
       case _ => Seq()
     }
@@ -481,27 +470,34 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
    * and pass this reader on parquet file. So that, we can query the partition columns.
    */
 
-  protected def getPartitionColumnsAsInternalRow(file: FileStatus): InternalRow =
-    getPartitionColumnsAsInternalRowInternal(file, metaClient.getBasePathV2, shouldExtractPartitionValuesFromPartitionPath)
+  protected def getPartitionColumnsAsInternalRow(file: StoragePathInfo): InternalRow =
+    getPartitionColumnsAsInternalRowInternal(file, metaClient.getBasePath, shouldExtractPartitionValuesFromPartitionPath)
 
-  protected def getPartitionColumnValuesAsInternalRow(file: FileStatus): InternalRow =
-    getPartitionColumnsAsInternalRowInternal(file, metaClient.getBasePathV2, extractPartitionValuesFromPartitionPath = true)
+  protected def getPartitionColumnValuesAsInternalRow(file: StoragePathInfo): InternalRow =
+    getPartitionColumnsAsInternalRowInternal(file,
+      metaClient.getBasePath, extractPartitionValuesFromPartitionPath = true)
 
-  protected def getPartitionColumnsAsInternalRowInternal(file: FileStatus, basePath: Path,
+  protected def usePartitionValueExtractorOnRead(optParams: Map[String, String], sparkSession: SparkSession): Boolean = {
+    optParams.getOrElse(DataSourceReadOptions.USE_PARTITION_VALUE_EXTRACTOR_ON_READ.key,
+      DataSourceReadOptions.USE_PARTITION_VALUE_EXTRACTOR_ON_READ.defaultValue).toBoolean
+  }
+
+  protected def getPartitionColumnsAsInternalRowInternal(file: StoragePathInfo, basePath: StoragePath,
                                                          extractPartitionValuesFromPartitionPath: Boolean): InternalRow = {
     if (extractPartitionValuesFromPartitionPath) {
-      val tablePathWithoutScheme = CachingPath.getPathWithoutSchemeAndAuthority(basePath)
-      val partitionPathWithoutScheme = CachingPath.getPathWithoutSchemeAndAuthority(file.getPath.getParent)
-      val relativePath = new URI(tablePathWithoutScheme.toString).relativize(new URI(partitionPathWithoutScheme.toString)).toString
+      val tablePathWithoutScheme = basePath.getPathWithoutSchemeAndAuthority
+      val partitionPathWithoutScheme = file.getPath.getParent.getPathWithoutSchemeAndAuthority
+      val relativePath = tablePathWithoutScheme.toUri.relativize(partitionPathWithoutScheme.toUri).toString
       val timeZoneId = conf.get("timeZone", sparkSession.sessionState.conf.sessionLocalTimeZone)
       val rowValues = HoodieSparkUtils.parsePartitionColumnValues(
         partitionColumns,
         relativePath,
         basePath,
         tableStructSchema,
+        tableConfig,
         timeZoneId,
-        sparkAdapter.getSparkParsePartitionUtil,
-        conf.getBoolean("spark.sql.sources.validatePartitionColumns", true))
+        conf.getBoolean("spark.sql.sources.validatePartitionColumns", true),
+        usePartitionValueExtractorOnRead(optParams, sparkSession))
       if(rowValues.length != partitionColumns.length) {
         throw new HoodieException("Failed to get partition column values from the partition-path:"
             + s"partition column size: ${partitionColumns.length}, parsed partition value size: ${rowValues.length}")
@@ -567,52 +563,40 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
       baseFileFormat = baseFileFormat
     )
 
-    // Check whether fields required for merging were also requested to be fetched
-    // by the query:
-    //    - In case they were, there's no optimization we could apply here (we will have
-    //    to fetch such fields)
-    //    - In case they were not, we will provide 2 separate file-readers
-    //        a) One which would be applied to file-groups w/ delta-logs (merging)
-    //        b) One which would be applied to file-groups w/ no delta-logs or
-    //           in case query-mode is skipping merging
+    // For file groups without delta logs, we can make the following optimizations:
+    //  a) If the requested columns are not included in mandatoryColumns, they can be removed from requiredDataSchema.
+    //  b) Apply filters to reader for data skipping since no merging.
     val mandatoryColumns = mandatoryFields.map(HoodieAvroUtils.getRootLevelFieldName)
-    if (mandatoryColumns.forall(requestedColumns.contains)) {
-      HoodieMergeOnReadBaseFileReaders(
-        fullSchemaReader = fullSchemaReader,
-        requiredSchemaReader = requiredSchemaReader,
-        requiredSchemaReaderSkipMerging = requiredSchemaReader
-      )
+    val unusedMandatoryColumnNames = mandatoryColumns.filterNot(requestedColumns.contains)
+    val prunedRequiredSchema = if (unusedMandatoryColumnNames.isEmpty) {
+      requiredDataSchema
     } else {
-      val prunedRequiredSchema = {
-        val unusedMandatoryColumnNames = mandatoryColumns.filterNot(requestedColumns.contains)
-        val prunedStructSchema =
-          StructType(requiredDataSchema.structTypeSchema.fields
-            .filterNot(f => unusedMandatoryColumnNames.contains(f.name)))
+      val prunedStructSchema =
+        StructType(requiredDataSchema.structTypeSchema.fields
+          .filterNot(f => unusedMandatoryColumnNames.contains(f.name)))
 
-        HoodieTableSchema(prunedStructSchema, convertToAvroSchema(prunedStructSchema, tableName).toString)
-      }
-
-      val requiredSchemaReaderSkipMerging = createBaseFileReader(
-        spark = sqlContext.sparkSession,
-        partitionSchema = partitionSchema,
-        dataSchema = dataSchema,
-        requiredDataSchema = prunedRequiredSchema,
-        // This file-reader is only used in cases when no merging is performed, therefore it's safe to push
-        // down these filters to the base file readers
-        filters = requiredFilters ++ optionalFilters,
-        options = optParams,
-        // NOTE: We have to fork the Hadoop Config here as Spark will be modifying it
-        //       to configure Parquet reader appropriately
-        hadoopConf = embedInternalSchema(new Configuration(conf), requiredDataSchema.internalSchema),
-        baseFileFormat = baseFileFormat
-      )
-
-      HoodieMergeOnReadBaseFileReaders(
-        fullSchemaReader = fullSchemaReader,
-        requiredSchemaReader = requiredSchemaReader,
-        requiredSchemaReaderSkipMerging = requiredSchemaReaderSkipMerging
-      )
+      HoodieTableSchema(prunedStructSchema, convertToHoodieSchema(prunedStructSchema, tableName))
     }
+
+    val requiredSchemaReaderSkipMerging = createBaseFileReader(
+      spark = sqlContext.sparkSession,
+      partitionSchema = partitionSchema,
+      dataSchema = dataSchema,
+      requiredDataSchema = prunedRequiredSchema,
+      // This file-reader is only used in cases when no merging is performed, therefore it's safe to push
+      // down these filters to the base file readers
+      filters = requiredFilters ++ optionalFilters,
+      options = optParams,
+      // NOTE: We have to fork the Hadoop Config here as Spark will be modifying it
+      //       to configure Parquet reader appropriately
+      hadoopConf = embedInternalSchema(new Configuration(conf), requiredDataSchema.internalSchema),
+      baseFileFormat = baseFileFormat
+    )
+
+    HoodieMergeOnReadBaseFileReaders(
+      fullSchemaReader = fullSchemaReader,
+      requiredSchemaReader = requiredSchemaReader,
+      requiredSchemaReaderSkipMerging = requiredSchemaReaderSkipMerging)
   }
 
   /**
@@ -690,10 +674,11 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
     val internalSchema = internalSchemaOpt.getOrElse(InternalSchema.getEmptyInternalSchema)
     val querySchemaString = SerDeHelper.toJson(internalSchema)
     if (!isNullOrEmpty(querySchemaString)) {
-      val validCommits = timeline.getInstants.iterator.asScala.map(_.getFileName).mkString(",")
+      val instantFileNameGenerator = TimelineLayout.fromVersion(timeline.getTimelineLayoutVersion).getInstantFileNameGenerator
+      val validCommits = timeline.getInstants.iterator.asScala.map(instant => instantFileNameGenerator.getFileName(instant)).mkString(",")
 
       conf.set(SparkInternalSchemaConverter.HOODIE_QUERY_SCHEMA, SerDeHelper.toJson(internalSchema))
-      conf.set(SparkInternalSchemaConverter.HOODIE_TABLE_PATH, metaClient.getBasePath)
+      conf.set(SparkInternalSchemaConverter.HOODIE_TABLE_PATH, metaClient.getBasePath.toString)
       conf.set(SparkInternalSchemaConverter.HOODIE_VALID_COMMITS_LIST, validCommits)
     }
     conf
@@ -725,9 +710,9 @@ abstract class HoodieBaseRelation(val sqlContext: SQLContext,
 
       (partitionSchema,
         HoodieTableSchema(prunedDataStructSchema,
-          convertToAvroSchema(prunedDataStructSchema, tableName).toString, prunedDataInternalSchema),
+          convertToHoodieSchema(prunedDataStructSchema, tableName), prunedDataInternalSchema),
         HoodieTableSchema(prunedRequiredStructSchema,
-          convertToAvroSchema(prunedRequiredStructSchema, tableName).toString, prunedRequiredInternalSchema))
+          convertToHoodieSchema(prunedRequiredStructSchema, tableName), prunedRequiredInternalSchema))
     } else {
       (StructType(Nil), tableSchema, requiredSchema)
     }
@@ -771,10 +756,9 @@ object HoodieBaseRelation extends SparkAdapterSupport {
     def apply(file: PartitionedFile): Iterator[InternalRow] = read.apply(file)
   }
 
-  def convertToAvroSchema(structSchema: StructType, tableName: String ): Schema = {
-    val (recordName, namespace) = AvroConversionUtils.getAvroRecordNameAndNamespace(tableName)
-    val avroSchema = sparkAdapter.getAvroSchemaConverters.toAvroType(structSchema, nullable = false, recordName, namespace)
-    getAvroSchemaWithDefaults(avroSchema, structSchema)
+  def convertToHoodieSchema(structSchema: StructType, tableName: String ): HoodieSchema = {
+    val (recordName, namespace) = HoodieSchemaConversionUtils.getRecordNameAndNamespace(tableName)
+    HoodieSparkSchemaConverters.toHoodieType(structSchema, nullable = false, recordName, namespace)
   }
 
   def getPartitionPath(fileStatus: FileStatus): Path =
@@ -812,29 +796,30 @@ object HoodieBaseRelation extends SparkAdapterSupport {
    * @param tableSchema schema to project (either of [[InternalSchema]] or Avro's [[Schema]])
    * @param requiredColumns required top-level columns to be projected
    */
-  def projectSchema(tableSchema: Either[Schema, InternalSchema], requiredColumns: Array[String]): (Schema, StructType, InternalSchema) = {
+  def projectSchema(tableSchema: Either[HoodieSchema, InternalSchema], requiredColumns: Array[String]): (HoodieSchema, StructType, InternalSchema) = {
     tableSchema match {
       case Right(internalSchema) =>
         checkState(!internalSchema.isEmptySchema)
         val prunedInternalSchema = InternalSchemaUtils.pruneInternalSchema(internalSchema, requiredColumns.toList.asJava)
-        val requiredAvroSchema = AvroInternalSchemaConverter.convert(prunedInternalSchema, "schema")
-        val requiredStructSchema = AvroConversionUtils.convertAvroSchemaToStructType(requiredAvroSchema)
+        val requiredSchema = InternalSchemaConverter.convert(prunedInternalSchema, "schema")
+        val requiredStructSchema = HoodieSchemaConversionUtils.convertHoodieSchemaToStructType(requiredSchema)
 
-        (requiredAvroSchema, requiredStructSchema, prunedInternalSchema)
+        (requiredSchema, requiredStructSchema, prunedInternalSchema)
 
-      case Left(avroSchema) =>
-        val fieldMap = avroSchema.getFields.asScala.map(f => f.name() -> f).toMap
+      case Left(hoodieSchema) =>
+        val fieldMap = hoodieSchema.getFields.asScala.map(f => f.name() -> f).toMap
         val requiredFields = requiredColumns.map { col =>
           val f = fieldMap(col)
-          // We have to create a new [[Schema.Field]] since Avro schemas can't share field
+          // We have to create a new HoodieSchemaField since Avro schemas can't share field
           // instances (and will throw "org.apache.avro.AvroRuntimeException: Field already used")
-          new Schema.Field(f.name(), f.schema(), f.doc(), f.defaultVal(), f.order())
+          HoodieCommonSchemaUtils.createNewSchemaField(f.name(), f.schema(), f.doc().orElse(null), f.defaultVal().orElse(null))
         }.toList
-        val requiredAvroSchema = Schema.createRecord(avroSchema.getName, avroSchema.getDoc,
-          avroSchema.getNamespace, avroSchema.isError, requiredFields.asJava)
-        val requiredStructSchema = AvroConversionUtils.convertAvroSchemaToStructType(requiredAvroSchema)
 
-        (requiredAvroSchema, requiredStructSchema, InternalSchema.getEmptyInternalSchema)
+        val requiredSchema = HoodieSchema.createRecord(hoodieSchema.getName, hoodieSchema.getDoc.orElse(null),
+          hoodieSchema.getNamespace.orElse(null), hoodieSchema.isError, requiredFields.asJava)
+        val requiredStructSchema = HoodieSchemaConversionUtils.convertHoodieSchemaToStructType(requiredSchema)
+
+        (requiredSchema, requiredStructSchema, InternalSchema.getEmptyInternalSchema)
     }
   }
 
@@ -844,27 +829,25 @@ object HoodieBaseRelation extends SparkAdapterSupport {
                                 filters: Seq[Filter],
                                 options: Map[String, String],
                                 hadoopConf: Configuration): PartitionedFile => Iterator[InternalRow] = {
-    val hadoopConfBroadcast =
-      spark.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+    val hadoopConfBroadcast = spark.sparkContext.broadcast(new SerializableWritable(hadoopConf))
 
     partitionedFile => {
-      val hadoopConf = hadoopConfBroadcast.value.get()
+      val hadoopConf = hadoopConfBroadcast.value.value
       val filePath = sparkAdapter.getSparkPartitionedFileUtils.getPathFromPartitionedFile(partitionedFile)
-      val hoodieConfig = new HoodieConfig()
-      hoodieConfig.setValue(USE_NATIVE_HFILE_READER,
-        options.getOrElse(USE_NATIVE_HFILE_READER.key(), USE_NATIVE_HFILE_READER.defaultValue().toString))
-      val reader = HoodieFileReaderFactory.getReaderFactory(HoodieRecordType.AVRO)
-        .getFileReader(hoodieConfig, hadoopConf, filePath, HFILE)
+      val hoodieConfig = ConfigUtils.getHFileCacheConfigs(options.asJava)
+
+      val reader = new HoodieSparkIOFactory(
+        HoodieStorageUtils.getStorage(filePath, HadoopFSUtils.getStorageConf(hadoopConf)))
+        .getReaderFactory(HoodieRecordType.AVRO)
+        .getFileReader(hoodieConfig, filePath, HFILE)
 
       val requiredRowSchema = requiredDataSchema.structTypeSchema
-      // NOTE: Schema has to be parsed at this point, since Avro's [[Schema]] aren't serializable
-      //       to be passed from driver to executor
-      val requiredAvroSchema = new Schema.Parser().parse(requiredDataSchema.avroSchemaStr)
-      val avroToRowConverter = AvroConversionUtils.createAvroToInternalRowConverter(requiredAvroSchema, requiredRowSchema)
+      val requiredSchema = requiredDataSchema.schema
+      val hoodieSchemaToRowConverter = HoodieSchemaConversionUtils.createGenericRecordToInternalRowConverter(requiredSchema, requiredRowSchema)
 
-      reader.getRecordIterator(requiredAvroSchema).asScala
+      reader.getRecordIterator(requiredSchema).asScala
         .map(record => {
-          avroToRowConverter.apply(record.getData.asInstanceOf[GenericRecord]).get
+          hoodieSchemaToRowConverter.apply(record.getData.asInstanceOf[GenericRecord]).get
         })
     }
   }
@@ -874,7 +857,6 @@ object HoodieBaseRelation extends SparkAdapterSupport {
     //       t/h Spark Session configuration (for ex, for Spark SQL)
     optParams.getOrElse(DataSourceReadOptions.SCHEMA_EVOLUTION_ENABLED.key,
       DataSourceReadOptions.SCHEMA_EVOLUTION_ENABLED.defaultValue.toString).toBoolean ||
-      sparkSession.conf.get(DataSourceReadOptions.SCHEMA_EVOLUTION_ENABLED.key,
-        DataSourceReadOptions.SCHEMA_EVOLUTION_ENABLED.defaultValue.toString).toBoolean
+      ProvidesHoodieConfig.isSchemaEvolutionEnabled(sparkSession)
   }
 }

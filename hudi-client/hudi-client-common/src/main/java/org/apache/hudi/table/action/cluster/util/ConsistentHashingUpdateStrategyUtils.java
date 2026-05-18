@@ -23,19 +23,17 @@ import org.apache.hudi.avro.model.HoodieClusteringPlan;
 import org.apache.hudi.common.model.ConsistentHashingNode;
 import org.apache.hudi.common.model.HoodieConsistentHashingMetadata;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
-import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.ClusteringUtils;
 import org.apache.hudi.common.util.Option;
-import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.common.util.ValidationUtils;
+import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.index.bucket.ConsistentBucketIdentifier;
 import org.apache.hudi.index.bucket.ConsistentBucketIndexUtils;
 import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.table.action.cluster.strategy.BaseConsistentHashingBucketClusteringPlanStrategy;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.HashMap;
 import java.util.List;
@@ -47,9 +45,8 @@ import java.util.stream.Stream;
 /**
  * Utility class for update strategy of table with consistent hash bucket index.
  */
+@Slf4j
 public class ConsistentHashingUpdateStrategyUtils {
-
-  private static final Logger LOG = LoggerFactory.getLogger(ConsistentHashingUpdateStrategyUtils.class);
 
   /**
    * Construct identifier for the given partitions that are under concurrent resizing (i.e., clustering).
@@ -58,7 +55,8 @@ public class ConsistentHashingUpdateStrategyUtils {
   public static Map<String, Pair<String, ConsistentBucketIdentifier>> constructPartitionToIdentifier(Set<String> partitions, HoodieTable table) {
     // Read all pending/ongoing clustering plans
     List<Pair<HoodieInstant, HoodieClusteringPlan>> instantPlanPairs =
-        table.getMetaClient().getActiveTimeline().filterInflightsAndRequested().filter(instant -> instant.getAction().equals(HoodieTimeline.REPLACE_COMMIT_ACTION)).getInstantsAsStream()
+        table.getMetaClient().getActiveTimeline()
+            .filterPendingReplaceOrClusteringTimeline().getInstantsAsStream()
             .map(instant -> ClusteringUtils.getClusteringPlan(table.getMetaClient(), instant))
             .flatMap(o -> o.isPresent() ? Stream.of(o.get()) : Stream.empty())
             .collect(Collectors.toList());
@@ -67,7 +65,7 @@ public class ConsistentHashingUpdateStrategyUtils {
     Map<String, HoodieConsistentHashingMetadata> partitionToHashingMeta = new HashMap<>();
     Map<String, String> partitionToInstant = new HashMap<>();
     for (Pair<HoodieInstant, HoodieClusteringPlan> pair : instantPlanPairs) {
-      String instant = pair.getLeft().getTimestamp();
+      String instant = pair.getLeft().requestedTime();
       HoodieClusteringPlan plan = pair.getRight();
       extractHashingMetadataFromClusteringPlan(instant, plan, table, partitions, partitionToHashingMeta, partitionToInstant);
     }
@@ -99,7 +97,7 @@ public class ConsistentHashingUpdateStrategyUtils {
         List<ConsistentHashingNode> nodes = ConsistentHashingNode.fromJsonString(nodeJson);
         partitionToHashingMeta.get(p).getChildrenNodes().addAll(nodes);
       } catch (Exception e) {
-        LOG.error("Failed to parse child nodes in clustering plan.", e);
+        log.error("Failed to parse child nodes in clustering plan.", e);
         throw new HoodieException("Failed to parse child nodes in clustering plan, partition: " + p + ", cluster group: " + group, e);
       }
     }

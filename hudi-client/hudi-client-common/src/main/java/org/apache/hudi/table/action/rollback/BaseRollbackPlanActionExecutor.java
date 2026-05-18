@@ -24,17 +24,14 @@ import org.apache.hudi.avro.model.HoodieRollbackRequest;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
-import org.apache.hudi.common.table.timeline.TimelineMetadataUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieIOException;
 import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.table.action.BaseActionExecutor;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
-import java.io.IOException;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
@@ -43,9 +40,8 @@ import java.util.List;
  * Base rollback plan action executor to assist in scheduling rollback requests. This phase serialized {@link HoodieRollbackPlan}
  * to rollback.requested instant.
  */
+@Slf4j
 public class BaseRollbackPlanActionExecutor<T, I, K, O> extends BaseActionExecutor<T, I, K, O, Option<HoodieRollbackPlan>> {
-
-  private static final Logger LOG = LoggerFactory.getLogger(BaseRollbackPlanActionExecutor.class);
 
   protected final HoodieInstant instantToRollback;
   private final boolean skipTimelinePublish;
@@ -104,27 +100,26 @@ public class BaseRollbackPlanActionExecutor<T, I, K, O> extends BaseActionExecut
    * @return Rollback Plan if generated
    */
   protected Option<HoodieRollbackPlan> requestRollback(String startRollbackTime) {
-    final HoodieInstant rollbackInstant = new HoodieInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.ROLLBACK_ACTION, startRollbackTime);
+    final HoodieInstant rollbackInstant = instantGenerator.createNewInstant(HoodieInstant.State.REQUESTED, HoodieTimeline.ROLLBACK_ACTION, startRollbackTime);
     try {
       List<HoodieRollbackRequest> rollbackRequests = new ArrayList<>();
       if (!instantToRollback.isRequested()) {
         rollbackRequests.addAll(getRollbackStrategy().getRollbackRequests(instantToRollback));
       }
-      HoodieRollbackPlan rollbackPlan = new HoodieRollbackPlan(new HoodieInstantInfo(instantToRollback.getTimestamp(),
+      HoodieRollbackPlan rollbackPlan = new HoodieRollbackPlan(new HoodieInstantInfo(instantToRollback.requestedTime(),
           instantToRollback.getAction()), rollbackRequests, LATEST_ROLLBACK_PLAN_VERSION);
       if (!skipTimelinePublish) {
-        if (table.getRollbackTimeline().filterInflightsAndRequested().containsInstant(rollbackInstant.getTimestamp())) {
-          LOG.warn("Request Rollback found with instant time " + rollbackInstant + ", hence skipping scheduling rollback");
+        if (table.getRollbackTimeline().filterInflightsAndRequested().containsInstant(rollbackInstant.requestedTime())) {
+          log.info("Request Rollback found with instant time {}, hence skipping scheduling rollback", rollbackInstant);
         } else {
-          table.getActiveTimeline().saveToRollbackRequested(rollbackInstant, TimelineMetadataUtils.serializeRollbackPlan(rollbackPlan));
-          table.getMetaClient().reloadActiveTimeline();
-          LOG.info("Requesting Rollback with instant time " + rollbackInstant);
+          table.getActiveTimeline().saveToRollbackRequested(rollbackInstant, rollbackPlan);
+          log.info("Requesting Rollback with instant time {}", rollbackInstant);
         }
       }
       return Option.of(rollbackPlan);
-    } catch (IOException e) {
-      LOG.error("Got exception when saving rollback requested file", e);
-      throw new HoodieIOException(e.getMessage(), e);
+    } catch (HoodieIOException e) {
+      log.error("Got exception when saving rollback requested file", e);
+      throw e;
     }
   }
 

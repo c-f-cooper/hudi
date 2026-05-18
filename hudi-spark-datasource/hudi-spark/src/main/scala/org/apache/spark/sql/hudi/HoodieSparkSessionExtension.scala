@@ -17,7 +17,8 @@
 
 package org.apache.spark.sql.hudi
 
-import org.apache.hudi.{HoodieSparkUtils, SparkAdapterSupport}
+import org.apache.hudi.SparkAdapterSupport
+
 import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.hudi.analysis.HoodieAnalysis
 import org.apache.spark.sql.parser.HoodieCommonSqlParser
@@ -52,5 +53,7 @@ class HoodieSparkSessionExtension extends (SparkSessionExtensions => Unit)
     */
 
     sparkAdapter.injectTableFunctions(extensions)
+    sparkAdapter.injectScalarFunctions(extensions)
+    sparkAdapter.injectPlannerStrategies(extensions)
   }
 }

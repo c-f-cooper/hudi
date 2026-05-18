@@ -23,8 +23,8 @@ import org.apache.hudi.common.model.HoodieReplaceCommitMetadata;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.model.WriteOperationType;
+import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
-import org.apache.hudi.common.table.timeline.HoodieDefaultTimeline;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.collection.Pair;
@@ -32,9 +32,7 @@ import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieIOException;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.avro.Schema;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.util.HashMap;
@@ -47,10 +45,10 @@ import java.util.stream.Collectors;
 /**
  * Helper class to generate commit metadata.
  */
+@Slf4j
 public class CommitUtils {
 
-  private static final Logger LOG = LoggerFactory.getLogger(CommitUtils.class);
-  private static final String NULL_SCHEMA_STR = Schema.create(Schema.Type.NULL).toString();
+  private static final String NULL_SCHEMA_STR = HoodieSchema.NULL_SCHEMA.toString();
   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
   /**
@@ -60,7 +58,7 @@ public class CommitUtils {
    */
   public static String getCommitActionType(WriteOperationType operation, HoodieTableType tableType) {
     if (operation == WriteOperationType.INSERT_OVERWRITE || operation == WriteOperationType.INSERT_OVERWRITE_TABLE
-        || operation == WriteOperationType.DELETE_PARTITION) {
+        || operation == WriteOperationType.DELETE_PARTITION || operation == WriteOperationType.BUCKET_RESCALE) {
       return HoodieTimeline.REPLACE_COMMIT_ACTION;
     } else {
       return getCommitActionType(tableType);
@@ -107,7 +105,7 @@ public class CommitUtils {
                                                              String commitActionType,
                                                              WriteOperationType operationType) {
     final HoodieCommitMetadata commitMetadata;
-    if (HoodieTimeline.REPLACE_COMMIT_ACTION.equals(commitActionType)) {
+    if (ClusteringUtils.isClusteringOrReplaceCommitAction(commitActionType)) {
       HoodieReplaceCommitMetadata replaceMetadata = new HoodieReplaceCommitMetadata();
       replaceMetadata.setPartitionToReplaceFileIds(partitionToReplaceFileIds);
       commitMetadata = replaceMetadata;
@@ -120,20 +118,17 @@ public class CommitUtils {
       commitMetadata.addWriteStat(partition, writeStat);
     }
 
-    LOG.info("Creating  metadata for " + operationType + " numWriteStats:" + writeStats.size()
-        + " numReplaceFileIds:" + partitionToReplaceFileIds.values().stream().mapToInt(e -> e.size()).sum());
+    log.info("Creating  metadata for {} numWriteStats:{} numReplaceFileIds:{}", operationType, writeStats.size(), partitionToReplaceFileIds.values().stream().mapToInt(e -> e.size()).sum());
     return commitMetadata;
   }
 
-  public static Option<HoodieCommitMetadata> buildMetadataFromInstant(HoodieDefaultTimeline timeline, HoodieInstant instant) {
+  public static Option<HoodieCommitMetadata> buildMetadataFromInstant(HoodieTimeline timeline, HoodieInstant instant) {
     try {
-      HoodieCommitMetadata commitMetadata = HoodieCommitMetadata.fromBytes(
-          timeline.getInstantDetails(instant).get(),
-          HoodieCommitMetadata.class);
+      HoodieCommitMetadata commitMetadata = timeline.readCommitMetadata(instant);
 
       return Option.of(commitMetadata);
     } catch (IOException e) {
-      LOG.info("Failed to parse HoodieCommitMetadata for " + instant.toString(), e);
+      log.info("Failed to parse HoodieCommitMetadata for {}", instant.toString(), e);
     }
 
     return Option.empty();
@@ -183,8 +178,7 @@ public class CommitUtils {
     return (Option<String>) timeline.getWriteTimeline().filterCompletedInstants().getReverseOrderedInstants()
         .map(instant -> {
           try {
-            HoodieCommitMetadata commitMetadata = HoodieCommitMetadata
-                .fromBytes(timeline.getInstantDetails(instant).get(), HoodieCommitMetadata.class);
+            HoodieCommitMetadata commitMetadata = timeline.readCommitMetadata(instant);
             // process commits only with checkpoint entries
             String checkpointValue = commitMetadata.getMetadata(checkpointKey);
             if (StringUtils.nonEmpty(checkpointValue)) {

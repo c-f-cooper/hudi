@@ -18,15 +18,16 @@
 
 package org.apache.hudi.utilities;
 
+import org.apache.hudi.SparkAdapterSupport$;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.exception.HoodieException;
 
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
 import org.apache.hadoop.fs.Path;
-import org.apache.hudi.exception.HoodieException;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,7 +53,7 @@ public class HoodieCleaner {
   /**
    * Bag of properties with source, hoodie client, key generator etc.
    */
-  private TypedProperties props;
+  private final TypedProperties props;
 
   public HoodieCleaner(Config cfg, JavaSparkContext jssc) {
     this(cfg, jssc, UtilHelpers.buildProperties(jssc.hadoopConfiguration(), cfg.propsFilePath, cfg.configs));
@@ -73,7 +74,7 @@ public class HoodieCleaner {
   }
 
   private HoodieWriteConfig getHoodieClientConfig() {
-    return HoodieWriteConfig.newBuilder().combineInput(true, true).withPath(cfg.basePath).withAutoCommit(false)
+    return HoodieWriteConfig.newBuilder().combineInput(true, true).withPath(cfg.basePath)
         .withProps(props).build();
   }
 
@@ -95,6 +96,9 @@ public class HoodieCleaner {
     @Parameter(names = {"--spark-master"}, description = "spark master to use.")
     public String sparkMaster = "local[2]";
 
+    @Parameter(names = {"--enable-hive-support", "-ehs"}, description = "Enables hive support during spark context initialization.", required = false)
+    public Boolean enableHiveSupport = false;
+
     @Parameter(names = {"--help", "-h"}, help = true)
     public Boolean help = false;
   }
@@ -108,14 +112,16 @@ public class HoodieCleaner {
     }
 
     String dirName = new Path(cfg.basePath).getName();
-    JavaSparkContext jssc = UtilHelpers.buildSparkContext("hoodie-cleaner-" + dirName, cfg.sparkMaster);
+    JavaSparkContext jssc = UtilHelpers.buildSparkContext("hoodie-cleaner-" + dirName, cfg.sparkMaster, cfg.enableHiveSupport);
 
+    int exitCode = 0;
     try {
       new HoodieCleaner(cfg, jssc).run();
     } catch (Throwable throwable) {
+      exitCode = 1;
       throw new HoodieException("Failed to run cleaning for " + cfg.basePath, throwable);
     } finally {
-      jssc.stop();
+      SparkAdapterSupport$.MODULE$.sparkAdapter().stopSparkContext(jssc, exitCode);
     }
 
     LOG.info("Cleaner ran successfully");

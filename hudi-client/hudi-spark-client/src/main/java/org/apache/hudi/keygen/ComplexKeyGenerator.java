@@ -17,9 +17,10 @@
 
 package org.apache.hudi.keygen;
 
-import org.apache.avro.generic.GenericRecord;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.keygen.constant.KeyGeneratorOptions;
+
+import org.apache.avro.generic.GenericRecord;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.types.StructType;
@@ -38,6 +39,7 @@ import java.util.stream.Collectors;
 public class ComplexKeyGenerator extends BuiltinKeyGenerator {
 
   private final ComplexAvroKeyGenerator complexAvroKeyGenerator;
+  private final boolean encodeSingleKeyFieldName;
 
   public ComplexKeyGenerator(TypedProperties props) {
     super(props);
@@ -47,6 +49,7 @@ public class ComplexKeyGenerator extends BuiltinKeyGenerator {
         .filter(s -> !s.isEmpty())
         .collect(Collectors.toList());
     this.complexAvroKeyGenerator = new ComplexAvroKeyGenerator(props);
+    this.encodeSingleKeyFieldName = KeyGenUtils.encodeSingleKeyFieldNameForComplexKeyGen(props);
   }
 
   @Override
@@ -62,13 +65,15 @@ public class ComplexKeyGenerator extends BuiltinKeyGenerator {
   @Override
   public String getRecordKey(Row row) {
     tryInitRowAccessor(row.schema());
-    return combineCompositeRecordKey(rowAccessor.getRecordKeyParts(row));
+    return combineCompositeRecordKey(
+        encodeSingleKeyFieldName, rowAccessor.getRecordKeyParts(row));
   }
 
   @Override
   public UTF8String getRecordKey(InternalRow internalRow, StructType schema) {
     tryInitRowAccessor(schema);
-    return combineCompositeRecordKeyUnsafe(rowAccessor.getRecordKeyParts(internalRow));
+    return combineCompositeRecordKeyUnsafe(
+        encodeSingleKeyFieldName, rowAccessor.getRecordKeyParts(internalRow));
   }
 
   @Override

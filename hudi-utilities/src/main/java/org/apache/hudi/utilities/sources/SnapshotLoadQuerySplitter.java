@@ -18,10 +18,17 @@
 
 package org.apache.hudi.utilities.sources;
 
+import org.apache.hudi.ApiMaturityLevel;
+import org.apache.hudi.PublicAPIClass;
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.table.read.IncrementalQueryAnalyzer.QueryContext;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.utilities.sources.helpers.QueryInfo;
+import org.apache.hudi.utilities.streamer.SourceProfileSupplier;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 
@@ -30,8 +37,9 @@ import static org.apache.hudi.utilities.sources.SnapshotLoadQuerySplitter.Config
 /**
  * Abstract splitter responsible for managing the snapshot load query operations.
  */
+@PublicAPIClass(maturity = ApiMaturityLevel.EVOLVING)
+@AllArgsConstructor
 public abstract class SnapshotLoadQuerySplitter {
-
   /**
    * Configuration properties for the splitter.
    */
@@ -48,35 +56,38 @@ public abstract class SnapshotLoadQuerySplitter {
   }
 
   /**
-   * Constructor initializing the properties.
-   *
-   * @param properties Configuration properties for the splitter.
+   * Checkpoint returned for the SnapshotLoadQuerySplitter.
    */
-  public SnapshotLoadQuerySplitter(TypedProperties properties) {
-    this.properties = properties;
+  @AllArgsConstructor
+  @Getter
+  public static class CheckpointWithPredicates {
+
+    private final String endCompletionTime;
+    private final String predicateFilter;
   }
 
   /**
-   * Abstract method to retrieve the next checkpoint.
+   * Abstract method to retrieve the next checkpoint with predicates.
    *
-   * @param df The dataset to process.
-   * @param beginCheckpointStr The starting checkpoint string.
-   * @return The next checkpoint as an Option.
+   * @param df             The dataset to process.
+   * @param queryContext   The query context containing the instants to filter from.
+   * @return The next checkpoint with predicates for partitionPath etc. to optimise snapshot query.
    */
-  public abstract Option<String> getNextCheckpoint(Dataset<Row> df, String beginCheckpointStr);
+  public abstract Option<CheckpointWithPredicates> getNextCheckpointWithPredicates(Dataset<Row> df, QueryContext queryContext);
 
   /**
-   * Retrieves the next checkpoint based on query information.
+   * Retrieves the next checkpoint based on query information and a SourceProfileSupplier.
    *
    * @param df The dataset to process.
    * @param queryInfo The query information object.
+   * @param sourceProfileSupplier An Option of a SourceProfileSupplier to use in load splitting implementation
    * @return Updated query information with the next checkpoint, in case of empty checkpoint,
    * returning endPoint same as queryInfo.getEndInstant().
    */
-  public QueryInfo getNextCheckpoint(Dataset<Row> df, QueryInfo queryInfo) {
-    return getNextCheckpoint(df, queryInfo.getStartInstant())
-        .map(checkpoint -> queryInfo.withUpdatedEndInstant(checkpoint))
-        .orElse(queryInfo);
+  @Deprecated
+  public QueryInfo getNextCheckpoint(Dataset<Row> df, QueryInfo queryInfo, Option<SourceProfileSupplier> sourceProfileSupplier) {
+    // TODO(HUDI-8354): fix related usage in the event incremental source
+    throw new UnsupportedOperationException("getNextCheckpoint is no longer supported with instant time.");
   }
 
   public static Option<SnapshotLoadQuerySplitter> getInstance(TypedProperties props) {

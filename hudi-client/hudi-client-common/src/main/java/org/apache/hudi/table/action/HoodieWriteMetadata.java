@@ -22,6 +22,10 @@ import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.util.Option;
 
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
@@ -30,21 +34,24 @@ import java.util.Map;
 /**
  * Contains metadata, write-statuses and latency times corresponding to a commit/delta-commit action.
  */
+@Getter
+@NoArgsConstructor
 public class HoodieWriteMetadata<O> {
 
+  @Setter
   private O writeStatuses;
   private Option<Duration> indexLookupDuration = Option.empty();
+  private Option<Long> sourceReadAndIndexDurationMs = Option.empty();
 
   // Will be set when auto-commit happens
+  @Setter
   private boolean isCommitted;
+  @Setter
   private Option<HoodieCommitMetadata> commitMetadata = Option.empty();
   private Option<List<HoodieWriteStat>> writeStats = Option.empty();
   private Option<Duration> indexUpdateDuration = Option.empty();
   private Option<Duration> finalizeDuration = Option.empty();
   private Option<Map<String, List<String>>> partitionToReplaceFileIds = Option.empty();
-
-  public HoodieWriteMetadata() {
-  }
 
   /**
    * Clones the write metadata with transformed write statuses.
@@ -58,6 +65,9 @@ public class HoodieWriteMetadata<O> {
     newMetadataInstance.setWriteStatuses(transformedWriteStatuses);
     if (indexLookupDuration.isPresent()) {
       newMetadataInstance.setIndexLookupDuration(indexLookupDuration.get());
+    }
+    if (sourceReadAndIndexDurationMs.isPresent()) {
+      newMetadataInstance.setSourceReadAndIndexDurationMs(sourceReadAndIndexDurationMs.get());
     }
     newMetadataInstance.setCommitted(isCommitted);
     newMetadataInstance.setCommitMetadata(commitMetadata);
@@ -76,60 +86,24 @@ public class HoodieWriteMetadata<O> {
     return newMetadataInstance;
   }
 
-  public O getWriteStatuses() {
-    return writeStatuses;
-  }
-
-  public Option<HoodieCommitMetadata> getCommitMetadata() {
-    return commitMetadata;
-  }
-
-  public void setWriteStatuses(O writeStatuses) {
-    this.writeStatuses = writeStatuses;
-  }
-
-  public void setCommitMetadata(Option<HoodieCommitMetadata> commitMetadata) {
-    this.commitMetadata = commitMetadata;
-  }
-
-  public Option<Duration> getFinalizeDuration() {
-    return finalizeDuration;
-  }
-
   public void setFinalizeDuration(Duration finalizeDuration) {
     this.finalizeDuration = Option.ofNullable(finalizeDuration);
-  }
-
-  public Option<Duration> getIndexUpdateDuration() {
-    return indexUpdateDuration;
   }
 
   public void setIndexUpdateDuration(Duration indexUpdateDuration) {
     this.indexUpdateDuration = Option.ofNullable(indexUpdateDuration);
   }
 
-  public boolean isCommitted() {
-    return isCommitted;
-  }
-
-  public void setCommitted(boolean committed) {
-    isCommitted = committed;
-  }
-
-  public Option<List<HoodieWriteStat>> getWriteStats() {
-    return writeStats;
-  }
-
   public void setWriteStats(List<HoodieWriteStat> writeStats) {
     this.writeStats = Option.of(writeStats);
   }
 
-  public Option<Duration> getIndexLookupDuration() {
-    return indexLookupDuration;
-  }
-
   public void setIndexLookupDuration(Duration indexLookupDuration) {
     this.indexLookupDuration = Option.ofNullable(indexLookupDuration);
+  }
+
+  public void setSourceReadAndIndexDurationMs(Long sourceReadAndIndexDurationMs) {
+    this.sourceReadAndIndexDurationMs = Option.of(sourceReadAndIndexDurationMs);
   }
 
   public Map<String, List<String>> getPartitionToReplaceFileIds() {

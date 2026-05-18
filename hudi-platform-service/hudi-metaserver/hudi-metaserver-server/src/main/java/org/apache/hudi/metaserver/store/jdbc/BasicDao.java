@@ -1,5 +1,3 @@
-package org.apache.hudi.metaserver.store.jdbc;
-
 /*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -18,7 +16,10 @@ package org.apache.hudi.metaserver.store.jdbc;
  * limitations under the License.
  */
 
+package org.apache.hudi.metaserver.store.jdbc;
+
 import org.apache.hudi.metaserver.thrift.MetaserverStorageException;
+
 import org.apache.ibatis.session.SqlSession;
 
 import java.io.Serializable;

@@ -19,6 +19,8 @@
 
 package org.apache.hudi.common.bloom;
 
+import lombok.Getter;
+
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
@@ -30,6 +32,7 @@ import java.io.IOException;
  *
  * @see InternalBloomFilter The general behavior of a bloom filter and how the key is used.
  */
+@Getter
 public class Key implements Comparable<Key> {
   /**
    * Byte value of key
@@ -86,20 +89,6 @@ public class Key implements Comparable<Key> {
   }
 
   /**
-   * @return byte[] The value of <i>this</i> key.
-   */
-  public byte[] getBytes() {
-    return this.bytes;
-  }
-
-  /**
-   * @return Returns the weight associated to <i>this</i> key.
-   */
-  public double getWeight() {
-    return weight;
-  }
-
-  /**
    * Increments the weight of <i>this</i> key with a specified value.
    *
    * @param weight The increment.
@@ -136,7 +125,7 @@ public class Key implements Comparable<Key> {
   /**
    * Serialize the fields of this object to <code>out</code>.
    *
-   * @param out <code>DataOuput</code> to serialize this object into.
+   * @param out <code>DataOutput</code> to serialize this object into.
    * @throws IOException
    */
   public void write(DataOutput out) throws IOException {

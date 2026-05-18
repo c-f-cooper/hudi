@@ -18,10 +18,10 @@
 package org.apache.spark.sql.hudi.command.procedures
 
 import org.apache.hudi.HoodieCLIUtils
-import org.apache.hudi.common.table.HoodieTableMetaClient
 import org.apache.hudi.common.table.timeline.{HoodieInstant, HoodieTimeline}
 import org.apache.hudi.common.util.StringUtils
 import org.apache.hudi.exception.{HoodieException, HoodieSavepointException}
+
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.types.{DataTypes, Metadata, StructField, StructType}
@@ -51,14 +51,14 @@ class RollbackToSavepointProcedure extends BaseProcedure with ProcedureBuilder w
     var instantTime = getArgValueOrDefault(args, PARAMETERS(1)).get.asInstanceOf[String]
 
     val basePath: String = getBasePath(tableName, tablePath)
-    val metaClient = HoodieTableMetaClient.builder.setConf(jsc.hadoopConfiguration()).setBasePath(basePath).build
-
+    val metaClient = createMetaClient(jsc, basePath)
+    val instantGenerator = metaClient.getTimelineLayout.getInstantGenerator
     val completedInstants = metaClient.getActiveTimeline.getSavePointTimeline.filterCompletedInstants
     if (completedInstants.empty) throw new HoodieException("There are no completed savepoint to run delete")
     if (StringUtils.isNullOrEmpty(instantTime)) {
-      instantTime = completedInstants.lastInstant.get.getTimestamp
+      instantTime = completedInstants.lastInstant.get.requestedTime
     }
-    val savePoint = new HoodieInstant(false, HoodieTimeline.SAVEPOINT_ACTION, instantTime)
+    val savePoint = instantGenerator.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.SAVEPOINT_ACTION, instantTime)
 
     if (!completedInstants.containsInstant(savePoint)) {
       throw new HoodieException("Commit " + instantTime + " not found in Commits " + completedInstants)
@@ -73,11 +73,11 @@ class RollbackToSavepointProcedure extends BaseProcedure with ProcedureBuilder w
       if (tableName.isDefined) {
         spark.catalog.refreshTable(tableName.get.asInstanceOf[String])
       }
-      logInfo("The commit $instantTime rolled back.")
+      logInfo(s"The commit $instantTime rolled back.")
       result = true
     } catch {
       case _: HoodieSavepointException =>
-        logWarning(s"The commit $instantTime failed to roll back.")
+        logWarning(s"Failed to roll back commit at instant time: $instantTime")
     } finally {
       client.close()
     }

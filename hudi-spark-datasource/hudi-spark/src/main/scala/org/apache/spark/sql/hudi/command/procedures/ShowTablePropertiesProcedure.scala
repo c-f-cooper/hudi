@@ -17,19 +17,20 @@
 
 package org.apache.spark.sql.hudi.command.procedures
 
-import org.apache.hudi.common.table.HoodieTableMetaClient
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.types.{DataTypes, Metadata, StructField, StructType}
 
 import java.util
 import java.util.function.Supplier
-import scala.collection.JavaConversions._
+
+import scala.collection.JavaConverters._
 
 class ShowTablePropertiesProcedure() extends BaseProcedure with ProcedureBuilder {
   private val PARAMETERS = Array[ProcedureParameter](
     ProcedureParameter.optional(0, "table", DataTypes.StringType),
     ProcedureParameter.optional(1, "path", DataTypes.StringType),
-    ProcedureParameter.optional(2, "limit", DataTypes.IntegerType, 10)
+    ProcedureParameter.optional(2, "limit", DataTypes.IntegerType, 10),
+    ProcedureParameter.optional(3, "filter", DataTypes.StringType, "")
   )
 
   private val OUTPUT_TYPE = new StructType(Array[StructField](
@@ -47,14 +48,17 @@ class ShowTablePropertiesProcedure() extends BaseProcedure with ProcedureBuilder
     val tableName = getArgValueOrDefault(args, PARAMETERS(0))
     val tablePath = getArgValueOrDefault(args, PARAMETERS(1))
     val limit = getArgValueOrDefault(args, PARAMETERS(2)).get.asInstanceOf[Int]
+    val filter = getArgValueOrDefault(args, PARAMETERS(3)).get.asInstanceOf[String]
 
+    validateFilter(filter, outputType)
     val basePath: String = getBasePath(tableName, tablePath)
-    val metaClient = HoodieTableMetaClient.builder.setConf(jsc.hadoopConfiguration()).setBasePath(basePath).build
+    val metaClient = createMetaClient(jsc, basePath)
     val tableProps = metaClient.getTableConfig.getProps
 
     val rows = new util.ArrayList[Row]
-    tableProps.foreach(p => rows.add(Row(p._1, p._2)))
-    rows.stream().limit(limit).toArray().map(r => r.asInstanceOf[Row]).toList
+    tableProps.asScala.foreach(p => rows.add(Row(p._1, p._2)))
+    val results = rows.stream().limit(limit).toArray().map(r => r.asInstanceOf[Row]).toList
+    applyFilter(results, filter, outputType)
   }
 
   override def build: Procedure = new ShowTablePropertiesProcedure()

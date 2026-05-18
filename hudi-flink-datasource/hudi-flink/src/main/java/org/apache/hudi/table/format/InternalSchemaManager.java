@@ -18,24 +18,28 @@
 
 package org.apache.hudi.table.format;
 
+import org.apache.hudi.common.config.HoodieCommonConfig;
 import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.TableSchemaResolver;
-import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.table.timeline.InstantFileNameGenerator;
+import org.apache.hudi.common.table.timeline.TimelineLayout;
+import org.apache.hudi.common.table.timeline.versioning.TimelineLayoutVersion;
 import org.apache.hudi.common.util.InternalSchemaCache;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
-import org.apache.hudi.configuration.HadoopConfigurations;
-import org.apache.hudi.configuration.OptionsResolver;
 import org.apache.hudi.internal.schema.InternalSchema;
 import org.apache.hudi.internal.schema.Type;
 import org.apache.hudi.internal.schema.Types;
 import org.apache.hudi.internal.schema.action.InternalSchemaMerger;
-import org.apache.hudi.internal.schema.convert.AvroInternalSchemaConverter;
+import org.apache.hudi.internal.schema.convert.InternalSchemaConverter;
 import org.apache.hudi.internal.schema.utils.InternalSchemaUtils;
-import org.apache.hudi.util.AvroSchemaConverter;
+import org.apache.hudi.storage.HoodieStorageUtils;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.util.HoodieSchemaConverter;
 
-import org.apache.flink.configuration.Configuration;
+import lombok.Getter;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.util.Preconditions;
 
@@ -57,40 +61,44 @@ public class InternalSchemaManager implements Serializable {
 
   private static final long serialVersionUID = 1L;
 
-  public static final InternalSchemaManager DISABLED = new InternalSchemaManager(null, InternalSchema.getEmptyInternalSchema(), null, null);
+  public static final InternalSchemaManager DISABLED = new InternalSchemaManager(null, InternalSchema.getEmptyInternalSchema(), null, null,
+      TimelineLayout.fromVersion(TimelineLayoutVersion.CURR_LAYOUT_VERSION), null);
 
-  private final Configuration conf;
+  @Getter
   private final InternalSchema querySchema;
   private final String validCommits;
   private final String tablePath;
-  private transient org.apache.hadoop.conf.Configuration hadoopConf;
+  private final TimelineLayout layout;
+  private final HoodieTableConfig tableConfig;
+  private final StorageConfiguration<?> storageConf;
 
-  public static InternalSchemaManager get(Configuration conf, HoodieTableMetaClient metaClient) {
-    if (!OptionsResolver.isSchemaEvolutionEnabled(conf)) {
+  public static InternalSchemaManager get(StorageConfiguration<?> conf, HoodieTableMetaClient metaClient) {
+    if (!isSchemaEvolutionEnabled(conf)) {
       return DISABLED;
     }
     Option<InternalSchema> internalSchema = new TableSchemaResolver(metaClient).getTableInternalSchemaFromCommitMetadata();
     if (!internalSchema.isPresent() || internalSchema.get().isEmptySchema()) {
       return DISABLED;
     }
+
+    InstantFileNameGenerator factory = metaClient.getInstantFileNameGenerator();
     String validCommits = metaClient
         .getCommitsAndCompactionTimeline()
         .filterCompletedInstants()
         .getInstantsAsStream()
-        .map(HoodieInstant::getFileName)
+        .map(factory::getFileName)
         .collect(Collectors.joining(","));
-    return new InternalSchemaManager(conf, internalSchema.get(), validCommits, metaClient.getBasePathV2().toString());
+    return new InternalSchemaManager(conf, internalSchema.get(), validCommits, metaClient.getBasePath().toString(), metaClient.getTimelineLayout(), metaClient.getTableConfig());
   }
 
-  public InternalSchemaManager(Configuration conf, InternalSchema querySchema, String validCommits, String tablePath) {
-    this.conf = conf;
+  public InternalSchemaManager(StorageConfiguration<?> storageConf, InternalSchema querySchema, String validCommits, String tablePath,
+                               TimelineLayout layout, HoodieTableConfig tableConfig) {
+    this.storageConf = storageConf;
     this.querySchema = querySchema;
     this.validCommits = validCommits;
     this.tablePath = tablePath;
-  }
-
-  public InternalSchema getQuerySchema() {
-    return querySchema;
+    this.layout = layout;
+    this.tableConfig = tableConfig;
   }
 
   /**
@@ -110,7 +118,9 @@ public class InternalSchemaManager implements Serializable {
     }
     long commitInstantTime = Long.parseLong(FSUtils.getCommitTime(fileName));
     InternalSchema fileSchema = InternalSchemaCache.getInternalSchemaByVersionId(
-        commitInstantTime, tablePath, getHadoopConf(), validCommits);
+        commitInstantTime, tablePath,
+        HoodieStorageUtils.getStorage(tablePath, storageConf),
+        validCommits, layout, tableConfig);
     if (querySchema.equals(fileSchema)) {
       return InternalSchema.getEmptyInternalSchema();
     }
@@ -147,8 +157,8 @@ public class InternalSchemaManager implements Serializable {
     }
     List<Integer> selectedFieldList = IntStream.of(selectedFields).boxed().collect(Collectors.toList());
     // mergeSchema is built with useColumnTypeFromFileSchema = true
-    List<DataType> mergeSchemaAsDataTypes = AvroSchemaConverter.convertToDataType(
-        AvroInternalSchemaConverter.convert(mergeSchema, "tableName")).getChildren();
+    List<DataType> mergeSchemaAsDataTypes = HoodieSchemaConverter.convertToDataType(
+        InternalSchemaConverter.convert(mergeSchema, "tableName")).getChildren();
     DataType[] fileFieldTypes = new DataType[queryFieldTypes.length];
     for (int i = 0; i < queryFieldTypes.length; i++) {
       // position of ChangedType in querySchema
@@ -214,10 +224,10 @@ public class InternalSchemaManager implements Serializable {
     return Collections.unmodifiableMap(posProxy);
   }
 
-  private org.apache.hadoop.conf.Configuration getHadoopConf() {
-    if (hadoopConf == null) {
-      hadoopConf = HadoopConfigurations.getHadoopConf(conf);
-    }
-    return hadoopConf;
+  /**
+   * Returns whether comprehensive schema evolution enabled.
+   */
+  private static boolean isSchemaEvolutionEnabled(StorageConfiguration<?> conf) {
+    return conf.getBoolean(HoodieCommonConfig.SCHEMA_EVOLUTION_ENABLE.key(), HoodieCommonConfig.SCHEMA_EVOLUTION_ENABLE.defaultValue());
   }
 }

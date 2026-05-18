@@ -283,9 +283,9 @@ Here is how to go about a bug fix release.
 
 - Create a branch in your repo (<user>/hudi).
 - Cherry-pick commits from master that needs to be part of this release. (git cherry-pick commit-hash). You need to manually resolve the conflicts. For eg, a file might have been moved to a diff class in master where as in your release branch, it could be in older place. You need to take a call where to place it. Similar things like file addition, file deletion, etc.
-- Update the release version by running "mvn versions:set -DnewVersion=${RELEASE}-rc${RC_NUM}", with "RELEASE" as the version and "RC_NUM" as the RC number.  Make sure the version changes are intended.  Then git commit the changes.
+- Update the release version by running `mvn versions:set -DnewVersion=${RELEASE_VERSION}-rc${RC_NUM}`, with "RELEASE" as the version and "RC_NUM" as the RC number.  Make sure the version changes are intended.  Then git commit the changes.
 - Ensure both compilation and tests are good.
-- I assume you will have apache/hudi as upstream. If not add it as upstream
+- If apache/hudi is not set as upstream, then add it as upstream: `git remote add upstream https://github.com/apache/hudi.git`
 - Once the branch is ready with all commits, go ahead and push your branch to upstream.
 - Go to apache/hudi repo locally and pull this branch. Here after you can work on this branch and push to origin when need be.
 - Do not forget to set the env variables from above section.
@@ -313,6 +313,8 @@ mvn -Prelease clean install -Dspark3
 - There are no release blocking JIRA issues.
 - Release branch has been created.
 - Release Notes  have been audited and added to RELEASE_NOTES.md.
+- Thrift is installed locally, if not then please follow the instructions [here](https://thrift.apache.org/docs/install/).
+- A docker daemon is running (or Docker Desktop is running). This is required to build `hudi-metaserver-server` module.
 
 # Build a release candidate
 
@@ -406,21 +408,66 @@ Set up a few environment variables to simplify Maven commands that follow. This 
    1. This will deploy jar artifacts to the Apache Nexus Repository, which is the staging area for deploying jars to Maven Central.
    2. Review all staged artifacts (https://repository.apache.org/). They should contain all relevant parts for each module, including pom.xml, jar, test jar, source, test source, javadoc, etc. Carefully review any new artifacts.
    3. git checkout ${RELEASE_BRANCH}
-   4. ./scripts/release/deploy_staging_jars.sh 2>&1 | tee -a "/tmp/${RELEASE_VERSION}-${RC_NUM}.deploy.log"
-      1. when prompted for the passphrase, if you have multiple gpg keys in your keyring, make sure that you enter the right passphase corresponding to the same key (FINGERPRINT) as used while generating source release in step f.ii.
-         > If the prompt is not for the same key (by default the maven-gpg-plugin will pick up the first key in your keyring so that could be different), then add the following option to your ~/.gnupg/gpg.conf file
-      2. make sure your IP is not changing while uploading, otherwise it creates a different staging repo
-      3. Use a VPN if you can't prevent your IP from switching
-      4. after uploading, inspect the log to make sure all maven tasks said "BUILD SUCCESS"
-   5. Review all staged artifacts by logging into Apache Nexus and clicking on "Staging Repositories" link on left pane. Then find a "open" entry for apachehudi
-   6. Ensure it contains all 3 (2.11, 2.12 with spark2 and 2.12 with spark3) artifacts, mainly hudi-spark-bundle-2.11/2.12, hudi-spark3-bundle-2.12, hudi-spark-2.11/2.12, hudi-spark2-2.11/2.12, hudi-spark3-2.12, hudi-utilities-bundle_2.11/2.12 and hudi-utilities_2.11/2.12.
+   4. Given that certain bundle jars are built by Java 17 (Spark 4 bundle), multiple
+      scripts need to be run. Run each from the repository root directory (the one containing `packaging/`).
+       1. For most modules with Java 11 build, run `export JAVA_HOME=$(/usr/libexec/java_home -v 11)` and
+          `./scripts/release/deploy_staging_jars.sh 2>&1 | tee -a "/tmp/${RELEASE_VERSION}-${RC_NUM}.deploy1.log"`
+           1. when prompted for the passphrase, if you have multiple gpg keys in your keyring, make sure that you enter
+              the right passphase corresponding to the same key (FINGERPRINT) as used while generating source release in
+              step 6.2.
+          > If the prompt is not for the same key (by default the maven-gpg-plugin will pick up the first key in your
+          keyring so that could be different), then add the following option to your ~/.gnupg/gpg.conf file
+           2. make sure your IP is not changing while uploading, otherwise it creates a different staging repo
+           3. Use a VPN if you can't prevent your IP from switching
+           4. after uploading, inspect the log to make sure all maven tasks said "BUILD SUCCESS"
+           5. In case you faced any issue while building `hudi-platform-service` or `hudi-metaserver-server` module,
+              please ensure that you have docker daemon running. This is required to build `hudi-metaserver-server`
+              module. See [checklist](#checklist-to-proceed-to-the-next-step).
+       2. Continue with Java 17 build for Spark 4 bundle, run `export JAVA_HOME=$(/usr/libexec/java_home -v 17)` and
+          `./scripts/release/deploy_staging_jars_java17.sh 2>&1 | tee -a "/tmp/${RELEASE_VERSION}-${RC_NUM}.deploy2.log"`
+   5. Note that the artifacts from Java 17 build are uploaded to a separate staging repo. Use the
+      `copy_staging_repo.sh` script to copy all artifacts from the Java 17 staging repo into the Java 11 staging repo
+      so that all artifacts stay in the same repo.
+      1. Identify both staging repo IDs from [Apache Nexus Staging Repositories](https://repository.apache.org/#stagingRepositories)
+         (e.g., `orgapachehudi-1177` for Java 17, `orgapachehudi-1176` for Java 11). Make sure both repos are still in
+         the "open" state (not closed).
+      2. First do a dry-run to verify the list of artifacts to be copied:
+         ```shell
+         ./scripts/release/copy_staging_repo.sh --dry-run <java17-repo-id> <java11-repo-id>
+         ```
+      3. Then run the actual copy:
+         ```shell
+         ./scripts/release/copy_staging_repo.sh <java17-repo-id> <java11-repo-id> 2>&1 | tee -a "/tmp/${RELEASE_VERSION}-${RC_NUM}.copy_staging.log"
+         ```
+      4. The script reads Nexus credentials from `~/.m2/settings.xml` (server id `apache.releases.https`), downloads
+         every artifact from the source repo, and re-uploads them to the target repo. After it finishes, drop the
+         Java 17 staging repo on Apache Nexus.
+   6. Review all staged artifacts by logging into Apache Nexus and clicking on "Staging Repositories" link on left pane.
+      Then find a "open" entry for apachehudi
+   7. Ensure it contains all 2 (2.12 and 2.13) artifacts, mainly hudi-spark-bundle-2.12/2.13,
+      hudi-spark3-bundle-2.12/2.13, hudi-spark-2.12/2.13, hudi-spark3-2.12/2.13, hudi-utilities-bundle_2.12/2.13 and
+      hudi-utilities_2.12/2.13.
       > With 0.10.1, we had 4 bundles. spark2 with scala11, spark2 with scala12, spark3.0.x bundles and spark3.1.x bundles. Ensure each spark bundle reflects the version correctly. hudi-spark3.1.2-bundle_2.12-0.10.1.jar and hudi-spark3.0.3-bundle_2.12-0.10.1.jar are the respective bundle names for spark3 bundles.
-   7. Once you have ensured everything is good and validation of step 7 succeeds, you can close the staging repo. Until you close, you can re-run deploying to staging multiple times. But once closed, it will create a new staging repo. So ensure you close this, so that the next RC (if need be) is on a new repo. So, once everything is good, close the staging repository on Apache Nexus. When prompted for a description, enter
+   8. Before closing the staging repo, run the validate script against the private staging URL to programmatically
+      confirm all expected bundle artifacts are present. The `--auth` flag reads Nexus credentials from
+      `~/.m2/settings.xml` (server id `apache.releases.https`), which is required because the public URL is not
+      populated until the repo is closed.
+      ```shell
+      ./scripts/release/validate_staged_bundles.sh --auth orgapachehudi-<stage_repo_number> ${RELEASE_VERSION}-rc${RC_NUM} 2>&1 | tee -a /tmp/validate_staged_bundles_output.txt
+      ```
+      If the script reports any missing artifacts, re-run the relevant `deploy_staging_jars*.sh` step rather than
+      closing the repo, since once closed it cannot be re-deployed to.
+   9. Once you have ensured everything is good and validation of step 8 succeeds, you can close the staging repo. Until
+      you close, you can re-run deploying to staging multiple times. But once closed, it will create a new staging repo.
+      So ensure you close this, so that the next RC (if need be) is on a new repo. So, once everything is good, close
+      the staging repository on Apache Nexus. When prompted for a description, enter
       > Apache Hudi, version `${RELEASE_VERSION}`, release candidate `${RC_NUM}`.
-   8. After closing, run the script to validate the staged bundles again:
+   10. After closing, run the script to validate the staged bundles again against the public URL:
       ```shell
       ./scripts/release/validate_staged_bundles.sh orgapachehudi-<stage_repo_number> ${RELEASE_VERSION}-rc${RC_NUM} 2>&1 | tee -a /tmp/validate_staged_bundles_output.txt
       ```
+   11. Run the release candidate bundle validation in GitHub Action by following the instruction in
+      ["Running Bundle Validation on a Release Candidate"](../packaging/bundle-validation/README.md#running-bundle-validation-on-a-release-candidate).
 
 ## Checklist to proceed to the next step
 
@@ -550,7 +597,7 @@ Once the release candidate has been reviewed and approved by the community, the 
 1. Drop all RC orgapachehudi-XXX in [Apache Nexus Staging Repositories](https://repository.apache.org/#stagingRepositories).
 2. change the version from ${RELEASE_VERSION}-rc${RC_NUM} to ${RELEASE_VERSION} against release branch, use command `mvn versions:set -DnewVersion=${RELEASE_VERSION}`, e.g. change 0.5.1-rc1 to 0.5.1.
 3. Commit and push the version change to release branch.
-   1. git commit -am "[MINOR] Update release version to reflect published version  ${RELEASE_VERSION}"
+    1. git commit -am "chore: Update release version to reflect published version  ${RELEASE_VERSION}"
    2. git push origin release-${RELEASE_VERSION}
 4. Repeat the steps from **_Generate Source Release (f) to Stage source releases on [dist.apache.org](http://dist.apache.org/) (i)_**. Including staging jars with the release version and uploading source release.
    > **Note that make sure remove the -rc${RC_NUM} suffix when repeat the above steps. and please also verify the steps.  Ensure git tag is also done without -rc${RC_NUM}**
@@ -579,7 +626,15 @@ Once the release candidate has been reviewed and approved by the community, the 
    > Note: we should close jira and choose 'resolution = Fixed' rather than resolve jira.
 9. Finalize the Release in Jira by providing the release date. 
 10. Update [DOAP](https://github.com/apache/hudi/blob/master/doap_HUDI.rdf) file in the root of the project via sending a PR like [this one](https://github.com/apache/incubator-hudi/pull/1448). 
-11. Create a new Github release, off the release version tag, you pushed before
+11. Create a new GitHub release, off the release version tag, you pushed before.
+
+After the release candidate artifacts are finalized and released from the staging repository, the artifacts usually take
+24 hours to be available in [Maven Central](https://repo1.maven.org/maven2/org/apache/hudi). Once the artifacts are
+available in Maven Central, please run the bundle validation GitHub Action to ensure the artifacts are valid. Steps to
+run the bundle validation GitHub Action are available in
+the [bundle validation documentation](../packaging/bundle-validation/README.md#running-bundle-validation-on-release-artifacts-in-maven-central).
+
+In the meantime, you can proceed with documentation changes and website updates.
 
 ## Steps to cut doc version and update website.
 

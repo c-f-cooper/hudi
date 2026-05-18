@@ -36,8 +36,7 @@ import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.table.WorkloadProfile;
 import org.apache.hudi.table.WorkloadStat;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -51,9 +50,8 @@ import java.util.stream.Collectors;
 /**
  * Packs incoming records to be upserted, into buckets.
  */
+@Slf4j
 public class JavaUpsertPartitioner<T> implements Partitioner  {
-
-  private static final Logger LOG = LoggerFactory.getLogger(JavaUpsertPartitioner.class);
 
   /**
    * List of all small files to be corrected.
@@ -66,19 +64,19 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
   /**
    * Stat for the input and output workload. Describe the workload before and after being assigned buckets.
    */
-  private WorkloadProfile workloadProfile;
+  private final WorkloadProfile workloadProfile;
   /**
    * Helps decide which bucket an incoming update should go to.
    */
-  private HashMap<String, Integer> updateLocationToBucket;
+  private final HashMap<String, Integer> updateLocationToBucket;
   /**
    * Helps us pack inserts into 1 or more buckets depending on number of incoming records.
    */
-  private HashMap<String, List<InsertBucketCumulativeWeightPair>> partitionPathToInsertBucketInfos;
+  private final HashMap<String, List<InsertBucketCumulativeWeightPair>> partitionPathToInsertBucketInfos;
   /**
    * Remembers what type each bucket is for later.
    */
-  private HashMap<Integer, BucketInfo> bucketInfoMap;
+  private final HashMap<Integer, BucketInfo> bucketInfoMap;
 
   protected final HoodieTable table;
 
@@ -95,7 +93,7 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
     assignUpdates(workloadProfile);
     assignInserts(workloadProfile, context);
 
-    LOG.info("Total Buckets :" + totalBuckets + ", buckets info => " + bucketInfoMap + ", \n"
+    log.info("Total Buckets :" + totalBuckets + ", buckets info => " + bucketInfoMap + ", \n"
         + "Partition to insert buckets => " + partitionPathToInsertBucketInfos + ", \n"
         + "UpdateLocations mapped to buckets =>" + updateLocationToBucket);
   }
@@ -132,9 +130,9 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
     // for new inserts, compute buckets depending on how many records we have for each partition
     Set<String> partitionPaths = profile.getPartitionPaths();
     long averageRecordSize =
-        averageBytesPerRecord(table.getMetaClient().getActiveTimeline().getCommitTimeline().filterCompletedInstants(),
+        averageBytesPerRecord(table.getMetaClient().getActiveTimeline().getCommitAndReplaceTimeline().filterCompletedInstants(),
             config);
-    LOG.info("AvgRecordSize => " + averageRecordSize);
+    log.info("AvgRecordSize => " + averageRecordSize);
 
     Map<String, List<SmallFile>> partitionSmallFilesMap =
         getSmallFilesForPartitions(new ArrayList<String>(partitionPaths), context);
@@ -147,7 +145,7 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
         List<SmallFile> smallFiles = partitionSmallFilesMap.getOrDefault(partitionPath, new ArrayList<>());
         this.smallFiles.addAll(smallFiles);
 
-        LOG.info("For partitionPath : " + partitionPath + " Small Files => " + smallFiles);
+        log.info("For partitionPath : " + partitionPath + " Small Files => " + smallFiles);
 
         long totalUnassignedInserts = pStat.getNumInserts();
         List<Integer> bucketNumbers = new ArrayList<>();
@@ -162,10 +160,10 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
             int bucket;
             if (updateLocationToBucket.containsKey(smallFile.location.getFileId())) {
               bucket = updateLocationToBucket.get(smallFile.location.getFileId());
-              LOG.info("Assigning " + recordsToAppend + " inserts to existing update bucket " + bucket);
+              log.info("Assigning " + recordsToAppend + " inserts to existing update bucket " + bucket);
             } else {
               bucket = addUpdateBucket(partitionPath, smallFile.location.getFileId());
-              LOG.info("Assigning " + recordsToAppend + " inserts to new update bucket " + bucket);
+              log.info("Assigning " + recordsToAppend + " inserts to new update bucket " + bucket);
             }
             if (profile.hasOutputWorkLoadStats()) {
               outputWorkloadStats.addInserts(smallFile.location, recordsToAppend);
@@ -184,7 +182,7 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
           }
 
           int insertBuckets = (int) Math.ceil((1.0 * totalUnassignedInserts) / insertRecordsPerBucket);
-          LOG.info("After small file assignment: unassignedInserts => " + totalUnassignedInserts
+          log.info("After small file assignment: unassignedInserts => " + totalUnassignedInserts
               + ", totalInsertBuckets => " + insertBuckets + ", recordsPerBucket => " + insertRecordsPerBucket);
           for (int b = 0; b < insertBuckets; b++) {
             bucketNumbers.add(totalBuckets);
@@ -212,7 +210,7 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
           currentCumulativeWeight += bkt.weight;
           insertBuckets.add(new InsertBucketCumulativeWeightPair(bkt, currentCumulativeWeight));
         }
-        LOG.info("Total insert buckets for partition path " + partitionPath + " => " + insertBuckets);
+        log.info("Total insert buckets for partition path " + partitionPath + " => " + insertBuckets);
         partitionPathToInsertBucketInfos.put(partitionPath, insertBuckets);
       }
       if (profile.hasOutputWorkLoadStats()) {
@@ -249,7 +247,7 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
     if (!commitTimeline.empty()) { // if we have some commits
       HoodieInstant latestCommitTime = commitTimeline.lastInstant().get();
       List<HoodieBaseFile> allFiles = table.getBaseFileOnlyView()
-          .getLatestBaseFilesBeforeOrOn(partitionPath, latestCommitTime.getTimestamp()).collect(Collectors.toList());
+          .getLatestBaseFilesBeforeOrOn(partitionPath, latestCommitTime.requestedTime()).collect(Collectors.toList());
 
       for (HoodieBaseFile file : allFiles) {
         if (file.getFileSize() < config.getParquetSmallFileLimit()) {
@@ -320,8 +318,7 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
         Iterator<HoodieInstant> instants = commitTimeline.getReverseOrderedInstants().iterator();
         while (instants.hasNext()) {
           HoodieInstant instant = instants.next();
-          HoodieCommitMetadata commitMetadata = HoodieCommitMetadata
-              .fromBytes(commitTimeline.getInstantDetails(instant).get(), HoodieCommitMetadata.class);
+          HoodieCommitMetadata commitMetadata = commitTimeline.readCommitMetadata(instant);
           long totalBytesWritten = commitMetadata.fetchTotalBytesWritten();
           long totalRecordsWritten = commitMetadata.fetchTotalRecordsWritten();
           if (totalBytesWritten > fileSizeThreshold && totalRecordsWritten > 0) {
@@ -332,7 +329,7 @@ public class JavaUpsertPartitioner<T> implements Partitioner  {
       }
     } catch (Throwable t) {
       // make this fail safe.
-      LOG.error("Error trying to compute average bytes/record ", t);
+      log.error("Error trying to compute average bytes/record ", t);
     }
     return avgSize;
   }

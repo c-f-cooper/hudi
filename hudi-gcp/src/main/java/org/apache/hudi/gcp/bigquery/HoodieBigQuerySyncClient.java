@@ -19,6 +19,8 @@
 
 package org.apache.hudi.gcp.bigquery;
 
+import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.VisibleForTesting;
 import org.apache.hudi.sync.common.HoodieSyncClient;
@@ -40,12 +42,12 @@ import com.google.cloud.bigquery.JobInfo;
 import com.google.cloud.bigquery.QueryJobConfiguration;
 import com.google.cloud.bigquery.Schema;
 import com.google.cloud.bigquery.StandardSQLTypeName;
+import com.google.cloud.bigquery.StandardTableDefinition;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.TableInfo;
 import com.google.cloud.bigquery.ViewDefinition;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -54,53 +56,46 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.apache.hudi.gcp.bigquery.BigQuerySyncConfig.BIGQUERY_SYNC_BIG_LAKE_CONNECTION_ID;
+import static org.apache.hudi.gcp.bigquery.BigQuerySyncConfig.BIGQUERY_SYNC_BILLING_PROJECT_ID;
 import static org.apache.hudi.gcp.bigquery.BigQuerySyncConfig.BIGQUERY_SYNC_DATASET_LOCATION;
 import static org.apache.hudi.gcp.bigquery.BigQuerySyncConfig.BIGQUERY_SYNC_DATASET_NAME;
 import static org.apache.hudi.gcp.bigquery.BigQuerySyncConfig.BIGQUERY_SYNC_PROJECT_ID;
 import static org.apache.hudi.gcp.bigquery.BigQuerySyncConfig.BIGQUERY_SYNC_REQUIRE_PARTITION_FILTER;
 
+@Slf4j
 public class HoodieBigQuerySyncClient extends HoodieSyncClient {
-
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieBigQuerySyncClient.class);
 
   protected final BigQuerySyncConfig config;
   private final String projectId;
+  private final String billingProjectId;
   private final String bigLakeConnectionId;
   private final String datasetName;
   private final boolean requirePartitionFilter;
   private transient BigQuery bigquery;
 
-  public HoodieBigQuerySyncClient(final BigQuerySyncConfig config) {
-    super(config);
-    this.config = config;
-    this.projectId = config.getString(BIGQUERY_SYNC_PROJECT_ID);
-    this.bigLakeConnectionId = config.getString(BIGQUERY_SYNC_BIG_LAKE_CONNECTION_ID);
-    this.datasetName = config.getString(BIGQUERY_SYNC_DATASET_NAME);
-    this.requirePartitionFilter = config.getBoolean(BIGQUERY_SYNC_REQUIRE_PARTITION_FILTER);
-    this.createBigQueryConnection();
+  public HoodieBigQuerySyncClient(final BigQuerySyncConfig config, HoodieTableMetaClient metaClient) {
+    this(config, createBigQueryConnection(config), metaClient);
   }
 
   @VisibleForTesting
-  HoodieBigQuerySyncClient(final BigQuerySyncConfig config, final BigQuery bigquery) {
-    super(config);
+  HoodieBigQuerySyncClient(final BigQuerySyncConfig config, final BigQuery bigquery, HoodieTableMetaClient metaClient) {
+    super(config, metaClient);
     this.config = config;
     this.projectId = config.getString(BIGQUERY_SYNC_PROJECT_ID);
+    this.billingProjectId = config.getStringOrDefault(BIGQUERY_SYNC_BILLING_PROJECT_ID, this.projectId);
     this.datasetName = config.getString(BIGQUERY_SYNC_DATASET_NAME);
     this.requirePartitionFilter = config.getBoolean(BIGQUERY_SYNC_REQUIRE_PARTITION_FILTER);
     this.bigquery = bigquery;
     this.bigLakeConnectionId = config.getString(BIGQUERY_SYNC_BIG_LAKE_CONNECTION_ID);
   }
 
-  private void createBigQueryConnection() {
-    if (bigquery == null) {
-      try {
-        // Initialize client that will be used to send requests. This client only needs to be created
-        // once, and can be reused for multiple requests.
-        bigquery = BigQueryOptions.newBuilder().setLocation(config.getString(BIGQUERY_SYNC_DATASET_LOCATION)).build().getService();
-        LOG.info("Successfully established BigQuery connection.");
-      } catch (BigQueryException e) {
-        throw new HoodieBigQuerySyncException("Cannot create bigQuery connection ", e);
-      }
+  private static BigQuery createBigQueryConnection(BigQuerySyncConfig config) {
+    try {
+      // Initialize client that will be used to send requests. This client only needs to be created
+      // once, and can be reused for multiple requests.
+      return BigQueryOptions.newBuilder().setLocation(config.getString(BIGQUERY_SYNC_DATASET_LOCATION)).build().getService();
+    } catch (BigQueryException e) {
+      throw new HoodieBigQuerySyncException("Cannot create bigQuery connection ", e);
     }
   }
 
@@ -130,17 +125,17 @@ public class HoodieBigQuerySyncClient extends HoodieSyncClient {
       QueryJobConfiguration queryConfig = QueryJobConfiguration.newBuilder(query)
           .setUseLegacySql(false)
           .build();
-      JobId jobId = JobId.newBuilder().setProject(projectId).setRandomJob().build();
+      JobId jobId = JobId.newBuilder().setProject(billingProjectId).setRandomJob().build();
       Job queryJob = bigquery.create(JobInfo.newBuilder(queryConfig).setJobId(jobId).build());
 
       queryJob = queryJob.waitFor();
 
       if (queryJob == null) {
-        LOG.error("Job for table creation no longer exists");
+        log.error("Job for table creation no longer exists");
       } else if (queryJob.getStatus().getError() != null) {
-        LOG.error("Job for table creation failed: {}", queryJob.getStatus().getError().toString());
+        log.error("Job for table creation failed: {}", queryJob.getStatus().getError().toString());
       } else {
-        LOG.info("External table created using manifest file.");
+        log.info("External table created using manifest file.");
       }
     } catch (InterruptedException | BigQueryException e) {
       throw new HoodieBigQuerySyncException("Failed to create external table using manifest file. ", e);
@@ -166,7 +161,7 @@ public class HoodieBigQuerySyncClient extends HoodieSyncClient {
               .setMaxBadRecords(0)
               .build();
       bigquery.create(TableInfo.of(tableId, customTable));
-      LOG.info("Manifest External table created.");
+      log.info("Manifest External table created.");
     } catch (BigQueryException e) {
       throw new HoodieBigQuerySyncException("Manifest External table was not created ", e);
     }
@@ -195,19 +190,25 @@ public class HoodieBigQuerySyncClient extends HoodieSyncClient {
     boolean samePartitionFilter = partitionFields.isEmpty()
         || (requirePartitionFilter == (definition.getHivePartitioningOptions().getRequirePartitionFilter() != null && definition.getHivePartitioningOptions().getRequirePartitionFilter()));
     if (sameSchema && samePartitionFilter) {
-      LOG.info("No table update is needed.");
+      log.info("No table update is needed.");
       return; // No need to update schema.
     }
-    ExternalTableDefinition.Builder builder = definition.toBuilder();
-    builder.setSchema(finalSchema);
-    builder.setAutodetect(false);
-    if (definition.getHivePartitioningOptions() != null) {
-      builder.setHivePartitioningOptions(definition.getHivePartitioningOptions().toBuilder().setRequirePartitionFilter(requirePartitionFilter).build());
+    if (!StringUtils.isNullOrEmpty(bigLakeConnectionId)) {
+      Table updatedTable =
+              existingTable.toBuilder().setDefinition(StandardTableDefinition.of(finalSchema)).build();
+      updatedTable.update();
+    } else {
+      ExternalTableDefinition.Builder builder = definition.toBuilder();
+      builder.setSchema(finalSchema);
+      builder.setAutodetect(false);
+      if (definition.getHivePartitioningOptions() != null) {
+        builder.setHivePartitioningOptions(definition.getHivePartitioningOptions().toBuilder().setRequirePartitionFilter(requirePartitionFilter).build());
+      }
+      Table updatedTable = existingTable.toBuilder()
+              .setDefinition(builder.build())
+              .build();
+      bigquery.update(updatedTable);
     }
-    Table updatedTable = existingTable.toBuilder()
-        .setDefinition(builder.build())
-        .build();
-    bigquery.update(updatedTable);
   }
 
   public void createVersionsTable(String tableName, String sourceUri, String sourceUriPrefix, List<String> partitionFields) {
@@ -240,7 +241,7 @@ public class HoodieBigQuerySyncClient extends HoodieSyncClient {
       }
 
       bigquery.create(TableInfo.of(tableId, customTable));
-      LOG.info("External table created using hivepartitioningoptions");
+      log.info("External table created using hivepartitioningoptions");
     } catch (BigQueryException e) {
       throw new HoodieBigQuerySyncException("External table was not created ", e);
     }
@@ -264,7 +265,7 @@ public class HoodieBigQuerySyncClient extends HoodieSyncClient {
           ViewDefinition.newBuilder(query).setUseLegacySql(false).build();
 
       bigquery.create(TableInfo.of(tableId, viewDefinition));
-      LOG.info("View created successfully");
+      log.info("View created successfully");
     } catch (BigQueryException e) {
       throw new HoodieBigQuerySyncException("View was not created ", e);
     }
@@ -290,8 +291,9 @@ public class HoodieBigQuerySyncClient extends HoodieSyncClient {
 
   /**
    * Checks for the existence of a table that uses the manifest file approach and matches other requirements.
+   *
    * @param tableName name of the table
-   * @return Returns true if the table does not exist or if the table does exist but does not use the manifest file. False otherwise.
+   * @return Returns true if the table does not exist or if the table does exist but does not use the manifest file or table base path is outdated. False otherwise.
    */
   public boolean tableNotExistsOrDoesNotMatchSpecification(String tableName) {
     TableId tableId = TableId.of(projectId, datasetName, tableName);
@@ -303,11 +305,37 @@ public class HoodieBigQuerySyncClient extends HoodieSyncClient {
     boolean manifestDoesNotExist =
         externalTableDefinition.getSourceUris() == null
             || externalTableDefinition.getSourceUris().stream().noneMatch(uri -> uri.contains(ManifestFileWriter.ABSOLUTE_PATH_MANIFEST_FOLDER_NAME));
+    if (isBasePathUpdated(externalTableDefinition)) {
+      // if table base path is outdated, we need to replace the table.
+      return true;
+    }
     if (!StringUtils.isNullOrEmpty(config.getString(BIGQUERY_SYNC_BIG_LAKE_CONNECTION_ID))) {
       // If bigLakeConnectionId is present and connectionId is not present in table definition, we need to replace the table.
       return manifestDoesNotExist || externalTableDefinition.getConnectionId() == null;
     }
     return manifestDoesNotExist;
+  }
+
+  private boolean isBasePathUpdated(ExternalTableDefinition externalTableDefinition) {
+    String basePath = StringUtils.stripEnd(getBasePath(), "/");
+    if (externalTableDefinition.getHivePartitioningOptions() == null) {
+      List<String> sourceUris = Option.ofNullable(externalTableDefinition.getSourceUris()).orElse(Collections.emptyList());
+      // compare source uris with trailing slash to make sure the unwanted prefix matches are avoided
+      String basePathWithTrailingSlash = String.format("%s/", basePath);
+      boolean isTableBasePathUpdated = sourceUris.stream()
+          .noneMatch(sourceUri -> sourceUri.startsWith(basePathWithTrailingSlash));
+      if (isTableBasePathUpdated) {
+        log.warn("Table base path from source uri updated from: {}, to new base path: {}", sourceUris, basePathWithTrailingSlash);
+      }
+      return isTableBasePathUpdated;
+    }
+    String basePathInTableDefinition = externalTableDefinition.getHivePartitioningOptions().getSourceUriPrefix();
+    basePathInTableDefinition = StringUtils.stripEnd(basePathInTableDefinition, "/");
+    boolean isTableBasePathUpdated = !basePathInTableDefinition.equals(basePath);
+    if (isTableBasePathUpdated) {
+      log.warn("Table base path from table definition updated from: {}, to new base path: {}", basePathInTableDefinition, basePath);
+    }
+    return isTableBasePathUpdated;
   }
 
   @Override

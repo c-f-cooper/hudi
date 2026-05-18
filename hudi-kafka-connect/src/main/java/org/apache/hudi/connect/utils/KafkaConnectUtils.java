@@ -32,19 +32,19 @@ import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.connect.ControlMessage;
 import org.apache.hudi.connect.writers.KafkaConnectConfigs;
 import org.apache.hudi.exception.HoodieException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.keygen.BaseKeyGenerator;
-import org.apache.hudi.keygen.CustomAvroKeyGenerator;
 import org.apache.hudi.keygen.KeyGenerator;
 import org.apache.hudi.keygen.constant.KeyGeneratorOptions;
+import org.apache.hudi.storage.StorageConfiguration;
 
 import com.google.protobuf.ByteString;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.DescribeTopicsResult;
 import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.common.KafkaFuture;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.FileVisitOption;
@@ -54,7 +54,7 @@ import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -66,9 +66,8 @@ import static org.apache.hudi.common.util.StringUtils.getUTF8Bytes;
 /**
  * Helper methods for Kafka.
  */
+@Slf4j
 public class KafkaConnectUtils {
-
-  private static final Logger LOG = LoggerFactory.getLogger(KafkaConnectUtils.class);
   private static final String HOODIE_CONF_PREFIX = "hoodie.";
   public static final String HADOOP_CONF_DIR = "HADOOP_CONF_DIR";
   public static final String HADOOP_HOME = "HADOOP_HOME";
@@ -81,10 +80,10 @@ public class KafkaConnectUtils {
       String hadoopHomePath = System.getenv(HADOOP_HOME);
       DEFAULT_HADOOP_CONF_FILES.addAll(getHadoopConfigFiles(hadoopConfigPath, hadoopHomePath));
       if (!DEFAULT_HADOOP_CONF_FILES.isEmpty()) {
-        LOG.info(String.format("Found Hadoop default config files %s", DEFAULT_HADOOP_CONF_FILES));
+        log.info("Found Hadoop default config files {}", DEFAULT_HADOOP_CONF_FILES);
       }
     } catch (IOException e) {
-      LOG.error("An error occurred while getting the default Hadoop configuration. "
+      log.error("An error occurred while getting the default Hadoop configuration. "
               + "Please use hadoop.conf.dir or hadoop.home to configure Hadoop environment variables", e);
     }
   }
@@ -122,11 +121,11 @@ public class KafkaConnectUtils {
     props.put("bootstrap.servers", bootstrapServers);
     try {
       AdminClient client = AdminClient.create(props);
-      DescribeTopicsResult result = client.describeTopics(Arrays.asList(topicName));
+      DescribeTopicsResult result = client.describeTopics(Collections.singletonList(topicName));
       Map<String, KafkaFuture<TopicDescription>> values = result.values();
       KafkaFuture<TopicDescription> topicDescription = values.get(topicName);
       int numPartitions = topicDescription.get().partitions().size();
-      LOG.info(String.format("Latest number of partitions for topic %s is %s", topicName, numPartitions));
+      log.info("Latest number of partitions for topic {} is {}", topicName, numPartitions);
       return numPartitions;
     } catch (Exception exception) {
       throw new HoodieException("Fatal error fetching the latest partition of kafka topic name" + topicName, exception);
@@ -134,11 +133,9 @@ public class KafkaConnectUtils {
   }
 
   /**
-   * Returns the default Hadoop Configuration.
-   *
-   * @return
+   * @return the default storage configuration.
    */
-  public static Configuration getDefaultHadoopConf(KafkaConnectConfigs connectConfigs) {
+  public static StorageConfiguration<Configuration> getDefaultStorageConf(KafkaConnectConfigs connectConfigs) {
     Configuration hadoopConf = new Configuration();
 
     // add hadoop config files
@@ -164,7 +161,7 @@ public class KafkaConnectUtils {
     }).forEach(prop -> {
       hadoopConf.set(prop.toString(), connectConfigs.getProps().get(prop.toString()).toString());
     });
-    return hadoopConf;
+    return HadoopFSUtils.getStorageConf(hadoopConf);
   }
 
   /**
@@ -185,14 +182,7 @@ public class KafkaConnectUtils {
    * @param typedProperties properties from the config.
    * @return partition columns Returns the partition columns separated by comma.
    */
-  public static String getPartitionColumns(KeyGenerator keyGenerator, TypedProperties typedProperties) {
-    if (keyGenerator instanceof CustomAvroKeyGenerator) {
-      return ((BaseKeyGenerator) keyGenerator).getPartitionPathFields().stream().map(
-          pathField -> Arrays.stream(pathField.split(CustomAvroKeyGenerator.SPLIT_REGEX))
-              .findFirst().orElseGet(() -> "Illegal partition path field format: '$pathField' for ${c.getClass.getSimpleName}"))
-          .collect(Collectors.joining(","));
-    }
-
+  public static String getPartitionColumnsForKeyGenerator(KeyGenerator keyGenerator, TypedProperties typedProperties) {
     if (keyGenerator instanceof BaseKeyGenerator) {
       return String.join(",", ((BaseKeyGenerator) keyGenerator).getPartitionPathFields());
     }
@@ -215,8 +205,7 @@ public class KafkaConnectUtils {
     Option<HoodieInstant> latestInstant = timeline.lastInstant();
     if (latestInstant.isPresent()) {
       try {
-        byte[] data = timeline.getInstantDetails(latestInstant.get()).get();
-        return Option.of(HoodieCommitMetadata.fromBytes(data, HoodieCommitMetadata.class));
+        return Option.of(timeline.readCommitMetadata(latestInstant.get()));
       } catch (Exception e) {
         throw new HoodieException("Failed to read schema from commit metadata", e);
       }
@@ -230,7 +219,7 @@ public class KafkaConnectUtils {
     try {
       md = MessageDigest.getInstance("MD5");
     } catch (NoSuchAlgorithmException e) {
-      LOG.error("Fatal error selecting hash algorithm", e);
+      log.error("Fatal error selecting hash algorithm", e);
       throw new HoodieException(e);
     }
     byte[] digest = Objects.requireNonNull(md).digest(getUTF8Bytes(stringToHash));

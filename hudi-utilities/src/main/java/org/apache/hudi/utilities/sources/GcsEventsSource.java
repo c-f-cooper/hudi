@@ -19,6 +19,8 @@
 package org.apache.hudi.utilities.sources;
 
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
+import org.apache.hudi.common.table.checkpoint.StreamerCheckpointV2;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.exception.HoodieException;
@@ -31,14 +33,13 @@ import org.apache.hudi.utilities.sources.helpers.gcs.MetadataMessage;
 import org.apache.hudi.utilities.sources.helpers.gcs.PubsubMessagesFetcher;
 
 import com.google.pubsub.v1.ReceivedMessage;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.types.StructType;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -51,6 +52,7 @@ import static org.apache.hudi.utilities.config.CloudSourceConfig.ACK_MESSAGES;
 import static org.apache.hudi.utilities.config.CloudSourceConfig.BATCH_SIZE_CONF;
 import static org.apache.hudi.utilities.config.CloudSourceConfig.MAX_FETCH_TIME_PER_SYNC_SECS;
 import static org.apache.hudi.utilities.config.CloudSourceConfig.MAX_NUM_MESSAGES_PER_SYNC;
+import static org.apache.hudi.utilities.config.CloudSourceConfig.META_EVENTS_PER_PARTITION;
 import static org.apache.hudi.utilities.config.GCSEventsSourceConfig.GOOGLE_PROJECT_ID;
 import static org.apache.hudi.utilities.config.GCSEventsSourceConfig.PUBSUB_SUBSCRIPTION_ID;
 import static org.apache.hudi.utilities.sources.helpers.gcs.MessageValidity.ProcessingDecision.DO_SKIP;
@@ -100,17 +102,17 @@ absolute_path_to/hudi-utilities-bundle_2.12-0.13.0-SNAPSHOT.jar \
 --hoodie-conf hoodie.datasource.hive_sync.table=gcs_meta \
 --hoodie-conf hoodie.datasource.hive_sync.partition_fields=bucket \
 */
+@Slf4j
 public class GcsEventsSource extends RowSource {
 
   private final PubsubMessagesFetcher pubsubMessagesFetcher;
   private final SchemaProvider schemaProvider;
   private final boolean ackMessages;
+  private final int recordsPerPartition;
 
   private final List<String> messagesToAck = new ArrayList<>();
 
-  private static final String CHECKPOINT_VALUE_ZERO = "0";
-
-  private static final Logger LOG = LoggerFactory.getLogger(GcsEventsSource.class);
+  private static final Checkpoint CHECKPOINT_VALUE_ZERO = new StreamerCheckpointV2("0");
 
   public GcsEventsSource(TypedProperties props, JavaSparkContext jsc, SparkSession spark,
                          SchemaProvider schemaProvider) {
@@ -132,13 +134,14 @@ public class GcsEventsSource extends RowSource {
     this.pubsubMessagesFetcher = pubsubMessagesFetcher;
     this.ackMessages = getBooleanWithAltKeys(props, ACK_MESSAGES);
     this.schemaProvider = schemaProvider;
+    this.recordsPerPartition = getIntWithAltKeys(props, META_EVENTS_PER_PARTITION);
 
-    LOG.info("Created GcsEventsSource");
+    log.info("Created GcsEventsSource");
   }
 
   @Override
-  protected Pair<Option<Dataset<Row>>, String> fetchNextBatch(Option<String> lastCkptStr, long sourceLimit) {
-    LOG.info("fetchNextBatch(): Input checkpoint: " + lastCkptStr);
+  protected Pair<Option<Dataset<Row>>, Checkpoint> fetchNextBatch(Option<Checkpoint> lastCheckpoint, long sourceLimit) {
+    log.info("fetchNextBatch(): Input checkpoint: {}", lastCheckpoint);
     MessageBatch messageBatch;
     try {
       messageBatch = fetchFileMetadata();
@@ -149,13 +152,15 @@ public class GcsEventsSource extends RowSource {
     }
 
     if (messageBatch.isEmpty()) {
-      LOG.info("No new data. Returning empty batch with checkpoint value: " + CHECKPOINT_VALUE_ZERO);
+      log.info("No new data. Returning empty batch with checkpoint value: {}", CHECKPOINT_VALUE_ZERO);
       return Pair.of(Option.empty(), CHECKPOINT_VALUE_ZERO);
     }
 
-    Dataset<String> eventRecords = sparkSession.createDataset(messageBatch.getMessages(), Encoders.STRING());
+    int numPartitions = (int) Math.ceil(
+        (double) messageBatch.getMessages().size() / recordsPerPartition);
+    Dataset<String> eventRecords = sparkSession.createDataset(messageBatch.getMessages(), Encoders.STRING()).repartition(numPartitions);
 
-    LOG.info("Returning checkpoint value: " + CHECKPOINT_VALUE_ZERO);
+    log.info("Returning checkpoint value: {}", CHECKPOINT_VALUE_ZERO);
 
     StructType sourceSchema = UtilHelpers.getSourceSchema(schemaProvider);
     if (sourceSchema != null) {
@@ -167,12 +172,12 @@ public class GcsEventsSource extends RowSource {
 
   @Override
   public void onCommit(String lastCkptStr) {
-    LOG.info("onCommit(): Checkpoint: " + lastCkptStr);
+    log.info("onCommit(): Checkpoint: {}", lastCkptStr);
 
     if (ackMessages) {
       ackOutstandingMessages();
     } else {
-      LOG.warn("Not acknowledging messages. Can result in repeated redeliveries.");
+      log.warn("Not acknowledging messages. Can result in repeated redeliveries.");
     }
   }
 
@@ -190,6 +195,7 @@ public class GcsEventsSource extends RowSource {
    */
   private MessageBatch processMessages(List<ReceivedMessage> receivedMessages) {
     List<String> messages = new ArrayList<>();
+    long skippedMsgCount = 0;
 
     for (ReceivedMessage received : receivedMessages) {
       MetadataMessage message = new MetadataMessage(received.getMessage());
@@ -201,13 +207,14 @@ public class GcsEventsSource extends RowSource {
 
       MessageValidity messageValidity = message.shouldBeProcessed();
       if (messageValidity.getDecision() == DO_SKIP) {
-        LOG.info("Skipping message: " + messageValidity.getDescription());
+        log.debug("Skipping message: {}", messageValidity.getDescription());
+        skippedMsgCount++;
         continue;
       }
 
       messages.add(msgStr);
     }
-
+    log.info("Messages received: {}, toBeProcessed: {}, skipped: {}", receivedMessages.size(), messages.size(), skippedMsgCount);
     return new MessageBatch(messages);
   }
 
@@ -225,11 +232,8 @@ public class GcsEventsSource extends RowSource {
   }
 
   private void logDetails(MetadataMessage message, String msgStr) {
-    LOG.info("eventType: " + message.getEventType() + ", objectId: " + message.getObjectId());
-
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("msg: " + msgStr);
-    }
+    log.debug("eventType: {}, objectId: {}", message.getEventType(), message.getObjectId());
+    log.debug("msg: {}", msgStr);
   }
 
 }

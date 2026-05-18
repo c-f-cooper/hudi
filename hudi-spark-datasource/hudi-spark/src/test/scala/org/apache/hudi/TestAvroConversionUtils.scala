@@ -18,14 +18,18 @@
 
 package org.apache.hudi
 
-import java.nio.ByteBuffer
-import java.util.Objects
-import org.apache.avro.Schema
+import org.apache.hudi.common.schema.HoodieSchema
+import org.apache.hudi.internal.schema.HoodieSchemaException
+
 import org.apache.avro.generic.GenericData
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
 import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DataTypes, MapType, StringType, StructField, StructType}
 import org.scalatest.{FunSuite, Matchers}
+
+import java.nio.ByteBuffer
+import java.time.LocalDate
+import java.util.Objects
 
 class TestAvroConversionUtils extends FunSuite with Matchers {
 
@@ -171,12 +175,12 @@ class TestAvroConversionUtils extends FunSuite with Matchers {
       .add("nullableMap", mapType, true).add("map", mapType, false)
       .add("nullableArray", arrayType, true).add("array", arrayType, false)
 
-    val avroSchema = AvroConversionUtils.convertStructTypeToAvroSchema(struct, "SchemaName", "SchemaNS")
+    val schema = HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(struct, "SchemaName", "SchemaNS")
 
     val expectedSchemaStr = complexSchemaStr
-    val expectedAvroSchema = new Schema.Parser().parse(expectedSchemaStr)
+    val expectedSchema = HoodieSchema.parse(expectedSchemaStr)
 
-    assert(avroSchema.equals(expectedAvroSchema))
+    assert(schema.equals(expectedSchema))
   }
 
   test("test convertStructTypeToAvroSchema with Nested StructField comment") {
@@ -189,7 +193,7 @@ class TestAvroConversionUtils extends FunSuite with Matchers {
       .add("nullableMap", mapType, true).add("map",mapType,false)
       .add("nullableArray", arrayType, true).add("array",arrayType,false)
 
-    val avroSchema = AvroConversionUtils.convertStructTypeToAvroSchema(struct, "SchemaName", "SchemaNS")
+    val schema = HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(struct, "SchemaName", "SchemaNS")
 
     val expectedSchemaStr = s"""
         {
@@ -390,21 +394,21 @@ class TestAvroConversionUtils extends FunSuite with Matchers {
         }
     """
 
-    val expectedAvroSchema = new Schema.Parser().parse(expectedSchemaStr)
+    val expectedSchema = HoodieSchema.parse(expectedSchemaStr)
 
-    assert(avroSchema.equals(expectedAvroSchema))
+    assert(schema.equals(expectedSchema))
   }
 
   test("test converter with binary") {
-    val avroSchema = new Schema.Parser().parse("{\"type\":\"record\",\"name\":\"h0_record\",\"namespace\":\"hoodie.h0\",\"fields\""
+    val hoodieSchema = HoodieSchema.parse("{\"type\":\"record\",\"name\":\"h0_record\",\"namespace\":\"hoodie.h0\",\"fields\""
       + ":[{\"name\":\"col9\",\"type\":[\"null\",\"bytes\"],\"default\":null}]}")
     val sparkSchema = StructType(List(StructField("col9", BinaryType, nullable = true)))
     // create a test record with avroSchema
-    val avroRecord = new GenericData.Record(avroSchema)
+    val avroRecord = new GenericData.Record(hoodieSchema.toAvroSchema)
     val bb = ByteBuffer.wrap(Array[Byte](97, 48, 53))
     avroRecord.put("col9", bb)
-    val row1 = AvroConversionUtils.createAvroToInternalRowConverter(avroSchema, sparkSchema).apply(avroRecord).get
-    val row2 = AvroConversionUtils.createAvroToInternalRowConverter(avroSchema, sparkSchema).apply(avroRecord).get
+    val row1 = AvroConversionUtils.createAvroToInternalRowConverter(hoodieSchema, sparkSchema).apply(avroRecord).get
+    val row2 = AvroConversionUtils.createAvroToInternalRowConverter(hoodieSchema, sparkSchema).apply(avroRecord).get
     internalRowCompare(row1, row2, sparkSchema)
   }
 
@@ -443,5 +447,40 @@ class TestAvroConversionUtils extends FunSuite with Matchers {
 
   private def checkNull(left: Any, right: Any): Boolean = {
     (left == null && right != null) || (left == null && right != null)
+  }
+
+  test("convert struct type with duplicate column names") {
+    val struct = new StructType().add("id", DataTypes.LongType, true)
+      .add("name", DataTypes.StringType, true)
+      .add("name", DataTypes.StringType, true)
+    the[HoodieSchemaException] thrownBy {
+      HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(struct, "SchemaName", "SchemaNS")
+    } should have message "Duplicate field name in record SchemaNS.SchemaName: name type:UNION pos:2 and name type:UNION pos:1."
+  }
+
+  test("Logical type: date") {
+    val dateSchema = s"""
+      {
+        "namespace": "logical",
+        "type": "record",
+        "name": "test",
+        "fields": [
+          {"name": "date", "type": {"type": "int", "logicalType": "date"}}
+        ]
+      }
+    """
+
+    val dateInputData = Seq(7, 365, 0) // one week, one year, epoch
+    val schema = HoodieSchema.parse(dateSchema)
+    val converter = AvroConversionUtils.createConverterToRow(schema, HoodieSchemaConversionUtils.convertHoodieSchemaToStructType(schema))
+
+    val dateOutputData = dateInputData.map(x => {
+      val record = new GenericData.Record(schema.toAvroSchema) {{ put("date", x) }}
+      converter(record).get(0)
+    })
+
+    assert(dateOutputData(0).toString === LocalDate.ofEpochDay(dateInputData(0)).toString)
+    assert(dateOutputData(1).toString === LocalDate.ofEpochDay(dateInputData(1)).toString)
+    assert(dateOutputData(2).toString === LocalDate.ofEpochDay(dateInputData(2)).toString)
   }
 }

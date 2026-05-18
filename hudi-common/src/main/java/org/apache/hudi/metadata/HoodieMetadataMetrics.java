@@ -18,15 +18,20 @@
 
 package org.apache.hudi.metadata;
 
-import org.apache.hudi.common.metrics.Registry;
+import org.apache.hudi.common.engine.HoodieLocalEngineContext;
 import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.view.HoodieTableFileSystemView;
+import org.apache.hudi.common.util.Option;
+import org.apache.hudi.config.metrics.HoodieMetricsConfig;
 import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.metrics.HoodieGauge;
+import org.apache.hudi.metrics.Metrics;
+import org.apache.hudi.storage.HoodieStorage;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.codahale.metrics.MetricRegistry;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.io.Serializable;
@@ -40,6 +45,7 @@ import java.util.stream.Collectors;
 /**
  * Metrics for metadata.
  */
+@Slf4j
 public class HoodieMetadataMetrics implements Serializable {
 
   // Metric names
@@ -47,16 +53,19 @@ public class HoodieMetadataMetrics implements Serializable {
   public static final String LOOKUP_FILES_STR = "lookup_files";
   public static final String LOOKUP_BLOOM_FILTERS_METADATA_STR = "lookup_meta_index_bloom_filters";
   public static final String LOOKUP_COLUMN_STATS_METADATA_STR = "lookup_meta_index_column_ranges";
+  public static final String LOOKUP_BLOOM_FILTERS_FILE_COUNT_STR = "lookup_meta_index_bloom_filters_file_count";
+  public static final String LOOKUP_COLUMN_STATS_FILE_COUNT_STR = "lookup_meta_index_column_ranges_file_count";
+
   // Time for lookup from record index
   public static final String LOOKUP_RECORD_INDEX_TIME_STR = "lookup_record_index_time";
   // Number of keys looked up in a call
   public static final String LOOKUP_RECORD_INDEX_KEYS_COUNT_STR = "lookup_record_index_key_count";
   // Number of keys found in record index
-  public static final String LOOKUP_RECORD_INDEX_KEYS_HITS_COUNT_STR = "lookup_record_index_key_count";
+  public static final String LOOKUP_RECORD_INDEX_KEYS_HITS_COUNT_STR = "lookup_record_index_key_hit_count";
   public static final String SCAN_STR = "scan";
   public static final String BASEFILE_READ_STR = "basefile_read";
   public static final String INITIALIZE_STR = "initialize";
-  public static final String REBOOTSTRAP_STR = "rebootstrap";
+  public static final String REBOOTSTRAP_STR = "rebootstrap_count";
   public static final String BOOTSTRAP_ERR_STR = "bootstrap_error";
 
   // Stats names
@@ -70,19 +79,23 @@ public class HoodieMetadataMetrics implements Serializable {
   public static final String TABLE_SERVICE_EXECUTION_STATUS = "table_service_execution_status";
   public static final String TABLE_SERVICE_EXECUTION_DURATION = "table_service_execution_duration";
   public static final String ASYNC_INDEXER_CATCHUP_TIME = "async_indexer_catchup_time";
+  public static final String COMPACTION_FAILURES = "compaction_failures";
+  public static final String LOG_COMPACTION_FAILURES = "logcompaction_failures";
+  public static final String PENDING_COMPACTIONS_FAILURES = "pending_compactions_failures";
 
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieMetadataMetrics.class);
+  private final transient MetricRegistry metricsRegistry;
+  private final transient Metrics metrics;
 
-  private final Registry metricsRegistry;
-
-  public HoodieMetadataMetrics(Registry metricsRegistry) {
-    this.metricsRegistry = metricsRegistry;
+  public HoodieMetadataMetrics(HoodieMetricsConfig metricsConfig, HoodieStorage storage) {
+    this.metrics = Metrics.getInstance(metricsConfig, storage);
+    this.metricsRegistry = metrics.getRegistry();
   }
 
   public Map<String, String> getStats(boolean detailed, HoodieTableMetaClient metaClient, HoodieTableMetadata metadata, Set<String> metadataPartitions) {
     try {
-      HoodieTableFileSystemView fsView = new HoodieTableFileSystemView(metaClient, metaClient.getActiveTimeline());
-      return getStats(fsView, detailed, metadata, metadataPartitions);
+      HoodieTableFileSystemView fileSystemView =
+          HoodieTableFileSystemView.fileListingBasedFileSystemView(new HoodieLocalEngineContext(metaClient.getStorageConf()), metaClient, metaClient.getActiveTimeline());
+      return getStats(fileSystemView, detailed, metadata, metadataPartitions);
     } catch (IOException ioe) {
       throw new HoodieIOException("Unable to get metadata stats.", ioe);
     }
@@ -104,7 +117,7 @@ public class HoodieMetadataMetrics implements Serializable {
 
       for (FileSlice slice : latestSlices) {
         if (slice.getBaseFile().isPresent()) {
-          totalBaseFileSizeInBytes += slice.getBaseFile().get().getFileStatus().getLen();
+          totalBaseFileSizeInBytes += slice.getBaseFile().get().getPathInfo().getLength();
           ++baseFileCount;
         }
         Iterator<HoodieLogFile> it = slice.getLogFiles().iterator();
@@ -136,7 +149,7 @@ public class HoodieMetadataMetrics implements Serializable {
     String countKey = action + ".count";
     String durationKey = action + ".totalDuration";
     incrementMetric(countKey, 1);
-    incrementMetric(durationKey, durationInMs);
+    setMetric(durationKey, durationInMs);
   }
 
   public void updateSizeMetrics(HoodieTableMetaClient metaClient, HoodieBackedTableMetadata metadata, Set<String> metadataPartitions) {
@@ -147,15 +160,16 @@ public class HoodieMetadataMetrics implements Serializable {
   }
 
   protected void incrementMetric(String action, long value) {
-    LOG.info(String.format("Updating metadata metrics (%s=%d) in %s", action, value, metricsRegistry));
-    metricsRegistry.add(action, value);
+    log.debug("Updating metadata metrics ({}={}) in {}", action, value, metricsRegistry);
+    Option<HoodieGauge<Long>> gaugeOpt = metrics.registerGauge(action);
+    gaugeOpt.ifPresent(gauge -> gauge.setValue(gauge.getValue() + value));
   }
 
   protected void setMetric(String action, long value) {
-    metricsRegistry.set(action, value);
+    metrics.registerGauge(action, value);
   }
 
-  public Registry registry() {
+  public MetricRegistry registry() {
     return metricsRegistry;
   }
 }

@@ -18,7 +18,6 @@
 
 package org.apache.hudi.client.embedded;
 
-import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.metrics.Registry;
 import org.apache.hudi.common.table.marker.MarkerType;
@@ -27,13 +26,11 @@ import org.apache.hudi.common.table.view.FileSystemViewStorageConfig;
 import org.apache.hudi.common.table.view.FileSystemViewStorageType;
 import org.apache.hudi.common.util.NetworkUtils;
 import org.apache.hudi.config.HoodieWriteConfig;
-import org.apache.hudi.hadoop.fs.HadoopFSUtils;
+import org.apache.hudi.storage.StorageConfiguration;
 import org.apache.hudi.timeline.service.TimelineService;
 
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.util.HashMap;
@@ -46,11 +43,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Timeline Service that runs as part of write client.
  */
+@Slf4j
 public class EmbeddedTimelineService {
   // lock used when starting/stopping/modifying embedded services
   private static final Object SERVICE_LOCK = new Object();
-
-  private static final Logger LOG = LoggerFactory.getLogger(EmbeddedTimelineService.class);
   private static final AtomicInteger NUM_SERVERS_RUNNING = new AtomicInteger(0);
   // Map of TimelineServiceIdentifier to existing timeline service running
   private static final Map<TimelineServiceIdentifier, EmbeddedTimelineService> RUNNING_SERVICES = new HashMap<>();
@@ -59,12 +55,13 @@ public class EmbeddedTimelineService {
   private int serverPort;
   private String hostAddr;
   private final HoodieEngineContext context;
-  private final SerializableConfiguration hadoopConf;
+  private final StorageConfiguration<?> storageConf;
   private final HoodieWriteConfig writeConfig;
   private TimelineService.Config serviceConfig;
   private final TimelineServiceIdentifier timelineServiceIdentifier;
   private final Set<String> basePaths; // the set of base paths using this EmbeddedTimelineService
 
+  @Getter
   private transient FileSystemViewManager viewManager;
   private transient TimelineService server;
 
@@ -76,7 +73,7 @@ public class EmbeddedTimelineService {
     this.timelineServiceIdentifier = timelineServiceIdentifier;
     this.basePaths = new HashSet<>();
     this.basePaths.add(writeConfig.getBasePath());
-    this.hadoopConf = context.getHadoopConf();
+    this.storageConf = context.getStorageConf();
     this.viewManager = createViewManager();
   }
 
@@ -100,7 +97,7 @@ public class EmbeddedTimelineService {
       synchronized (SERVICE_LOCK) {
         if (RUNNING_SERVICES.containsKey(timelineServiceIdentifier)) {
           RUNNING_SERVICES.get(timelineServiceIdentifier).addBasePath(writeConfig.getBasePath());
-          LOG.info("Reusing existing embedded timeline server with configuration: " + RUNNING_SERVICES.get(timelineServiceIdentifier).serviceConfig);
+          log.info("Reusing existing embedded timeline server with configuration: " + RUNNING_SERVICES.get(timelineServiceIdentifier).serviceConfig);
           return RUNNING_SERVICES.get(timelineServiceIdentifier);
         }
         // if no compatible instance is found, create a new one
@@ -125,10 +122,10 @@ public class EmbeddedTimelineService {
 
   public static void shutdownAllTimelineServers() {
     RUNNING_SERVICES.entrySet().forEach(entry -> {
-      LOG.info("Closing Timeline server");
+      log.info("Closing Timeline server");
       entry.getValue().server.close();
       METRICS_REGISTRY.set(NUM_EMBEDDED_TIMELINE_SERVERS, NUM_SERVERS_RUNNING.decrementAndGet());
-      LOG.info("Closed Timeline server");
+      log.info("Closed Timeline server");
     });
     RUNNING_SERVICES.clear();
   }
@@ -147,7 +144,7 @@ public class EmbeddedTimelineService {
   }
 
   private void startServer(TimelineServiceCreator timelineServiceCreator) throws IOException {
-    TimelineService.Config.Builder timelineServiceConfBuilder = TimelineService.Config.builder()
+    TimelineService.Config.ConfigBuilder timelineServiceConfBuilder = TimelineService.Config.builder()
         .serverPort(writeConfig.getEmbeddedTimelineServerPort())
         .numThreads(writeConfig.getEmbeddedTimelineServerThreads())
         .compress(writeConfig.getEmbeddedTimelineServerCompressOutput())
@@ -168,37 +165,34 @@ public class EmbeddedTimelineService {
           .earlyConflictDetectionCheckCommitConflict(writeConfig.earlyConflictDetectionCheckCommitConflict())
           .asyncConflictDetectorInitialDelayMs(writeConfig.getAsyncConflictDetectorInitialDelayMs())
           .asyncConflictDetectorPeriodMs(writeConfig.getAsyncConflictDetectorPeriodMs())
-          .earlyConflictDetectionMaxAllowableHeartbeatIntervalInMs(
+          .maxAllowableHeartbeatIntervalInMs(
               writeConfig.getHoodieClientHeartbeatIntervalInMs()
                   * writeConfig.getHoodieClientHeartbeatTolerableMisses());
     }
 
-    if (writeConfig.isTimelineServerBasedInstantStateEnabled()) {
-      timelineServiceConfBuilder
-          .instantStateForceRefreshRequestNumber(writeConfig.getTimelineServerBasedInstantStateForceRefreshRequestNumber())
-          .enableInstantStateRequests(true);
+    if (writeConfig.isUsingRemotePartitioner()) {
+      timelineServiceConfBuilder.enableRemotePartitioner(true);
     }
 
     this.serviceConfig = timelineServiceConfBuilder.build();
 
-    server = timelineServiceCreator.create(context, hadoopConf.newCopy(), serviceConfig,
-        HadoopFSUtils.getFs(writeConfig.getBasePath(), hadoopConf.newCopy()), viewManager);
+    server = timelineServiceCreator.create(storageConf.newInstance(), serviceConfig, viewManager);
     serverPort = server.startService();
-    LOG.info("Started embedded timeline server at " + hostAddr + ":" + serverPort);
+    log.info("Started embedded timeline server at {}:{}", hostAddr, serverPort);
   }
 
   @FunctionalInterface
   interface TimelineServiceCreator {
-    TimelineService create(HoodieEngineContext context, Configuration hadoopConf, TimelineService.Config timelineServerConf,
-                           FileSystem fileSystem, FileSystemViewManager globalFileSystemViewManager) throws IOException;
+    TimelineService create(StorageConfiguration<?> storageConf, TimelineService.Config timelineServerConf,
+                           FileSystemViewManager globalFileSystemViewManager) throws IOException;
   }
 
   private void setHostAddr(String embeddedTimelineServiceHostAddr) {
     if (embeddedTimelineServiceHostAddr != null) {
-      LOG.info("Overriding hostIp to (" + embeddedTimelineServiceHostAddr + ") found in spark-conf. It was " + this.hostAddr);
+      log.info("Overriding hostIp to ({}) found in write conf. It was {}", embeddedTimelineServiceHostAddr, this.hostAddr);
       this.hostAddr = embeddedTimelineServiceHostAddr;
     } else {
-      LOG.warn("Unable to find driver bind address from spark config");
+      log.warn("Unable to find driver bind address from write config, use current host name");
       this.hostAddr = NetworkUtils.getHostname();
     }
   }
@@ -206,25 +200,21 @@ public class EmbeddedTimelineService {
   /**
    * Retrieves proper view storage configs for remote clients to access this service.
    */
-  public FileSystemViewStorageConfig getRemoteFileSystemViewConfig() {
-    FileSystemViewStorageType viewStorageType = writeConfig.getClientSpecifiedViewStorageConfig()
+  public FileSystemViewStorageConfig getRemoteFileSystemViewConfig(HoodieWriteConfig clientWriteConfig) {
+    FileSystemViewStorageType viewStorageType = clientWriteConfig.getClientSpecifiedViewStorageConfig()
         .shouldEnableBackupForRemoteFileSystemView()
         ? FileSystemViewStorageType.REMOTE_FIRST : FileSystemViewStorageType.REMOTE_ONLY;
     return FileSystemViewStorageConfig.newBuilder()
         .withStorageType(viewStorageType)
         .withRemoteServerHost(hostAddr)
         .withRemoteServerPort(serverPort)
-        .withRemoteTimelineClientTimeoutSecs(writeConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineClientTimeoutSecs())
-        .withRemoteTimelineClientRetry(writeConfig.getClientSpecifiedViewStorageConfig().isRemoteTimelineClientRetryEnabled())
-        .withRemoteTimelineClientMaxRetryNumbers(writeConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineClientMaxRetryNumbers())
-        .withRemoteTimelineInitialRetryIntervalMs(writeConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineInitialRetryIntervalMs())
-        .withRemoteTimelineClientMaxRetryIntervalMs(writeConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineClientMaxRetryIntervalMs())
-        .withRemoteTimelineClientRetryExceptions(writeConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineClientRetryExceptions())
+        .withRemoteTimelineClientTimeoutSecs(clientWriteConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineClientTimeoutSecs())
+        .withRemoteTimelineClientRetry(clientWriteConfig.getClientSpecifiedViewStorageConfig().isRemoteTimelineClientRetryEnabled())
+        .withRemoteTimelineClientMaxRetryNumbers(clientWriteConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineClientMaxRetryNumbers())
+        .withRemoteTimelineInitialRetryIntervalMs(clientWriteConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineInitialRetryIntervalMs())
+        .withRemoteTimelineClientMaxRetryIntervalMs(clientWriteConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineClientMaxRetryIntervalMs())
+        .withRemoteTimelineClientRetryExceptions(clientWriteConfig.getClientSpecifiedViewStorageConfig().getRemoteTimelineClientRetryExceptions())
         .build();
-  }
-
-  public FileSystemViewManager getViewManager() {
-    return viewManager;
   }
 
   /**
@@ -251,18 +241,18 @@ public class EmbeddedTimelineService {
     }
     // continue rest of shutdown outside of the synchronized block to avoid excess blocking
     if (basePaths.isEmpty() && null != server) {
-      LOG.info("Closing Timeline server");
+      log.info("Closing Timeline server");
       this.server.close();
       METRICS_REGISTRY.set(NUM_EMBEDDED_TIMELINE_SERVERS, NUM_SERVERS_RUNNING.decrementAndGet());
       this.server = null;
       this.viewManager = null;
-      LOG.info("Closed Timeline server");
+      log.info("Closed Timeline server");
     }
   }
 
   private static TimelineServiceIdentifier getTimelineServiceIdentifier(String hostAddr, HoodieWriteConfig writeConfig) {
     return new TimelineServiceIdentifier(hostAddr, writeConfig.getMarkersType(), writeConfig.isMetadataTableEnabled(),
-        writeConfig.isEarlyConflictDetectionEnable(), writeConfig.isTimelineServerBasedInstantStateEnabled());
+        writeConfig.isEarlyConflictDetectionEnable());
   }
 
   static class TimelineServiceIdentifier {
@@ -270,15 +260,15 @@ public class EmbeddedTimelineService {
     private final MarkerType markerType;
     private final boolean isMetadataEnabled;
     private final boolean isEarlyConflictDetectionEnable;
-    private final boolean isTimelineServerBasedInstantStateEnabled;
 
-    public TimelineServiceIdentifier(String hostAddr, MarkerType markerType, boolean isMetadataEnabled, boolean isEarlyConflictDetectionEnable,
-                                     boolean isTimelineServerBasedInstantStateEnabled) {
+    public TimelineServiceIdentifier(String hostAddr,
+                                     MarkerType markerType,
+                                     boolean isMetadataEnabled,
+                                     boolean isEarlyConflictDetectionEnable) {
       this.hostAddr = hostAddr;
       this.markerType = markerType;
       this.isMetadataEnabled = isMetadataEnabled;
       this.isEarlyConflictDetectionEnable = isEarlyConflictDetectionEnable;
-      this.isTimelineServerBasedInstantStateEnabled = isTimelineServerBasedInstantStateEnabled;
     }
 
     @Override
@@ -292,7 +282,7 @@ public class EmbeddedTimelineService {
       TimelineServiceIdentifier that = (TimelineServiceIdentifier) o;
       if (this.hostAddr != null && that.hostAddr != null) {
         return isMetadataEnabled == that.isMetadataEnabled && isEarlyConflictDetectionEnable == that.isEarlyConflictDetectionEnable
-            && isTimelineServerBasedInstantStateEnabled == that.isTimelineServerBasedInstantStateEnabled && hostAddr.equals(that.hostAddr) && markerType == that.markerType;
+            && hostAddr.equals(that.hostAddr) && markerType == that.markerType;
       } else {
         return (hostAddr == null && that.hostAddr == null);
       }
@@ -300,7 +290,7 @@ public class EmbeddedTimelineService {
 
     @Override
     public int hashCode() {
-      return Objects.hash(hostAddr, markerType, isMetadataEnabled, isEarlyConflictDetectionEnable, isTimelineServerBasedInstantStateEnabled);
+      return Objects.hash(hostAddr, markerType, isMetadataEnabled, isEarlyConflictDetectionEnable);
     }
   }
 }

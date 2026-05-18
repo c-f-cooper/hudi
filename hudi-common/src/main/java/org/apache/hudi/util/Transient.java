@@ -22,6 +22,7 @@ import org.apache.hudi.common.function.SerializableSupplier;
 import org.apache.hudi.common.function.ThrowingConsumer;
 
 import javax.annotation.concurrent.ThreadSafe;
+
 import java.io.Serializable;
 
 import static org.apache.hudi.common.util.ValidationUtils.checkArgument;
@@ -90,7 +91,7 @@ public class Transient<T> implements Serializable {
 
   /**
    * Creates instance of {@link Transient} by lazily executing provided {@code initializer},
-   * to instantiate value of type {@link T}. Same initializer will be used to re-instantiate
+   * to instantiate value of type T. Same initializer will be used to re-instantiate
    * the value after original one being dropped during serialization/deserialization cycle
    */
   public static <T> Transient<T> lazy(SerializableSupplier<T> initializer) {

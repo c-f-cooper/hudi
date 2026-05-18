@@ -17,25 +17,35 @@
 
 package org.apache.spark.sql.adapter
 
-import org.apache.avro.Schema
 import org.apache.hudi.Spark35HoodieFileScanRDD
+import org.apache.hudi.common.schema.HoodieSchema
+import org.apache.hudi.storage.StorageConfiguration
+
+import org.apache.hadoop.conf.Configuration
+import org.apache.parquet.schema.MessageType
+import org.apache.spark.SparkEnv
+import org.apache.spark.api.java.JavaSparkContext
 import org.apache.spark.sql._
 import org.apache.spark.sql.avro._
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases
+import org.apache.spark.sql.catalyst.analysis.{EliminateSubqueryAliases, ResolvedTable}
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression}
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.catalyst.util.METADATA_COL_ATTR_KEY
-import org.apache.spark.sql.connector.catalog.V2TableWithV1Fallback
+import org.apache.spark.sql.catalyst.util.{METADATA_COL_ATTR_KEY, RebaseDateTime}
+import org.apache.spark.sql.connector.catalog.{V1Table, V2TableWithV1Fallback}
 import org.apache.spark.sql.execution.datasources._
-import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat, Spark35LegacyHoodieParquetFileFormat}
+import org.apache.spark.sql.execution.datasources.lance.SparkLanceReaderBase
+import org.apache.spark.sql.execution.datasources.orc.Spark35OrcReader
+import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat, ParquetFilters, Spark35LegacyHoodieParquetFileFormat, Spark35ParquetReader}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.hudi.analysis.TableValuedFunctions
+import org.apache.spark.sql.hudi.blob.{BatchedBlobReaderStrategy, ScalarFunctions}
+import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 import org.apache.spark.sql.parser.{HoodieExtendedParserInterface, HoodieSpark3_5ExtendedSqlParser}
-import org.apache.spark.sql.types.{DataType, Metadata, MetadataBuilder, StructType}
+import org.apache.spark.sql.types.{DataType, DataTypes, Metadata, MetadataBuilder, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatchRow
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.storage.StorageLevel._
@@ -52,11 +62,17 @@ class Spark3_5Adapter extends BaseSpark3Adapter {
         case plan if !plan.resolved => None
         // NOTE: When resolving Hudi table we allow [[Filter]]s and [[Project]]s be applied
         //       on top of it
-        case PhysicalOperation(_, _, DataSourceV2Relation(v2: V2TableWithV1Fallback, _, _, _, _)) if isHoodieTable(v2.v1Table) =>
+        case PhysicalOperation(_, _, DataSourceV2Relation(v2: V2TableWithV1Fallback, _, _, _, _)) if isHoodieTable(v2) =>
           Some(v2.v1Table)
+        case ResolvedTable(_, _, V1Table(v1Table), _) if isHoodieTable(v1Table) =>
+          Some(v1Table)
         case _ => None
       }
     }
+  }
+
+  def isHoodieTable(v2Table: V2TableWithV1Fallback): Boolean = {
+    v2Table.getClass.getName.contains("HoodieInternalV2Table")
   }
 
   override def isColumnarBatchRow(r: InternalRow): Boolean = r.isInstanceOf[ColumnarBatchRow]
@@ -66,8 +82,6 @@ class Spark3_5Adapter extends BaseSpark3Adapter {
       .putBoolean(METADATA_COL_ATTR_KEY, value = true)
       .build()
 
-  override def getCatalogUtils: HoodieSpark3CatalogUtils = HoodieSpark35CatalogUtils
-
   override def getCatalystExpressionUtils: HoodieCatalystExpressionUtils = HoodieSpark35CatalystExpressionUtils
 
   override def getCatalystPlanUtils: HoodieCatalystPlansUtils = HoodieSpark35CatalystPlanUtils
@@ -76,11 +90,11 @@ class Spark3_5Adapter extends BaseSpark3Adapter {
 
   override def getSparkPartitionedFileUtils: HoodieSparkPartitionedFileUtils = HoodieSpark35PartitionedFileUtils
 
-  override def createAvroSerializer(rootCatalystType: DataType, rootAvroType: Schema, nullable: Boolean): HoodieAvroSerializer =
-    new HoodieSpark3_5AvroSerializer(rootCatalystType, rootAvroType, nullable)
+  override def createAvroSerializer(rootCatalystType: DataType, rootType: HoodieSchema, nullable: Boolean): HoodieAvroSerializer =
+    new HoodieSpark3_5AvroSerializer(rootCatalystType, rootType.toAvroSchema, nullable)
 
-  override def createAvroDeserializer(rootAvroType: Schema, rootCatalystType: DataType): HoodieAvroDeserializer =
-    new HoodieSpark3_5AvroDeserializer(rootAvroType, rootCatalystType)
+  override def createAvroDeserializer(rootType: HoodieSchema, rootCatalystType: DataType): HoodieAvroDeserializer =
+    new HoodieSpark3_5AvroDeserializer(rootType.toAvroSchema, rootCatalystType)
 
   override def createExtendedSparkParser(spark: SparkSession, delegate: ParserInterface): HoodieExtendedParserInterface =
     new HoodieSpark3_5ExtendedSqlParser(spark, delegate)
@@ -105,6 +119,16 @@ class Spark3_5Adapter extends BaseSpark3Adapter {
     TableValuedFunctions.funcs.foreach(extensions.injectTableFunction)
   }
 
+  override def injectScalarFunctions(extensions: SparkSessionExtensions): Unit = {
+    ScalarFunctions.funcs.foreach(extensions.injectFunction)
+  }
+
+  override def injectPlannerStrategies(extensions: SparkSessionExtensions): Unit = {
+    extensions.injectPlannerStrategy { session =>
+      BatchedBlobReaderStrategy(session)
+    }
+  }
+
   /**
    * Converts instance of [[StorageLevel]] to a corresponding string
    */
@@ -123,5 +147,91 @@ class Spark3_5Adapter extends BaseSpark3Adapter {
     case MEMORY_AND_DISK_SER_2 => "MEMORY_AND_DISK_SER_2"
     case OFF_HEAP => "OFF_HEAP"
     case _ => throw new IllegalArgumentException(s"Invalid StorageLevel: $level")
+  }
+
+  /**
+   * Get parquet file reader
+   *
+   * @param vectorized true if vectorized reading is not prohibited due to schema, reading mode, etc
+   * @param sqlConf    the [[SQLConf]] used for the read
+   * @param options    passed as a param to the file format
+   * @param hadoopConf some configs will be set for the hadoopConf
+   * @return parquet file reader
+   */
+  override def createParquetFileReader(vectorized: Boolean,
+                                       sqlConf: SQLConf,
+                                       options: Map[String, String],
+                                       hadoopConf: Configuration): SparkColumnarFileReader = {
+    Spark35ParquetReader.build(vectorized, sqlConf, options, hadoopConf)
+  }
+
+  /**
+   * TODO
+   *
+   * @param vectorized
+   * @param sqlConf
+   * @param options
+   * @param hadoopConf
+   * @return
+   */
+  override def createOrcFileReader(vectorized: Boolean,
+                                   sqlConf: SQLConf,
+                                   options: Map[String, String],
+                                   hadoopConf: Configuration,
+                                   dataSchema: StructType): SparkColumnarFileReader = {
+    Spark35OrcReader.build(vectorized, sqlConf, options, hadoopConf, dataSchema)
+  }
+
+  override def createLanceFileReader(vectorized: Boolean,
+                                     sqlConf: SQLConf,
+                                     options: Map[String, String],
+                                     hadoopConf: Configuration): Option[SparkColumnarFileReader] = {
+    Some(new SparkLanceReaderBase(vectorized))
+  }
+
+  override def stopSparkContext(jssc: JavaSparkContext, exitCode: Int): Unit = {
+    jssc.sc.stop(exitCode)
+  }
+
+  override def getDateTimeRebaseMode(): LegacyBehaviorPolicy.Value = {
+    // Resolution order:
+    //   1. SQLConf override (so `spark.conf.set(...)` on the SparkSession takes
+    //      effect on the driver and inside Spark SQL execution contexts).
+    //   2. SparkConf (SparkEnv.get.conf) — broadcast to every executor at
+    //      startup, so user-set `spark.sql.parquet.datetimeRebaseModeInWrite`
+    //      is honored on executor tasks outside a SQL execution context (e.g.
+    //      compaction dispatched via vanilla
+    //      `JavaSparkContext.parallelize(...).map(...)`).
+    //   3. The ConfigEntry's own default.
+    val fromSqlConf = Option(SQLConf.get.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE, null))
+    val fromSparkConf = Option(SparkEnv.get)
+      .flatMap(env => Option(env.conf.get(SQLConf.PARQUET_REBASE_MODE_IN_WRITE.key, null)))
+    LegacyBehaviorPolicy.withName(
+      fromSqlConf.orElse(fromSparkConf)
+        .getOrElse(SQLConf.get.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE)))
+  }
+
+  override def isLegacyBehaviorPolicy(value: Object): Boolean = {
+    value == LegacyBehaviorPolicy.LEGACY
+  }
+
+  override def isTimestampNTZType(dataType: DataType): Boolean = {
+    dataType == DataTypes.TimestampNTZType
+  }
+
+  override def getRebaseSpec(policy: String): RebaseDateTime.RebaseSpec = {
+    RebaseDateTime.RebaseSpec(LegacyBehaviorPolicy.withName(policy))
+  }
+
+  override def createParquetFilters(schema: MessageType, storageConf: StorageConfiguration[_], sqlConf: SQLConf): ParquetFilters = {
+    new ParquetFilters(
+      schema,
+      storageConf.getBoolean(SQLConf.PARQUET_FILTER_PUSHDOWN_DATE_ENABLED.key, sqlConf.parquetFilterPushDownDate),
+      storageConf.getBoolean(SQLConf.PARQUET_FILTER_PUSHDOWN_TIMESTAMP_ENABLED.key, sqlConf.parquetFilterPushDownTimestamp),
+      storageConf.getBoolean(SQLConf.PARQUET_FILTER_PUSHDOWN_DECIMAL_ENABLED.key, sqlConf.parquetFilterPushDownDecimal),
+      storageConf.getBoolean(SQLConf.PARQUET_FILTER_PUSHDOWN_STRING_PREDICATE_ENABLED.key, sqlConf.parquetFilterPushDownStringPredicate),
+      storageConf.getInt(SQLConf.PARQUET_FILTER_PUSHDOWN_INFILTERTHRESHOLD.key, sqlConf.parquetFilterPushDownInFilterThreshold),
+      storageConf.getBoolean(SQLConf.CASE_SENSITIVE.key, sqlConf.caseSensitiveAnalysis),
+      getRebaseSpec("CORRECTED"))
   }
 }

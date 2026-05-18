@@ -26,6 +26,7 @@ import org.apache.hudi.config.HoodieWriteConfig
 import org.apache.hudi.integ.testsuite.configuration.DeltaConfig.Config
 import org.apache.hudi.integ.testsuite.dag.ExecutionContext
 import org.apache.hudi.integ.testsuite.schema.SchemaUtils
+
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SaveMode
 import org.slf4j.LoggerFactory
@@ -54,7 +55,7 @@ class SparkDeletePartitionNode(dagNodeConfig: Config) extends DagNode[RDD[WriteS
 
     context.getWriterContext.getSparkSession.emptyDataFrame.write.format("hudi")
       .options(DataSourceWriteOptions.mayBeDerivePartitionPath(context.getWriterContext.getProps.asScala.toMap))
-      .option(DataSourceWriteOptions.PRECOMBINE_FIELD.key(), SchemaUtils.SOURCE_ORDERING_FIELD)
+        .option(DataSourceWriteOptions.ORDERING_FIELDS.key(), SchemaUtils.SOURCE_ORDERING_FIELD)
       .option(DataSourceWriteOptions.TABLE_NAME.key, context.getHoodieTestSuiteWriter.getCfg.targetTableName)
       .option(DataSourceWriteOptions.TABLE_TYPE.key, context.getHoodieTestSuiteWriter.getCfg.tableType)
       .option(DataSourceWriteOptions.OPERATION.key, DataSourceWriteOptions.DELETE_PARTITION_OPERATION_OPT_VAL)

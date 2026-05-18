@@ -17,28 +17,32 @@
 
 package org.apache.spark.sql.hudi.command
 
-import org.apache.hadoop.fs.Path
-import org.apache.hudi.common.model.{HoodieFileFormat, HoodieTableType}
+import org.apache.hudi.{DataSourceWriteOptions, SparkAdapterSupport}
+import org.apache.hudi.common.model.HoodieTableType
+import org.apache.hudi.common.schema.{HoodieSchema, HoodieSchemaType}
 import org.apache.hudi.common.table.HoodieTableConfig
 import org.apache.hudi.common.util.ConfigUtils
-import org.apache.hudi.exception.HoodieException
-import org.apache.hudi.hadoop.HoodieParquetInputFormat
-import org.apache.hudi.hadoop.realtime.HoodieParquetRealtimeInputFormat
+import org.apache.hudi.exception.{HoodieException, HoodieValidationException}
 import org.apache.hudi.hadoop.utils.HoodieInputFormatUtils
-import org.apache.hudi.{DataSourceWriteOptions, SparkAdapterSupport}
+import org.apache.hudi.keygen.constant.KeyGeneratorOptions
+
+import org.apache.hadoop.fs.Path
+import org.apache.spark.{SPARK_VERSION, SparkConf}
+import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.avro.HoodieSparkSchemaConverters
 import org.apache.spark.sql.catalyst.analysis.NoSuchDatabaseException
-import org.apache.spark.sql.catalyst.catalog.HoodieCatalogTable.needFilterProps
 import org.apache.spark.sql.catalyst.catalog._
+import org.apache.spark.sql.catalyst.catalog.HoodieCatalogTable.needFilterProps
+import org.apache.spark.sql.catalyst.expressions.Cast
 import org.apache.spark.sql.hive.HiveClientUtils
 import org.apache.spark.sql.hive.HiveExternalCatalog._
-import org.apache.spark.sql.hudi.HoodieSqlCommonUtils.isUsingHiveCatalog
 import org.apache.spark.sql.hudi.{HoodieOptionConfig, HoodieSqlCommonUtils}
+import org.apache.spark.sql.hudi.HoodieSqlCommonUtils.{isUsingHiveCatalog, isUsingPolarisCatalog}
+import org.apache.spark.sql.hudi.command.CreateHoodieTableCommand.validateTableSchema
+import org.apache.spark.sql.hudi.command.exception.HoodieAnalysisException
 import org.apache.spark.sql.internal.StaticSQLConf.SCHEMA_STRING_LENGTH_THRESHOLD
-import org.apache.spark.sql.types.StructType
-import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
-import org.apache.spark.{SPARK_VERSION, SparkConf}
+import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, MapType, Metadata, StructField, StructType}
 
-import java.io.{PrintWriter, StringWriter}
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -71,14 +75,15 @@ case class CreateHoodieTableCommand(table: CatalogTable, ignoreIfExists: Boolean
       hoodieCatalogTable.initHoodieTable()
     } else {
       if (!hoodieCatalogTable.hoodieTableExists) {
-        throw new AnalysisException("Creating ro/rt table need the existence of the base table.")
+        throw new HoodieAnalysisException("Creating ro/rt table need the existence of the base table.")
       }
       if (HoodieTableType.MERGE_ON_READ != hoodieCatalogTable.tableType) {
-        throw new AnalysisException("Creating ro/rt table should only apply to a mor table.")
+        throw new HoodieAnalysisException("Creating ro/rt table should only apply to a mor table.")
       }
     }
 
     try {
+      validateTableSchema(table.schema, hoodieCatalogTable.tableSchemaWithoutMetaFields)
       // create catalog table for this hoodie table
       CreateHoodieTableCommand.createTableInCatalog(sparkSession, hoodieCatalogTable, ignoreIfExists, queryAsProp)
     } catch {
@@ -89,19 +94,49 @@ case class CreateHoodieTableCommand(table: CatalogTable, ignoreIfExists: Boolean
   }
 }
 
-object CreateHoodieTableCommand {
+object CreateHoodieTableCommand extends SparkAdapterSupport {
+
+  def validateTableSchema(userDefinedSchema: StructType, hoodieTableSchema: StructType): Boolean = {
+    if (userDefinedSchema.fields.length != 0 &&
+      userDefinedSchema.fields.length != hoodieTableSchema.fields.length) {
+      false
+    } else if (userDefinedSchema.fields.length != 0) {
+      val sortedHoodieTableFields = hoodieTableSchema.fields.sortBy(_.name)
+      val sortedUserDefinedFields = userDefinedSchema.fields.sortBy(_.name)
+      val diffResult = sortedHoodieTableFields.zip(sortedUserDefinedFields).forall {
+        case (hoodieTableColumn, userDefinedColumn) =>
+          hoodieTableColumn.name.equals(userDefinedColumn.name) &&
+            (Cast.canCast(hoodieTableColumn.dataType, userDefinedColumn.dataType) ||
+              HoodieSparkSchemaConverters.toHoodieType(hoodieTableColumn.dataType)
+                .equals(HoodieSparkSchemaConverters.toHoodieType(userDefinedColumn.dataType)))
+      }
+      if (!diffResult) {
+        throw new HoodieValidationException(
+          s"The defined schema is inconsistent with the schema in the hoodie metadata directory," +
+            s" hoodieTableSchema: ${hoodieTableSchema.simpleString}," +
+            s" userDefinedSchema: ${userDefinedSchema.simpleString}")
+      } else {
+        true
+      }
+    } else {
+      true
+    }
+  }
 
   def validateTblProperties(hoodieCatalogTable: HoodieCatalogTable): Unit = {
     if (hoodieCatalogTable.hoodieTableExists) {
       val originTableConfig = hoodieCatalogTable.tableConfig.getProps.asScala.toMap
       val tableOptions = hoodieCatalogTable.catalogProperties
 
-      checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.PRECOMBINE_FIELD.key)
+      checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.ORDERING_FIELDS.key)
+      checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.PRECOMBINE_FIELD.key())
       checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.PARTITION_FIELDS.key)
       checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.RECORDKEY_FIELDS.key)
       checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.KEY_GENERATOR_CLASS_NAME.key)
       checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.URL_ENCODE_PARTITIONING.key)
       checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.HIVE_STYLE_PARTITIONING_ENABLE.key)
+      checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.SLASH_SEPARATED_DATE_PARTITIONING.key)
+      checkTableConfigEqual(originTableConfig, tableOptions, HoodieTableConfig.PARTITION_EXTRACTOR_CLASS.key)
     }
   }
 
@@ -144,24 +179,32 @@ object CreateHoodieTableCommand {
       .copy(table = tableName, database = Some(newDatabaseName))
 
     val partitionColumnNames = hoodieCatalogTable.partitionSchema.map(_.name)
-    // Remove some properties should not be used;append pk, preCombineKey, type to the properties of table
-    val newTblProperties =
+    // Remove some properties should not be used;append pk, orderingFields, type to the properties of table
+    var newTblProperties =
       hoodieCatalogTable.catalogProperties.--(needFilterProps) ++ HoodieOptionConfig.extractSqlOptions(properties)
+
+    // Add provider -> hudi and path as a table property
+    newTblProperties = newTblProperties + ("provider" -> "hudi") + ("path" -> path)
+
     val newTable = table.copy(
       identifier = newTableIdentifier,
       storage = newStorage,
       schema = hoodieCatalogTable.tableSchema,
+      provider = Some("hudi"),
       partitionColumnNames = partitionColumnNames,
       createVersion = SPARK_VERSION,
       properties = newTblProperties
     )
 
-    // Create table in the catalog
-    val enableHive = isUsingHiveCatalog(sparkSession)
-    if (enableHive) {
-      createHiveDataSourceTable(sparkSession, newTable)
-    } else {
-      catalog.createTable(newTable, ignoreIfExists = false, validateLocation = false)
+    // If polaris is not enabled, we should create the table in hive or spark session catalog
+    // otherwise if enabled, hudi will use the delegate to create the table
+    if (!isUsingPolarisCatalog(sparkSession)) {
+      val enableHive = isUsingHiveCatalog(sparkSession)
+      if (enableHive) {
+        createHiveDataSourceTable(sparkSession, newTable)
+      } else {
+        catalog.createTable(newTable, ignoreIfExists = false, validateLocation = false)
+      }
     }
   }
 
@@ -180,14 +223,76 @@ object CreateHoodieTableCommand {
     if (!dbExists) {
       throw new NoSuchDatabaseException(dbName)
     }
-    // append some table properties need for spark data source table.
+    // Store original schema (with VariantType) in properties so Spark can reconstruct it when reading;
+    // schema passed to Hive is converted to Hive-compatible types so Hive 2.x/3.x does not reject VARIANT.
     val dataSourceProps = tableMetaToTableProps(sparkSession.sparkContext.conf,
       table, table.schema)
-
-    val tableWithDataSourceProps = table.copy(properties = dataSourceProps ++ table.properties)
+    val tableWithDataSourceProps = buildHiveCompatibleCatalogTable(table, dataSourceProps)
     val client = HiveClientUtils.getSingletonClientForMetadata(sparkSession)
     // create hive table.
     client.createTable(tableWithDataSourceProps, ignoreIfExists = true)
+  }
+
+  /**
+   * Returns a copy of `table` with a Hive-compatible schema and data-source properties merged in.
+   * The schema passed to the Hive metastore has VariantType (and other Hive-incompatible types)
+   * replaced by their physical representations, while `dataSourceProps` carries the original
+   * schema JSON so Spark can restore the logical types on read.
+   */
+  private[hudi] def buildHiveCompatibleCatalogTable(
+      table: CatalogTable,
+      dataSourceProps: Map[String, String]): CatalogTable = {
+    table.copy(
+      schema = toHiveCompatibleSchema(table.schema),
+      properties = dataSourceProps ++ table.properties)
+  }
+
+  /**
+   * Converts Spark DataTypes that Hive doesn't support to their physical representations.
+   * Currently handles:
+   *   - VariantType (Spark 4.0+) -> `struct<metadata:binary, value:binary>`
+   *   - VECTOR (Hudi custom logical type, exposed in Spark as ArrayType with `hudi_type`
+   *     metadata) -> `BinaryType`, matching its on-disk fixed_len_byte_array layout
+   *     (RFC-99). Field metadata is preserved so the full logical schema is still
+   *     serialized into `spark.sql.sources.schema.*` TBLPROPERTIES by the caller.
+   *
+   * Recurses into nested StructType, ArrayType, and MapType so variants embedded in
+   * complex types (e.g. `STRUCT<a: VARIANT>`, `ARRAY<VARIANT>`, `MAP<STRING, VARIANT>`)
+   * are also converted.
+   */
+  private[hudi] def toHiveCompatibleSchema(schema: StructType): StructType = {
+    toHiveCompatibleType(schema).asInstanceOf[StructType]
+  }
+
+  private def toHiveCompatibleType(dataType: DataType,
+                                   metadata: Metadata = Metadata.empty): DataType = dataType match {
+    case dt if sparkAdapter.isVariantType(dt) =>
+      // Canonical field order (metadata, value) matches the Parquet spec and Iceberg convention,
+      // mirroring HoodieSchema.createVariant().
+      StructType(Seq(
+        StructField(HoodieSchema.Variant.VARIANT_METADATA_FIELD, BinaryType, nullable = false),
+        StructField(HoodieSchema.Variant.VARIANT_VALUE_FIELD, BinaryType, nullable = false)
+      ))
+    case _: ArrayType if isVectorType(metadata) =>
+      // VECTOR is exposed in Spark as ArrayType(FloatType) with hudi_type metadata.
+      // HMS must store the column as BINARY matching the on-disk fixed_len_byte_array (RFC-99).
+      BinaryType
+    case st: StructType =>
+      StructType(st.fields.map(f => f.copy(dataType = toHiveCompatibleType(f.dataType, f.metadata))))
+    case at: ArrayType =>
+      at.copy(elementType = toHiveCompatibleType(at.elementType))
+    case mt: MapType =>
+      mt.copy(
+        keyType = toHiveCompatibleType(mt.keyType),
+        valueType = toHiveCompatibleType(mt.valueType))
+    case other => other
+  }
+
+  /** Mirrors the detection in HoodieSparkSchemaConverters.toHoodieTypeNested. */
+  private def isVectorType(metadata: Metadata): Boolean = {
+    metadata.contains(HoodieSchema.TYPE_METADATA_FIELD) &&
+      HoodieSchema.parseTypeDescriptor(
+        metadata.getString(HoodieSchema.TYPE_METADATA_FIELD)).getType == HoodieSchemaType.VECTOR
   }
 
   // This code is forked from org.apache.spark.sql.hive.HiveExternalCatalog#tableMetaToTableProps

@@ -20,6 +20,7 @@ import org.apache.hudi.DataSourceReadOptions;
 import org.apache.hudi.DataSourceWriteOptions;
 import org.apache.hudi.HoodieDataSourceHelpers;
 import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
@@ -30,9 +31,12 @@ import org.apache.hudi.exception.TableNotFoundException;
 import org.apache.hudi.hive.HiveSyncConfig;
 import org.apache.hudi.hive.MultiPartKeysValueExtractor;
 import org.apache.hudi.hive.SlashEncodedDayPartitionValueExtractor;
+import org.apache.hudi.storage.hadoop.HadoopStorageConfiguration;
+import org.apache.hudi.testutils.HoodieClientTestUtils;
 
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -44,15 +48,14 @@ import org.apache.spark.sql.streaming.DataStreamWriter;
 import org.apache.spark.sql.streaming.OutputMode;
 import org.apache.spark.sql.streaming.StreamingQuery;
 import org.apache.spark.sql.streaming.Trigger;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-import static org.apache.hudi.common.testutils.RawTripTestPayload.recordsToStrings;
+import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.recordsToStrings;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.createMetaClient;
 import static org.apache.hudi.hive.HiveSyncConfigHolder.HIVE_PASS;
 import static org.apache.hudi.hive.HiveSyncConfigHolder.HIVE_SYNC_ENABLED;
 import static org.apache.hudi.hive.HiveSyncConfigHolder.HIVE_URL;
@@ -64,6 +67,7 @@ import static org.apache.hudi.testutils.HoodieClientTestUtils.getSparkConfForTes
 /**
  * Sample program that writes & reads hoodie tables via the Spark datasource streaming.
  */
+@Slf4j
 public class HoodieJavaStreamingApp {
 
   @Parameter(names = {"--table-path", "-p"}, description = "path for Hoodie sample table")
@@ -110,9 +114,6 @@ public class HoodieJavaStreamingApp {
   @Parameter(names = {"--help", "-h"}, help = true)
   public Boolean help = false;
 
-
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieJavaStreamingApp.class);
-
   public static void main(String[] args) throws Exception {
     HoodieJavaStreamingApp cli = new HoodieJavaStreamingApp();
     JCommander cmd = new JCommander(cli, null, args);
@@ -125,7 +126,7 @@ public class HoodieJavaStreamingApp {
     try {
       cli.run();
     } catch (Exception ex) {
-      LOG.error("Got error running app ", ex);
+      log.error("Got error running app ", ex);
       errStatus = -1;
     } finally {
       System.exit(errStatus);
@@ -175,17 +176,17 @@ public class HoodieJavaStreamingApp {
     // thread for spark structured streaming
     try {
       Future<Void> streamFuture = executor.submit(() -> {
-        LOG.info("===== Streaming Starting =====");
+        log.info("===== Streaming Starting =====");
         stream(streamingInput, DataSourceWriteOptions.UPSERT_OPERATION_OPT_VAL(), ckptPath);
-        LOG.info("===== Streaming Ends =====");
+        log.info("===== Streaming Ends =====");
         return null;
       });
 
       // thread for adding data to the streaming source and showing results over time
       Future<Integer> showFuture = executor.submit(() -> {
-        LOG.info("===== Showing Starting =====");
+        log.info("===== Showing Starting =====");
         int numCommits = addInputAndValidateIngestion(spark, fs,  srcPath,0, 100, inputDF1, inputDF2, true);
-        LOG.info("===== Showing Ends =====");
+        log.info("===== Showing Ends =====");
         return numCommits;
       });
 
@@ -196,12 +197,12 @@ public class HoodieJavaStreamingApp {
       executor.shutdownNow();
     }
 
-    HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder().setConf(jssc.hadoopConfiguration()).setBasePath(tablePath).build();
+    HoodieTableMetaClient metaClient = HoodieClientTestUtils.createMetaClient(jssc, tablePath);
     if (tableType.equals(HoodieTableType.MERGE_ON_READ.name())) {
       // Ensure we have successfully completed one compaction commit
-      ValidationUtils.checkArgument(metaClient.getActiveTimeline().getCommitTimeline().countInstants() == 1);
+      ValidationUtils.checkArgument(metaClient.getActiveTimeline().getCommitAndReplaceTimeline().countInstants() == 1);
     } else {
-      ValidationUtils.checkArgument(metaClient.getActiveTimeline().getCommitTimeline().countInstants() >= 1);
+      ValidationUtils.checkArgument(metaClient.getActiveTimeline().getCommitAndReplaceTimeline().countInstants() >= 1);
     }
 
     // Deletes Stream
@@ -225,18 +226,18 @@ public class HoodieJavaStreamingApp {
     // thread for spark structured streaming
     try {
       Future<Void> streamFuture = executor.submit(() -> {
-        LOG.info("===== Streaming Starting =====");
+        log.info("===== Streaming Starting =====");
         stream(delStreamingInput, DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL(), ckptPath2);
-        LOG.info("===== Streaming Ends =====");
+        log.info("===== Streaming Ends =====");
         return null;
       });
 
       final int numCommits = numInitialCommits;
       // thread for adding data to the streaming source and showing results over time
       Future<Void> showFuture = executor.submit(() -> {
-        LOG.info("===== Showing Starting =====");
+        log.info("===== Showing Starting =====");
         addInputAndValidateIngestion(newSpark, fs, srcPath2, numCommits, 80, inputDF3, null, false);
-        LOG.info("===== Showing Ends =====");
+        log.info("===== Showing Ends =====");
         return null;
       });
 
@@ -257,14 +258,14 @@ public class HoodieJavaStreamingApp {
     while ((currTime - beginTime) < timeoutMsecs) {
       try {
         HoodieTimeline timeline = HoodieDataSourceHelpers.allCompletedCommitsCompactions(fs, tablePath);
-        LOG.info("Timeline :" + timeline.getInstants());
+        log.info("Timeline :{}", timeline.getInstants());
         if (timeline.countInstants() >= numCommits) {
           return;
         }
-        HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder().setConf(fs.getConf()).setBasePath(tablePath).setLoadActiveTimelineOnLoad(true).build();
-        System.out.println("Instants :" + metaClient.getActiveTimeline().getInstants());
+        HoodieTableMetaClient metaClient = createMetaClient(new HadoopStorageConfiguration(fs.getConf()), tablePath);
+        log.info("Instants :{}", metaClient.getActiveTimeline().getInstants());
       } catch (TableNotFoundException te) {
-        LOG.info("Got table not found exception. Retrying");
+        log.info("Got table not found exception. Retrying");
       } finally {
         Thread.sleep(sleepSecsAfterEachRun * 1000);
         currTime = System.currentTimeMillis();
@@ -293,7 +294,7 @@ public class HoodieJavaStreamingApp {
     // wait for spark streaming to process one microbatch
     waitTillNCommits(fs, numExpCommits, 180, 3);
     String commitInstantTime1 = HoodieDataSourceHelpers.latestCommit(fs, tablePath);
-    LOG.info("First commit at instant time :" + commitInstantTime1);
+    log.info("First commit at instant time: {}", commitInstantTime1);
 
     String commitInstantTime2 = commitInstantTime1;
     if (null != inputDF2) {
@@ -303,7 +304,7 @@ public class HoodieJavaStreamingApp {
       Thread.sleep(3000);
       waitTillNCommits(fs, numExpCommits, 180, 3);
       commitInstantTime2 = HoodieDataSourceHelpers.listCommitsSince(fs, tablePath, commitInstantTime1).stream().sorted().findFirst().get();
-      LOG.info("Second commit at instant time :" + commitInstantTime2);
+      log.info("Second commit at instant time: {}", commitInstantTime2);
     }
 
     if (tableType.equals(HoodieTableType.MERGE_ON_READ.name())) {
@@ -312,23 +313,20 @@ public class HoodieJavaStreamingApp {
       }
       // Wait for compaction to also finish and track latest timestamp as commit timestamp
       waitTillNCommits(fs, numExpCommits, 180, 3);
-      LOG.info("Compaction commit at instant time :" + HoodieDataSourceHelpers.latestCommit(fs, tablePath));
+      log.info("Compaction commit at instant time: {}", HoodieDataSourceHelpers.latestCommit(fs, tablePath));
     }
 
     /**
      * Read & do some queries
      */
-    Dataset<Row> hoodieROViewDF = spark.read().format("hudi")
-        // pass any path glob, can include hoodie & non-hoodie
-        // datasets
-        .load(tablePath + "/*/*/*/*");
+    Dataset<Row> hoodieROViewDF = spark.read().format("hudi").load(tablePath);
     hoodieROViewDF.registerTempTable("hoodie_ro");
     spark.sql("describe hoodie_ro").show();
     // all trips whose fare amount was greater than 2.
     spark.sql("select fare.amount, begin_lon, begin_lat, timestamp from hoodie_ro where fare.amount > 2.0").show();
 
     if (instantTimeValidation) {
-      System.out.println("Showing all records. Latest Instant Time =" + commitInstantTime2);
+      log.info("Showing all records. Latest Instant Time ={}", commitInstantTime2);
       spark.sql("select * from hoodie_ro").show(200, false);
       long numRecordsAtInstant2 =
           spark.sql("select * from hoodie_ro where _hoodie_commit_time = " + commitInstantTime2).count();
@@ -347,11 +345,11 @@ public class HoodieJavaStreamingApp {
       Dataset<Row> hoodieIncViewDF = spark.read().format("hudi")
           .option(DataSourceReadOptions.QUERY_TYPE().key(), DataSourceReadOptions.QUERY_TYPE_INCREMENTAL_OPT_VAL())
           // Only changes in write 2 above
-          .option(DataSourceReadOptions.BEGIN_INSTANTTIME().key(), commitInstantTime1)
+          .option(DataSourceReadOptions.START_COMMIT().key(), commitInstantTime1)
           // For incremental view, pass in the root/base path of dataset
           .load(tablePath);
 
-      LOG.info("You will only see records from : " + commitInstantTime2);
+      log.info("You will only see records from: {}", commitInstantTime2);
       hoodieIncViewDF.groupBy(hoodieIncViewDF.col("_hoodie_commit_time")).count().show();
     }
     return numExpCommits;
@@ -372,7 +370,7 @@ public class HoodieJavaStreamingApp {
         .option(DataSourceWriteOptions.TABLE_TYPE().key(), tableType)
         .option(DataSourceWriteOptions.RECORDKEY_FIELD().key(), "_row_key")
         .option(DataSourceWriteOptions.PARTITIONPATH_FIELD().key(), "partition")
-        .option(DataSourceWriteOptions.PRECOMBINE_FIELD().key(), "timestamp")
+        .option(HoodieTableConfig.ORDERING_FIELDS.key(), "timestamp")
         .option(HoodieCompactionConfig.INLINE_COMPACT_NUM_DELTA_COMMITS.key(), "1")
         .option(DataSourceWriteOptions.ASYNC_COMPACT_ENABLE().key(), "true")
         .option(DataSourceWriteOptions.ASYNC_CLUSTERING_ENABLE().key(), "true")
@@ -393,7 +391,7 @@ public class HoodieJavaStreamingApp {
    */
   private DataStreamWriter<Row> updateHiveSyncConfig(DataStreamWriter<Row> writer) {
     if (enableHiveSync) {
-      LOG.info("Enabling Hive sync to " + hiveJdbcUrl);
+      log.info("Enabling Hive sync to {}", hiveJdbcUrl);
       writer = writer.option(META_SYNC_TABLE_NAME.key(), hiveTable)
           .option(META_SYNC_DATABASE_NAME.key(), hiveDB)
           .option(HIVE_URL.key(), hiveJdbcUrl)

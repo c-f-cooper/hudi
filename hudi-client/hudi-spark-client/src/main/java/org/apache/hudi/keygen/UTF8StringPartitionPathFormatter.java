@@ -18,6 +18,7 @@
 package org.apache.hudi.keygen;
 
 import org.apache.hudi.common.util.PartitionPathEncodeUtils;
+
 import org.apache.spark.unsafe.types.UTF8String;
 
 import java.util.function.Supplier;
@@ -33,9 +34,10 @@ public class UTF8StringPartitionPathFormatter extends PartitionPathFormatterBase
   protected static final UTF8String HUDI_DEFAULT_PARTITION_PATH_UTF8 = UTF8String.fromString(HUDI_DEFAULT_PARTITION_PATH);
 
   public UTF8StringPartitionPathFormatter(Supplier<StringBuilder<UTF8String>> stringBuilderFactory,
-                                   boolean useHiveStylePartitioning,
-                                   boolean useEncoding) {
-    super(stringBuilderFactory, useHiveStylePartitioning, useEncoding);
+                                          boolean useHiveStylePartitioning,
+                                          boolean useEncoding,
+                                          boolean slashSeparatedDatePartitioning) {
+    super(stringBuilderFactory, useHiveStylePartitioning, useEncoding, slashSeparatedDatePartitioning);
   }
 
   @Override

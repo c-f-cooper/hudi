@@ -45,7 +45,7 @@ public class SparkInsertOverwriteTableCommitActionExecutor<T>
 
   @Override
   protected Map<String, List<String>> getPartitionToReplacedFileIds(HoodieWriteMetadata<HoodieData<WriteStatus>> writeMetadata) {
-    List<String> partitionPaths = FSUtils.getAllPartitionPaths(context, config.getMetadataConfig(), table.getMetaClient().getBasePath());
+    List<String> partitionPaths = FSUtils.getAllPartitionPaths(context, table.getMetaClient(), config.getMetadataConfig());
     if (partitionPaths == null || partitionPaths.isEmpty()) {
       return Collections.emptyMap();
     }

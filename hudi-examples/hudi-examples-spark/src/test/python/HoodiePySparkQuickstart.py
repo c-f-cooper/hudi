@@ -34,9 +34,8 @@ class ExamplePySpark:
             'hoodie.table.name': tableName,
             'hoodie.datasource.write.recordkey.field': 'uuid',
             'hoodie.datasource.write.partitionpath.field': 'partitionpath',
-            'hoodie.datasource.write.table.name': tableName,
             'hoodie.datasource.write.operation': 'upsert',
-            'hoodie.datasource.write.precombine.field': 'ts',
+            'hoodie.table.ordering.fields': 'ts',
             'hoodie.upsert.shuffle.parallelism': 2,
             'hoodie.insert.shuffle.parallelism': 2
         }
@@ -162,9 +161,8 @@ class ExamplePySpark:
         'hoodie.table.name': self.tableName,
         'hoodie.datasource.write.recordkey.field': 'uuid',
         'hoodie.datasource.write.partitionpath.field': 'partitionpath',
-        'hoodie.datasource.write.table.name': self.tableName,
         'hoodie.datasource.write.operation': 'upsert',
-        'hoodie.datasource.write.precombine.field': 'ts',
+        'hoodie.table.ordering.fields': 'ts',
         'hoodie.upsert.shuffle.parallelism': 2, 
         'hoodie.insert.shuffle.parallelism': 2
         }
@@ -197,9 +195,8 @@ class ExamplePySpark:
             'hoodie.table.name': self.tableName,
             'hoodie.datasource.write.recordkey.field': 'uuid',
             'hoodie.datasource.write.partitionpath.field': 'partitionpath',
-            'hoodie.datasource.write.table.name': self.tableName,
             'hoodie.datasource.write.operation': 'delete',
-            'hoodie.datasource.write.precombine.field': 'ts',
+            'hoodie.table.ordering.fields': 'ts',
             'hoodie.upsert.shuffle.parallelism': 2, 
             'hoodie.insert.shuffle.parallelism': 2
         }
@@ -225,9 +222,8 @@ class ExamplePySpark:
             'hoodie.table.name': self.tableName,
             'hoodie.datasource.write.recordkey.field': 'uuid',
             'hoodie.datasource.write.partitionpath.field': 'partitionpath',
-            'hoodie.datasource.write.table.name': self.tableName,
             'hoodie.datasource.write.operation': 'insert_overwrite',
-            'hoodie.datasource.write.precombine.field': 'ts',
+            'hoodie.table.ordering.fields': 'ts',
             'hoodie.upsert.shuffle.parallelism': 2,
             'hoodie.insert.shuffle.parallelism': 2
         }

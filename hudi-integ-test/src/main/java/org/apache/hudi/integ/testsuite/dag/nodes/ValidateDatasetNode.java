@@ -24,19 +24,18 @@ import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.integ.testsuite.configuration.DeltaConfig;
 import org.apache.hudi.integ.testsuite.dag.ExecutionContext;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.types.StructType;
 import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * This validation node uses spark datasource for comparison purposes.
  */
+@Slf4j
 public class ValidateDatasetNode extends BaseValidateDatasetNode {
-
-  private static final Logger LOG = LoggerFactory.getLogger(ValidateDatasetNode.class);
 
   public ValidateDatasetNode(DeltaConfig.Config config) {
     super(config);
@@ -44,14 +43,14 @@ public class ValidateDatasetNode extends BaseValidateDatasetNode {
 
   @Override
   public Logger getLogger() {
-    return LOG;
+    return log;
   }
 
   @Override
   public Dataset<Row> getDatasetToValidate(SparkSession session, ExecutionContext context,
                                            StructType inputSchema) {
     String partitionPathField = context.getWriterContext().getProps().getString(DataSourceWriteOptions.PARTITIONPATH_FIELD().key());
-    String hudiPath = context.getHoodieTestSuiteWriter().getCfg().targetBasePath + (partitionPathField.isEmpty() ? "/" : "/*/*/*");
+    String hudiPath = context.getHoodieTestSuiteWriter().getCfg().targetBasePath;
     Dataset<Row> hudiDf = session.read().option(HoodieMetadataConfig.ENABLE.key(), String.valueOf(context.getHoodieTestSuiteWriter().getCfg().enableMetadataOnRead))
         .format("hudi").load(hudiPath);
     return hudiDf.drop(HoodieRecord.COMMIT_TIME_METADATA_FIELD).drop(HoodieRecord.COMMIT_SEQNO_METADATA_FIELD).drop(HoodieRecord.RECORD_KEY_METADATA_FIELD)

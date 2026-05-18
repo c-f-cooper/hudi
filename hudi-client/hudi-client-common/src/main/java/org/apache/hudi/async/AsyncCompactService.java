@@ -21,13 +21,11 @@ import org.apache.hudi.client.BaseCompactor;
 import org.apache.hudi.client.BaseHoodieWriteClient;
 import org.apache.hudi.common.engine.EngineProperty;
 import org.apache.hudi.common.engine.HoodieEngineContext;
-import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.util.CustomizedThreadFactory;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.exception.HoodieIOException;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
@@ -38,6 +36,7 @@ import java.util.stream.IntStream;
 /**
  * Async Compactor Service that runs in separate thread. Currently, only one compactor is allowed to run at any time.
  */
+@Slf4j
 public abstract class AsyncCompactService extends HoodieAsyncTableService {
 
   /**
@@ -45,10 +44,9 @@ public abstract class AsyncCompactService extends HoodieAsyncTableService {
    */
   public static final String COMPACT_POOL_NAME = "hoodiecompact";
   private static final long serialVersionUID = 1L;
-  private static final Logger LOG = LoggerFactory.getLogger(AsyncCompactService.class);
   private final int maxConcurrentCompaction;
   protected transient HoodieEngineContext context;
-  private transient BaseCompactor compactor;
+  private final transient BaseCompactor compactor;
 
   public AsyncCompactService(HoodieEngineContext context, BaseHoodieWriteClient client) {
     this(context, client, false);
@@ -73,29 +71,29 @@ public abstract class AsyncCompactService extends HoodieAsyncTableService {
     return Pair.of(CompletableFuture.allOf(IntStream.range(0, maxConcurrentCompaction).mapToObj(i -> CompletableFuture.supplyAsync(() -> {
       try {
         // Set Compactor Pool Name for allowing users to prioritize compaction
-        LOG.info("Setting pool name for compaction to " + COMPACT_POOL_NAME);
+        log.info("Setting pool name for compaction to " + COMPACT_POOL_NAME);
         context.setProperty(EngineProperty.COMPACTION_POOL_NAME, COMPACT_POOL_NAME);
 
         while (!isShutdownRequested()) {
-          final HoodieInstant instant = fetchNextAsyncServiceInstant();
+          final String instantTime = fetchNextAsyncServiceInstant();
 
-          if (null != instant) {
-            LOG.info("Starting Compaction for instant " + instant);
-            compactor.compact(instant);
-            LOG.info("Finished Compaction for instant " + instant);
+          if (null != instantTime) {
+            log.info("Starting Compaction for instant " + instantTime);
+            compactor.compact(instantTime);
+            log.info("Finished Compaction for instant " + instantTime);
           }
         }
-        LOG.info("Compactor shutting down properly!!");
+        log.info("Compactor shutting down properly!!");
       } catch (InterruptedException ie) {
         hasError = true;
-        LOG.warn("Compactor executor thread got interrupted exception. Stopping", ie);
+        log.warn("Compactor executor thread got interrupted exception. Stopping", ie);
       } catch (IOException e) {
         hasError = true;
-        LOG.error("Compactor executor failed due to IOException", e);
+        log.error("Compactor executor failed due to IOException", e);
         throw new HoodieIOException(e.getMessage(), e);
       } catch (Exception e) {
         hasError = true;
-        LOG.error("Compactor executor failed", e);
+        log.error("Compactor executor failed", e);
         throw e;
       }
       return true;

@@ -17,11 +17,12 @@
 
 package org.apache.spark.sql.parser
 
+import org.apache.hudi.SparkAdapterSupport
+import org.apache.hudi.spark.sql.parser.{HoodieSqlCommonLexer, HoodieSqlCommonParser}
+
 import org.antlr.v4.runtime.{CharStream, CharStreams, CodePointCharStream, CommonTokenStream, IntStream}
 import org.antlr.v4.runtime.atn.PredictionMode
 import org.antlr.v4.runtime.misc.{Interval, ParseCancellationException}
-import org.apache.hudi.SparkAdapterSupport
-import org.apache.hudi.spark.sql.parser.{HoodieSqlCommonLexer, HoodieSqlCommonParser}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
@@ -30,6 +31,8 @@ import org.apache.spark.sql.catalyst.parser.{ParseErrorListener, ParseException,
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.trees.Origin
 import org.apache.spark.sql.types.{DataType, StructType}
+
+import scala.jdk.CollectionConverters._
 
 class HoodieCommonSqlParser(session: SparkSession, delegate: ParserInterface)
   extends ParserInterface with Logging with SparkAdapterSupport {
@@ -108,9 +111,11 @@ class HoodieCommonSqlParser(session: SparkSession, delegate: ParserInterface)
         throw e.withCommand(command)
       case e: AnalysisException =>
         val position = Origin(e.line, e.startPosition)
-        throw new ParseException(Option(command), e.message, position, position)
+        throw sparkAdapter.newParseException(Option(command), e, position, position)
     }
   }
+
+  def parseRoutineParam(sqlText: String): StructType = throw new UnsupportedOperationException()
 }
 
 /**

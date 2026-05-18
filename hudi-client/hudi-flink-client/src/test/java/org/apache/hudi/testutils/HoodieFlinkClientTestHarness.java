@@ -18,7 +18,6 @@
 
 package org.apache.hudi.testutils;
 
-import org.apache.hudi.client.FlinkTaskContextSupplier;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
 import org.apache.hudi.client.common.HoodieFlinkEngineContext;
 import org.apache.hudi.common.data.HoodieData;
@@ -32,9 +31,9 @@ import org.apache.hudi.common.testutils.HoodieTestUtils;
 import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.index.bloom.TestFlinkHoodieBloomIndex;
+import org.apache.hudi.storage.StorageConfiguration;
 import org.apache.hudi.table.HoodieTable;
 
-import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocalFileSystem;
@@ -42,7 +41,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 
@@ -54,22 +52,20 @@ import static org.apache.hudi.common.util.ValidationUtils.checkState;
 public class HoodieFlinkClientTestHarness extends HoodieCommonTestHarness {
 
   protected static final Logger LOG = LoggerFactory.getLogger(HoodieFlinkClientTestHarness.class);
-  protected Configuration hadoopConf;
+  protected StorageConfiguration<Configuration> storageConf;
   protected FileSystem fs;
   protected HoodieFlinkEngineContext context;
   protected ExecutorService executorService;
   protected HoodieFlinkWriteClient writeClient;
   protected HoodieTableFileSystemView tableView;
 
-  protected final FlinkTaskContextSupplier supplier = new FlinkTaskContextSupplier(null);
-
   protected void initFileSystem() {
-    hadoopConf = new Configuration();
-    initFileSystemWithConfiguration(hadoopConf);
-    context = new HoodieFlinkEngineContext(supplier);
+    storageConf = HoodieTestUtils.getDefaultStorageConf();
+    initFileSystemWithConfiguration(storageConf);
+    context = HoodieFlinkEngineContext.DEFAULT;
   }
 
-  private void initFileSystemWithConfiguration(Configuration configuration) {
+  private void initFileSystemWithConfiguration(StorageConfiguration<Configuration> configuration) {
     checkState(basePath != null);
     fs = HadoopFSUtils.getFs(basePath, configuration);
     if (fs instanceof LocalFileSystem) {
@@ -93,7 +89,7 @@ public class HoodieFlinkClientTestHarness extends HoodieCommonTestHarness {
 
   protected void initMetaClient(HoodieTableType tableType) throws IOException {
     checkState(basePath != null);
-    metaClient = HoodieTestUtils.init(hadoopConf, basePath, tableType);
+    metaClient = HoodieTestUtils.init(storageConf, basePath, tableType);
   }
 
   protected List<HoodieRecord> tagLocation(
@@ -123,21 +119,6 @@ public class HoodieFlinkClientTestHarness extends HoodieCommonTestHarness {
     cleanupTestDataGenerator();
     cleanupFileSystem();
     cleanupExecutorService();
-    System.gc();
-  }
-
-  /**
-   * Simple test sink function.
-   */
-  public static class SimpleTestSinkFunction implements SinkFunction<HoodieRecord> {
-
-    // must be static
-    public static List<HoodieRecord> valuesList = new ArrayList<>();
-
-    @Override
-    public synchronized void invoke(HoodieRecord value, Context context) throws Exception {
-      valuesList.add(value);
-    }
   }
 
   /**

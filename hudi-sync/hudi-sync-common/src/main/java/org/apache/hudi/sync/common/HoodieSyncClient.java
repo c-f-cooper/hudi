@@ -21,49 +21,54 @@ package org.apache.hudi.sync.common;
 import org.apache.hudi.common.engine.HoodieLocalEngineContext;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.TableSchemaResolver;
+import org.apache.hudi.common.table.ParquetTableSchemaResolver;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.table.timeline.TimelineUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
-import org.apache.hudi.hadoop.fs.CachingPath;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
+import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.sync.common.model.Partition;
 import org.apache.hudi.sync.common.model.PartitionEvent;
 import org.apache.hudi.sync.common.model.PartitionValueExtractor;
 
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.fs.Path;
-import org.apache.parquet.schema.MessageType;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_BASE_PATH;
+import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_DATABASE_NAME;
 import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_PARTITION_EXTRACTOR_CLASS;
+import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_TABLE_NAME;
+import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_TOUCH_PARTITIONS_ENABLED;
 import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_USE_FILE_LISTING_FROM_METADATA;
 
+@Slf4j
 public abstract class HoodieSyncClient implements HoodieMetaSyncOperations, AutoCloseable {
-
-  private static final Logger LOG = LoggerFactory.getLogger(HoodieSyncClient.class);
 
   protected final HoodieSyncConfig config;
   protected final PartitionValueExtractor partitionValueExtractor;
+  @Getter
   protected final HoodieTableMetaClient metaClient;
+  protected final ParquetTableSchemaResolver tableSchemaResolver;
+  private static final String TEMP_SUFFIX = "_temp";
 
-  public HoodieSyncClient(HoodieSyncConfig config) {
+  public HoodieSyncClient(HoodieSyncConfig config, HoodieTableMetaClient metaClient) {
     this.config = config;
     this.partitionValueExtractor = ReflectionUtils.loadClass(config.getStringOrDefault(META_SYNC_PARTITION_EXTRACTOR_CLASS));
-    this.metaClient = HoodieTableMetaClient.builder()
-        .setConf(config.getHadoopConf())
-        .setBasePath(config.getString(META_SYNC_BASE_PATH))
-        .setLoadActiveTimelineOnLoad(true)
-        .build();
+    this.metaClient = Objects.requireNonNull(metaClient, "metaClient is null");
+    this.tableSchemaResolver = new ParquetTableSchemaResolver(metaClient);
   }
 
   public HoodieTimeline getActiveTimeline() {
@@ -75,15 +80,19 @@ public abstract class HoodieSyncClient implements HoodieMetaSyncOperations, Auto
   }
 
   public String getBasePath() {
-    return metaClient.getBasePathV2().toString();
+    return metaClient.getBasePath().toString();
   }
 
   public boolean isBootstrap() {
     return metaClient.getTableConfig().getBootstrapBasePath().isPresent();
   }
 
-  public HoodieTableMetaClient getMetaClient() {
-    return metaClient;
+  public String getTableName() {
+    return config.getString(META_SYNC_TABLE_NAME);
+  }
+
+  public String getDatabaseName() {
+    return config.getString(META_SYNC_DATABASE_NAME);
   }
 
   /**
@@ -92,28 +101,40 @@ public abstract class HoodieSyncClient implements HoodieMetaSyncOperations, Auto
    * Going through archive timeline is a costly operation, and it should be avoided unless some start time is given.
    */
   public Set<String> getDroppedPartitionsSince(Option<String> lastCommitTimeSynced, Option<String> lastCommitCompletionTimeSynced) {
-    HoodieTimeline timeline = lastCommitTimeSynced.isPresent()
-        ? TimelineUtils.getCommitsTimelineAfter(metaClient, lastCommitTimeSynced.get(), lastCommitCompletionTimeSynced)
-        : metaClient.getActiveTimeline();
-    return new HashSet<>(TimelineUtils.getDroppedPartitions(timeline));
+    return new HashSet<>(TimelineUtils.getDroppedPartitions(metaClient, lastCommitTimeSynced, lastCommitCompletionTimeSynced));
   }
 
   @Override
-  public MessageType getStorageSchema() {
+  public HoodieSchema getStorageSchema() {
     try {
-      return new TableSchemaResolver(metaClient).getTableParquetSchema();
+      return tableSchemaResolver.getTableSchema();
     } catch (Exception e) {
-      throw new HoodieSyncException("Failed to read schema from storage.", e);
+      throw new HoodieSyncException(buildSchemaReadErrorMessage(e), e);
     }
   }
 
   @Override
-  public MessageType getStorageSchema(boolean includeMetadataField) {
+  public HoodieSchema getStorageSchema(boolean includeMetadataField) {
     try {
-      return new TableSchemaResolver(metaClient).getTableParquetSchema(includeMetadataField);
+      return tableSchemaResolver.getTableSchema(includeMetadataField);
     } catch (Exception e) {
-      throw new HoodieSyncException("Failed to read schema from storage.", e);
+      throw new HoodieSyncException(buildSchemaReadErrorMessage(e), e);
     }
+  }
+
+  private String buildSchemaReadErrorMessage(Exception e) {
+    String errorMessage = e.getMessage() != null ? e.getMessage() : e.getClass().getName();
+    if (e instanceof java.io.FileNotFoundException) {
+      return String.format(
+          "Cannot read Hudi table schema.%n%n"
+              + "Required data file missing .%n%n"
+              + "This indicates:%n"
+              + "  1. Aggressive cleaner retention compared to query run times\n"
+              + "  2. Manual file deletions (timeline files or data files)\n"
+              + "  3. Concurrent writers without proper locking or configurations set\n\n"
+              + "Original error: %s", errorMessage);
+    }
+    return String.format("Failed to read schema from storage.%nError: %s", errorMessage);
   }
 
   /**
@@ -122,20 +143,19 @@ public abstract class HoodieSyncClient implements HoodieMetaSyncOperations, Auto
    * @return All relative partitions paths.
    */
   public List<String> getAllPartitionPathsOnStorage() {
-    HoodieLocalEngineContext engineContext = new HoodieLocalEngineContext(metaClient.getHadoopConf());
+    HoodieLocalEngineContext engineContext = new HoodieLocalEngineContext(metaClient.getStorageConf());
     return FSUtils.getAllPartitionPaths(engineContext,
-        config.getString(META_SYNC_BASE_PATH),
+        metaClient,
         config.getBoolean(META_SYNC_USE_FILE_LISTING_FROM_METADATA));
   }
 
   public List<String> getWrittenPartitionsSince(Option<String> lastCommitTimeSynced, Option<String> lastCommitCompletionTimeSynced) {
     if (!lastCommitTimeSynced.isPresent()) {
-      LOG.info("Last commit time synced is not known, listing all partitions in "
-          + config.getString(META_SYNC_BASE_PATH)
-          + ",FS :" + config.getHadoopFileSystem());
+      log.info("Last commit time synced is not known, listing all partitions in {} , FS: {}",
+          config.getString(META_SYNC_BASE_PATH), config.getHadoopFileSystem());
       return getAllPartitionPathsOnStorage();
     } else {
-      LOG.info("Last commit time synced is " + lastCommitTimeSynced.get() + ", Getting commits since then");
+      log.info("Last commit time synced is {}, Getting commits since then", lastCommitTimeSynced.get());
       return TimelineUtils.getWrittenPartitions(
           TimelineUtils.getCommitsTimelineAfter(metaClient, lastCommitTimeSynced.get(), lastCommitCompletionTimeSynced));
     }
@@ -161,7 +181,8 @@ public abstract class HoodieSyncClient implements HoodieMetaSyncOperations, Auto
 
     List<PartitionEvent> events = new ArrayList<>();
     for (String storagePartition : allPartitionsOnStorage) {
-      Path storagePartitionPath = FSUtils.getPartitionPath(config.getString(META_SYNC_BASE_PATH), storagePartition);
+      Path storagePartitionPath =
+          HadoopFSUtils.constructAbsolutePathInHadoopPath(config.getString(META_SYNC_BASE_PATH), storagePartition);
       String fullStoragePartitionPath = Path.getPathWithoutSchemeAndAuthority(storagePartitionPath).toUri().getPath();
       // Check if the partition values or if hdfs path is the same
       List<String> storagePartitionValues = partitionValueExtractor.extractPartitionValuesInPath(storagePartition);
@@ -183,11 +204,11 @@ public abstract class HoodieSyncClient implements HoodieMetaSyncOperations, Auto
       String storagePath = paths.get(storageValue);
       try {
         String relativePath = FSUtils.getRelativePartitionPath(
-            metaClient.getBasePathV2(), new CachingPath(storagePath));
+            metaClient.getBasePath(), new StoragePath(storagePath));
         events.add(PartitionEvent.newPartitionDropEvent(relativePath));
       } catch (IllegalArgumentException e) {
-        LOG.error("Cannot parse the path stored in the metastore, ignoring it for "
-            + "generating DROP partition event: \"" + storagePath + "\".", e);
+        log.error("Cannot parse the path stored in the metastore, ignoring it for generating DROP partition event: \"{}\".",
+            storagePath, e);
       }
     });
     return events;
@@ -204,20 +225,27 @@ public abstract class HoodieSyncClient implements HoodieMetaSyncOperations, Auto
 
     List<PartitionEvent> events = new ArrayList<>();
     for (String storagePartition : writtenPartitionsOnStorage) {
-      Path storagePartitionPath = FSUtils.getPartitionPath(config.getString(META_SYNC_BASE_PATH), storagePartition);
+      Path storagePartitionPath =
+          HadoopFSUtils.constructAbsolutePathInHadoopPath(config.getString(META_SYNC_BASE_PATH), storagePartition);
       String fullStoragePartitionPath = Path.getPathWithoutSchemeAndAuthority(storagePartitionPath).toUri().getPath();
       // Check if the partition values or if hdfs path is the same
       List<String> storagePartitionValues = partitionValueExtractor.extractPartitionValuesInPath(storagePartition);
 
-      if (droppedPartitionsOnStorage.contains(storagePartition)) {
-        events.add(PartitionEvent.newPartitionDropEvent(storagePartition));
-      } else {
-        if (!storagePartitionValues.isEmpty()) {
-          String storageValue = String.join(", ", storagePartitionValues);
+      if (!storagePartitionValues.isEmpty()) {
+        String storageValue = String.join(", ", storagePartitionValues);
+        if (droppedPartitionsOnStorage.contains(storagePartition)) {
+          if (paths.containsKey(storageValue)) {
+            // Add partition drop event only if it exists in the metastore
+            events.add(PartitionEvent.newPartitionDropEvent(storagePartition));
+          }
+        } else {
           if (!paths.containsKey(storageValue)) {
             events.add(PartitionEvent.newPartitionAddEvent(storagePartition));
           } else if (!paths.get(storageValue).equals(fullStoragePartitionPath)) {
             events.add(PartitionEvent.newPartitionUpdateEvent(storagePartition));
+          } else if (config.getBoolean(META_SYNC_TOUCH_PARTITIONS_ENABLED)) {
+            // Only produce TOUCH events when touch partitions is enabled
+            events.add(PartitionEvent.newPartitionTouchEvent(storagePartition));
           }
         }
       }
@@ -241,5 +269,9 @@ public abstract class HoodieSyncClient implements HoodieMetaSyncOperations, Auto
       paths.put(String.join(", ", hivePartitionValues), fullTablePartitionPath);
     }
     return paths;
+  }
+
+  protected String generateTempTableName(String tableName) {
+    return tableName + TEMP_SUFFIX + ZonedDateTime.now().toEpochSecond();
   }
 }

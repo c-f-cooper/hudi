@@ -20,6 +20,8 @@ package org.apache.hudi.common.util;
 
 import org.apache.hudi.exception.HoodieException;
 
+import lombok.Getter;
+
 import java.util.ArrayDeque;
 import java.util.Deque;
 
@@ -46,7 +48,9 @@ public class HoodieTimer {
     }
   }
 
+  @Getter
   static class TimeInfo {
+
     // captures the startTime of the code block
     long startTime;
     // is the timing still running for the last started timer
@@ -55,14 +59,6 @@ public class HoodieTimer {
     public TimeInfo(long startTime) {
       this.startTime = startTime;
       this.isRunning = true;
-    }
-
-    public long getStartTime() {
-      return startTime;
-    }
-
-    public boolean isRunning() {
-      return isRunning;
     }
 
     public long stop() {
@@ -81,6 +77,17 @@ public class HoodieTimer {
       throw new HoodieException("Timer was not started");
     }
     return timeInfoDeque.pop().stop();
+  }
+
+  /**
+   * tries to end the timer but will not cause a runtime failure like endTimer will if the queue is empty
+   * @return option of the timer duration, empty option if the queue is empty
+   */
+  public Option<Long> tryEndTimer() {
+    if (timeInfoDeque.isEmpty()) {
+      return Option.empty();
+    }
+    return Option.of(timeInfoDeque.pop().stop());
   }
 
   /**

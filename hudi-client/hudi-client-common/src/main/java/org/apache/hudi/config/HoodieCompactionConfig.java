@@ -24,6 +24,7 @@ import org.apache.hudi.common.config.ConfigProperty;
 import org.apache.hudi.common.config.HoodieConfig;
 import org.apache.hudi.common.config.HoodieReaderConfig;
 import org.apache.hudi.table.action.compact.CompactionTriggerStrategy;
+import org.apache.hudi.table.action.compact.plan.generators.HoodieCompactionPlanGenerator;
 import org.apache.hudi.table.action.compact.strategy.CompactionStrategy;
 import org.apache.hudi.table.action.compact.strategy.LogFileSizeBasedCompactionStrategy;
 
@@ -33,8 +34,6 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.util.Properties;
-
-import static org.apache.hudi.common.config.HoodieReaderConfig.ENABLE_OPTIMIZED_LOG_BLOCKS_SCAN;
 
 /**
  * Compaction related config.
@@ -146,7 +145,7 @@ public class HoodieCompactionConfig extends HoodieConfig {
       .markAdvanced()
       .withDocumentation("Compaction strategy decides which file groups are picked up for "
           + "compaction during each compaction run. By default. Hudi picks the log file "
-          + "with most accumulated unmerged data");
+          + "with most accumulated unmerged data. The strategy can be composed with multiple strategies by concatenating the class names with ','.");
 
   public static final ConfigProperty<String> TARGET_PARTITIONS_PER_DAYBASED_COMPACTION = ConfigProperty
       .key("hoodie.compaction.daybased.target.partitions")
@@ -154,6 +153,13 @@ public class HoodieCompactionConfig extends HoodieConfig {
       .markAdvanced()
       .withDocumentation("Used by org.apache.hudi.io.compact.strategy.DayBasedCompactionStrategy to denote the number of "
           + "latest partitions to compact during a compaction run.");
+
+  public static final ConfigProperty<String> COMPACTION_SPECIFY_PARTITION_PATH_REGEX = ConfigProperty
+      .key("hoodie.compaction.partition.path.regex")
+      .noDefaultValue()
+      .markAdvanced()
+      .withDocumentation("Used to specify the partition path regex for compaction. "
+          + "Only partitions that match the regex will be compacted. Only be used when configure PartitionRegexBasedCompactionStrategy.");
 
   /**
    * Configs related to specific table types.
@@ -191,9 +197,14 @@ public class HoodieCompactionConfig extends HoodieConfig {
       .withDocumentation("Log compaction can be scheduled if the no. of log blocks crosses this threshold value. "
           + "This is effective only when log compaction is enabled via " + INLINE_LOG_COMPACT.key());
 
-  /**
-   * @deprecated Use {@link #INLINE_COMPACT} and its methods instead
-   */
+  public static final ConfigProperty<String> COMPACTION_PLAN_GENERATOR = ConfigProperty
+      .key("hoodie.compaction.plan.generator")
+      .defaultValue(HoodieCompactionPlanGenerator.class.getName())
+      .markAdvanced()
+      .withDocumentation("Compaction plan generator for data files. Override with a custom plan generator "
+          + "if there's a need to use extraMetadata in the compaction plan for optimizations, ignore otherwise");
+
+  /** @deprecated Use {@link #INLINE_COMPACT} and its methods instead */
   @Deprecated
   public static final String INLINE_COMPACT_PROP = INLINE_COMPACT.key();
   /**
@@ -401,8 +412,15 @@ public class HoodieCompactionConfig extends HoodieConfig {
       return this;
     }
 
-    public Builder withCompactionStrategy(CompactionStrategy compactionStrategy) {
-      compactionConfig.setValue(COMPACTION_STRATEGY, compactionStrategy.getClass().getName());
+    public Builder withCompactionStrategy(CompactionStrategy... compactionStrategies) {
+      StringBuilder compactionStrategyBuilder = new StringBuilder();
+      for (CompactionStrategy compactionStrategy : compactionStrategies) {
+        compactionStrategyBuilder.append(compactionStrategy.getClass().getName()).append(",");
+      }
+      if (compactionStrategyBuilder.length() > 0) {
+        compactionStrategyBuilder.deleteCharAt(compactionStrategyBuilder.length() - 1);
+      }
+      compactionConfig.setValue(COMPACTION_STRATEGY, compactionStrategyBuilder.toString());
       return this;
     }
 
@@ -456,8 +474,8 @@ public class HoodieCompactionConfig extends HoodieConfig {
       return this;
     }
 
-    public Builder withEnableOptimizedLogBlocksScan(String enableOptimizedLogBlocksScan) {
-      compactionConfig.setValue(ENABLE_OPTIMIZED_LOG_BLOCKS_SCAN, enableOptimizedLogBlocksScan);
+    public Builder withCompactionSpecifyPartitionPathRegex(String partitionPathRegex) {
+      compactionConfig.setValue(COMPACTION_SPECIFY_PARTITION_PATH_REGEX, partitionPathRegex);
       return this;
     }
 

@@ -18,9 +18,12 @@
 
 package org.apache.hudi.integ.testsuite.writer;
 
-import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 import org.apache.hudi.hadoop.fs.HoodieWrapperFileSystem;
+import org.apache.hudi.storage.StoragePath;
 
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.Schema;
 import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericDatumWriter;
@@ -30,8 +33,6 @@ import org.apache.avro.io.DatumWriter;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -40,10 +41,10 @@ import java.util.UUID;
 /**
  * Implementation of {@link DeltaInputWriter} that writes avro records to the result file.
  */
+@Slf4j
 public class AvroFileDeltaInputWriter implements DeltaInputWriter<GenericRecord> {
 
   public static final String AVRO_EXTENSION = ".avro";
-  private static Logger log = LoggerFactory.getLogger(AvroFileDeltaInputWriter.class);
   // The maximum file size for an avro file before being rolled over to a new one
   private final Long maxFileSize;
   private final Configuration configuration;
@@ -57,6 +58,7 @@ public class AvroFileDeltaInputWriter implements DeltaInputWriter<GenericRecord>
   private DataFileWriter<IndexedRecord> dataFileWriter;
   private OutputStream output;
   private Schema schema;
+  @Getter
   private DeltaWriteStats deltaWriteStats;
   private long recordsWritten = 0;
 
@@ -67,10 +69,10 @@ public class AvroFileDeltaInputWriter implements DeltaInputWriter<GenericRecord>
     this.maxFileSize = maxFileSize;
     this.configuration = configuration;
     this.basePath = basePath;
-    Path path = new Path(basePath, new Path(UUID.randomUUID().toString() + AVRO_EXTENSION));
+    StoragePath path = new StoragePath(basePath, UUID.randomUUID().toString() + AVRO_EXTENSION);
     this.file = HoodieWrapperFileSystem.convertToHoodiePath(path, configuration);
     this.fs = (HoodieWrapperFileSystem) this.file
-        .getFileSystem(FSUtils.registerFileSystem(path, configuration));
+        .getFileSystem(HadoopFSUtils.registerFileSystem(path, configuration));
     this.output = this.fs.create(this.file);
     this.writer = new GenericDatumWriter(schema);
     this.dataFileWriter = new DataFileWriter<>(writer).create(schema, output);
@@ -110,10 +112,5 @@ public class AvroFileDeltaInputWriter implements DeltaInputWriter<GenericRecord>
 
   public Path getPath() {
     return this.file;
-  }
-
-  @Override
-  public DeltaWriteStats getDeltaWriteStats() {
-    return this.deltaWriteStats;
   }
 }

@@ -35,8 +35,7 @@ import org.apache.hudi.table.HoodieFlinkTable;
 import org.apache.hudi.table.action.cluster.strategy.UpdateStrategy;
 import org.apache.hudi.table.action.cluster.util.ConsistentHashingUpdateStrategyUtils;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -51,14 +50,15 @@ import java.util.stream.Collectors;
  * Update strategy for consistent hashing bucket index. If updates to file groups that are under clustering are identified,
  * then the current batch of records will route to both old and new file groups
  * (i.e., dual write).
+ *
+ * TODO: remove this class when RowData mode writing is supported for COW.
  */
+@Slf4j
 public class FlinkConsistentBucketUpdateStrategy<T extends HoodieRecordPayload> extends UpdateStrategy<T, List<Pair<List<HoodieRecord>, String>>> {
 
-  private static final Logger LOG = LoggerFactory.getLogger(FlinkConsistentBucketUpdateStrategy.class);
-
   private boolean initialized = false;
-  private List<String> indexKeyFields;
-  private Map<String, Pair<String, ConsistentBucketIdentifier>> partitionToIdentifier;
+  private final List<String> indexKeyFields;
+  private final Map<String, Pair<String, ConsistentBucketIdentifier>> partitionToIdentifier;
   private String lastRefreshInstant = HoodieTimeline.INIT_INSTANT_TS;
 
   public FlinkConsistentBucketUpdateStrategy(HoodieFlinkWriteClient writeClient, List<String> indexKeyFields) {
@@ -75,13 +75,13 @@ public class FlinkConsistentBucketUpdateStrategy<T extends HoodieRecordPayload> 
     List<HoodieInstant> instants = ClusteringUtils.getPendingClusteringInstantTimes(table.getMetaClient());
     if (!instants.isEmpty()) {
       HoodieInstant latestPendingReplaceInstant = instants.get(instants.size() - 1);
-      if (latestPendingReplaceInstant.getTimestamp().compareTo(lastRefreshInstant) > 0) {
-        LOG.info("Found new pending replacement commit. Last pending replacement commit is {}.", latestPendingReplaceInstant);
+      if (latestPendingReplaceInstant.requestedTime().compareTo(lastRefreshInstant) > 0) {
+        log.info("Found new pending replacement commit. Last pending replacement commit is {}.", latestPendingReplaceInstant);
         this.table = table;
         this.fileGroupsInPendingClustering = table.getFileSystemView().getFileGroupsInPendingClustering()
             .map(Pair::getKey).collect(Collectors.toSet());
         // TODO throw exception if exists bucket merge plan
-        this.lastRefreshInstant = latestPendingReplaceInstant.getTimestamp();
+        this.lastRefreshInstant = latestPendingReplaceInstant.requestedTime();
         this.partitionToIdentifier.clear();
       }
     }
@@ -100,11 +100,15 @@ public class FlinkConsistentBucketUpdateStrategy<T extends HoodieRecordPayload> 
     Pair<List<HoodieRecord>, String> recordsInstantPair = recordsList.get(0);
     HoodieRecord sampleRecord = recordsInstantPair.getLeft().get(0);
     HoodieFileGroupId fileId = new HoodieFileGroupId(sampleRecord.getPartitionPath(), sampleRecord.getCurrentLocation().getFileId());
-    if (fileGroupsInPendingClustering.isEmpty() || !fileGroupsInPendingClustering.contains(fileId)) {
+    if (!needDualWrite(fileId)) {
       return Pair.of(recordsList, Collections.singleton(fileId));
     }
 
     return doHandleUpdate(fileId, recordsInstantPair);
+  }
+
+  public boolean needDualWrite(HoodieFileGroupId fileId) {
+    return !fileGroupsInPendingClustering.isEmpty() && fileGroupsInPendingClustering.contains(fileId);
   }
 
   private Pair<List<Pair<List<HoodieRecord>, String>>, Set<HoodieFileGroupId>> doHandleUpdate(HoodieFileGroupId fileId, Pair<List<HoodieRecord>, String> recordsInstantPair) {
@@ -125,7 +129,7 @@ public class FlinkConsistentBucketUpdateStrategy<T extends HoodieRecordPayload> 
       recordsList.add(Pair.of(e.getValue(), clusteringInstant));
       fgs.add(new HoodieFileGroupId(fileId.getPartitionPath(), newFileId));
     }
-    LOG.info("Apply duplicate update for FileGroup {}, routing records to: {}.", fileId, String.join(",", fileIdToRecords.keySet()));
+    log.info("Apply duplicate update for FileGroup {}, routing records to: {}.", fileId, String.join(",", fileIdToRecords.keySet()));
     // TODO add option to skip dual update, i.e., write updates only to the new file group
     recordsList.add(recordsInstantPair);
     fgs.add(fileId);

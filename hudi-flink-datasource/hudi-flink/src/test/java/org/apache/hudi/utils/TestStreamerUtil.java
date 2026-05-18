@@ -18,9 +18,17 @@
 
 package org.apache.hudi.utils;
 
+import org.apache.hudi.client.model.PartialUpdateFlinkRecordMerger;
+import org.apache.hudi.common.config.RecordMergeMode;
+import org.apache.hudi.common.model.EventTimeAvroPayload;
+import org.apache.hudi.common.model.OverwriteWithLatestAvroPayload;
+import org.apache.hudi.common.model.PartialUpdateAvroPayload;
 import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.util.FileIOUtils;
+import org.apache.hudi.common.table.HoodieTableVersion;
+import org.apache.hudi.common.testutils.HoodieTestUtils;
+import org.apache.hudi.io.util.FileIOUtils;
+import org.apache.hudi.common.util.collection.Triple;
 import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.configuration.HadoopConfigurations;
 import org.apache.hudi.hadoop.fs.HadoopFSUtils;
@@ -35,51 +43,108 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.HashMap;
 
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Test cases for {@link StreamerUtil}.
  */
-public class TestStreamerUtil {
+class TestStreamerUtil {
 
   @TempDir
   File tempFile;
+
+  @Test
+  void testInferMergingBehavior() {
+    Configuration conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
+    // default merge behavior
+    Triple<RecordMergeMode, String, String> mergeBehavior = StreamerUtil.inferMergingBehavior(conf);
+    assertEquals(RecordMergeMode.EVENT_TIME_ORDERING, mergeBehavior.getLeft());
+    assertEquals(EventTimeAvroPayload.class.getName(), mergeBehavior.getMiddle());
+    assertNull(mergeBehavior.getRight());
+
+    // set commit time merge mode
+    conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
+    conf.set(FlinkOptions.RECORD_MERGE_MODE, RecordMergeMode.COMMIT_TIME_ORDERING.name());
+    mergeBehavior = StreamerUtil.inferMergingBehavior(conf);
+    assertEquals(RecordMergeMode.COMMIT_TIME_ORDERING, mergeBehavior.getLeft());
+    assertEquals(OverwriteWithLatestAvroPayload.class.getName(), mergeBehavior.getMiddle());
+    assertNull(mergeBehavior.getRight());
+
+    // set partial update merger.
+    conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
+    conf.set(FlinkOptions.RECORD_MERGER_IMPLS, PartialUpdateFlinkRecordMerger.class.getName());
+    mergeBehavior = StreamerUtil.inferMergingBehavior(conf);
+    assertEquals(RecordMergeMode.EVENT_TIME_ORDERING, mergeBehavior.getLeft());
+    assertEquals(PartialUpdateAvroPayload.class.getName(), mergeBehavior.getMiddle());
+    assertNull(mergeBehavior.getRight());
+
+    // set partial update payload
+    conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
+    conf.set(FlinkOptions.PAYLOAD_CLASS_NAME, PartialUpdateAvroPayload.class.getName());
+    mergeBehavior = StreamerUtil.inferMergingBehavior(conf);
+    assertEquals(RecordMergeMode.EVENT_TIME_ORDERING, mergeBehavior.getLeft());
+    assertEquals(PartialUpdateAvroPayload.class.getName(), mergeBehavior.getMiddle());
+    assertNull(mergeBehavior.getRight());
+
+    // set partial update payload
+    conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
+    conf.set(FlinkOptions.PAYLOAD_CLASS_NAME, PartialUpdateAvroPayload.class.getName());
+    conf.set(FlinkOptions.WRITE_TABLE_VERSION, HoodieTableVersion.EIGHT.versionCode());
+    mergeBehavior = StreamerUtil.inferMergingBehavior(conf);
+    assertEquals(RecordMergeMode.EVENT_TIME_ORDERING, mergeBehavior.getLeft());
+    assertEquals(PartialUpdateAvroPayload.class.getName(), mergeBehavior.getMiddle());
+    assertNull(mergeBehavior.getRight());
+  }
+
+  @Test
+  void testInitTableWithSpecificVersion() throws IOException {
+    Configuration conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
+
+    // Test for partitioned table.
+    conf.set(FlinkOptions.PARTITION_PATH_FIELD, "p0,p1");
+    conf.set(FlinkOptions.WRITE_TABLE_VERSION, HoodieTableVersion.SIX.versionCode());
+    StreamerUtil.initTableIfNotExists(conf);
+
+    // Validate the partition fields & preCombineField in hoodie.properties.
+    HoodieTableMetaClient metaClient1 = HoodieTestUtils.createMetaClient(tempFile.getAbsolutePath());
+    assertArrayEquals(metaClient1.getTableConfig().getPartitionFields().get(), new String[] {"p0", "p1"});
+    assertNotNull(metaClient1.getTableConfig().getKeyGeneratorClassName());
+    assertEquals(HoodieTableVersion.SIX, metaClient1.getTableConfig().getTableVersion());
+  }
 
   @Test
   void testInitTableIfNotExists() throws IOException {
     Configuration conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
 
     // Test for partitioned table.
-    conf.setString(FlinkOptions.PRECOMBINE_FIELD, "ts");
-    conf.setString(FlinkOptions.PARTITION_PATH_FIELD, "p0,p1");
+    conf.set(FlinkOptions.ORDERING_FIELDS, "ts");
+    conf.set(FlinkOptions.PARTITION_PATH_FIELD, "p0,p1");
     StreamerUtil.initTableIfNotExists(conf);
 
     // Validate the partition fields & preCombineField in hoodie.properties.
-    HoodieTableMetaClient metaClient1 = HoodieTableMetaClient.builder()
-        .setBasePath(tempFile.getAbsolutePath())
-        .setConf(new org.apache.hadoop.conf.Configuration())
-        .build();
+    HoodieTableMetaClient metaClient1 = HoodieTestUtils.createMetaClient(tempFile.getAbsolutePath());
     assertTrue(metaClient1.getTableConfig().getPartitionFields().isPresent(),
         "Missing partition columns in the hoodie.properties.");
     assertArrayEquals(metaClient1.getTableConfig().getPartitionFields().get(), new String[] {"p0", "p1"});
-    assertEquals(metaClient1.getTableConfig().getPreCombineField(), "ts");
+    assertEquals(metaClient1.getTableConfig().getOrderingFieldsStr().get(), "ts");
     assertEquals(metaClient1.getTableConfig().getKeyGeneratorClassName(), SimpleAvroKeyGenerator.class.getName());
+    assertEquals(HoodieTableVersion.current(), metaClient1.getTableConfig().getTableVersion());
 
     // Test for non-partitioned table.
     conf.removeConfig(FlinkOptions.PARTITION_PATH_FIELD);
     FileIOUtils.deleteDirectory(tempFile);
     StreamerUtil.initTableIfNotExists(conf);
-    HoodieTableMetaClient metaClient2 = HoodieTableMetaClient.builder()
-        .setBasePath(tempFile.getAbsolutePath())
-        .setConf(new org.apache.hadoop.conf.Configuration())
-        .build();
+    HoodieTableMetaClient metaClient2 = HoodieTestUtils.createMetaClient(tempFile.getAbsolutePath());
     assertFalse(metaClient2.getTableConfig().getPartitionFields().isPresent());
     assertEquals(metaClient2.getTableConfig().getKeyGeneratorClassName(), SimpleAvroKeyGenerator.class.getName());
   }
@@ -105,6 +170,18 @@ public class TestStreamerUtil {
     String lower = "20210705125806";
     long diff = StreamerUtil.instantTimeDiffSeconds(higher, lower);
     assertThat(diff, is(75L));
+  }
+
+  @Test
+  public void testAddCheckpointIdIntoMetadata() {
+    Configuration conf = TestConfigurations.getDefaultConf(tempFile.getAbsolutePath());
+
+    // Test for write extra metadata.
+    conf.set(FlinkOptions.WRITE_EXTRA_METADATA_ENABLED, true);
+
+    HashMap<String, String> metadata = new HashMap<>();
+    StreamerUtil.addFlinkCheckpointIdIntoMetaData(conf, metadata, 123L);
+    assertEquals(metadata.get(StreamerUtil.FLINK_CHECKPOINT_ID), "123");
   }
 
   @Test

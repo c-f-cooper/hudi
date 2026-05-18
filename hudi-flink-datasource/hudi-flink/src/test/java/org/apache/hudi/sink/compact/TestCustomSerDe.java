@@ -18,25 +18,26 @@
 
 package org.apache.hudi.sink.compact;
 
-import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-
-import org.apache.avro.LogicalTypes;
-import org.apache.avro.Schema;
-import org.apache.avro.generic.GenericData;
-import org.apache.avro.generic.GenericFixed;
 import org.apache.hudi.common.model.EventTimeAvroPayload;
 import org.apache.hudi.common.model.HoodieAvroRecord;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.schema.HoodieSchema;
+import org.apache.hudi.common.serialization.DefaultSerializer;
 import org.apache.hudi.common.testutils.HoodieCommonTestHarness;
 import org.apache.hudi.common.util.collection.BitCaskDiskMap;
 import org.apache.hudi.common.util.collection.RocksDbDiskMap;
+
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericFixed;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-
-import java.io.IOException;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+
+import java.io.IOException;
+
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
 /**
  * Tests for custom SerDe of non-primitive avro types when using Avro versions > 1.10.0.
@@ -53,26 +54,33 @@ public class TestCustomSerDe extends HoodieCommonTestHarness {
   @ParameterizedTest
   @ValueSource(booleans = {false, true})
   public void testBitCaskDiskMapPutDecimal(boolean isCompressionEnabled) throws IOException {
-    BitCaskDiskMap<String, HoodieRecord> bitCaskDiskMap = new BitCaskDiskMap<>(basePath, isCompressionEnabled);
-    HoodieRecord avroRecord = createAvroRecordWithDecimalOrderingField();
-    bitCaskDiskMap.put(avroRecord.getRecordKey(), avroRecord);
-    assertDoesNotThrow(() -> bitCaskDiskMap.get(avroRecord.getRecordKey()));
+    try (BitCaskDiskMap<String, HoodieRecord> bitCaskDiskMap = new BitCaskDiskMap<>(basePath, new DefaultSerializer<>(), isCompressionEnabled)) {
+      HoodieRecord avroRecord = createAvroRecordWithDecimalOrderingField();
+      bitCaskDiskMap.put(avroRecord.getRecordKey(), avroRecord);
+      assertDoesNotThrow(() -> bitCaskDiskMap.get(avroRecord.getRecordKey()));
+    }
   }
 
   @Test
   public void testRocksDbDiskMapPutDecimal() throws IOException {
-    RocksDbDiskMap<String, HoodieRecord> rocksDbBasedMap = new RocksDbDiskMap<>(basePath);
-    HoodieRecord avroRecord = createAvroRecordWithDecimalOrderingField();
-    rocksDbBasedMap.put(avroRecord.getRecordKey(), avroRecord);
-    assertDoesNotThrow(() -> rocksDbBasedMap.get(avroRecord.getRecordKey()));
+    try (RocksDbDiskMap<String, HoodieRecord> rocksDbBasedMap = new RocksDbDiskMap<>(basePath, new DefaultSerializer<>())) {
+      HoodieRecord avroRecord = createAvroRecordWithDecimalOrderingField();
+      rocksDbBasedMap.put(avroRecord.getRecordKey(), avroRecord);
+      assertDoesNotThrow(() -> rocksDbBasedMap.get(avroRecord.getRecordKey()));
+    }
   }
 
   private static HoodieRecord createAvroRecordWithDecimalOrderingField() {
-    Schema precombineFieldSchema = LogicalTypes.decimal(20, 0)
-        .addToSchema(Schema.createFixed("fixed", null, "record.precombineField", 9));
+    HoodieSchema decimalSchema = HoodieSchema.createDecimal(
+        "fixed",                    // name
+        "record.precombineField",   // namespace
+        null,                       // doc
+        20,                         // precision
+        0,                          // scale
+        9                           // fixedSize in bytes
+    );
     byte[] decimalFieldBytes = new byte[] {0, 0, 0, 1, -122, -16, -116, -90, -32};
-    GenericFixed genericFixed = new GenericData.Fixed(precombineFieldSchema, decimalFieldBytes);
-
+    GenericFixed genericFixed = new GenericData.Fixed(decimalSchema.getAvroSchema(), decimalFieldBytes);
     // nullifying the record attribute in EventTimeAvroPayload here as it is not required in the test
     return new HoodieAvroRecord<>(new HoodieKey("recordKey", "partitionPath"),
         new EventTimeAvroPayload(null, (Comparable) genericFixed));

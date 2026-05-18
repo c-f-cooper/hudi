@@ -18,6 +18,7 @@
 
 package org.apache.hudi.common.config;
 
+import org.apache.hudi.common.util.ConfigUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.common.util.StringUtils;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.Properties;
 
 import static org.apache.hudi.common.util.ConfigUtils.getRawValueWithAltKeys;
+import static org.apache.hudi.common.util.ConfigUtils.loadGlobalProperties;
 
 /**
  * This class deals with {@link ConfigProperty} and provides get/set functionalities.
@@ -53,12 +55,12 @@ public class HoodieConfig implements Serializable {
     this.props = new TypedProperties();
   }
 
-  public HoodieConfig(Properties props) {
-    this.props = new TypedProperties(props);
-  }
-
   public HoodieConfig(TypedProperties props) {
     this.props = props;
+  }
+
+  protected HoodieConfig(Properties props) {
+    this.props = TypedProperties.copy(props);
   }
 
   public <T> void setValue(ConfigProperty<T> cfg, String val) {
@@ -68,6 +70,10 @@ public class HoodieConfig implements Serializable {
 
   public <T> void setValue(String key, String val) {
     props.setProperty(key, val);
+  }
+
+  public <T> void clearValue(ConfigProperty<T> cfg) {
+    ConfigUtils.removeConfigFromProps(props, cfg);
   }
 
   public void setAll(Properties properties) {
@@ -107,15 +113,19 @@ public class HoodieConfig implements Serializable {
     }
   }
 
-  public Boolean contains(String key) {
+  public boolean contains(String key) {
     return props.containsKey(key);
   }
 
   public <T> boolean contains(ConfigProperty<T> configProperty) {
-    if (props.containsKey(configProperty.key())) {
+    return contains(configProperty, this);
+  }
+
+  public static <T> boolean contains(ConfigProperty<T> configProperty, HoodieConfig config) {
+    if (config.getProps().containsKey(configProperty.key())) {
       return true;
     }
-    return configProperty.getAlternatives().stream().anyMatch(props::containsKey);
+    return configProperty.getAlternatives().stream().anyMatch(k -> config.getProps().containsKey(k));
   }
 
   private <T> Option<Object> getRawValue(ConfigProperty<T> configProperty) {
@@ -232,13 +242,17 @@ public class HoodieConfig implements Serializable {
     return rawValue.map(Object::toString).orElse(defaultVal);
   }
 
+  public String getStringOrDefault(String key, String defaultVal) {
+    return Option.ofNullable(props.getProperty(key)).orElse(defaultVal);
+  }
+
   public TypedProperties getProps() {
     return props;
   }
 
   public TypedProperties getProps(boolean includeGlobalProps) {
     if (includeGlobalProps) {
-      TypedProperties mergedProps = DFSPropertiesConfiguration.getGlobalProps();
+      TypedProperties mergedProps = loadGlobalProperties();
       mergedProps.putAll(props);
       return mergedProps;
     } else {
@@ -263,5 +277,9 @@ public class HoodieConfig implements Serializable {
     } else {
       throw new HoodieException(errorMessage);
     }
+  }
+
+  public static HoodieConfig copy(Properties props) {
+    return new HoodieConfig(props);
   }
 }

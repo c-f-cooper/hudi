@@ -17,28 +17,29 @@
 
 package org.apache.spark.sql.parser
 
+import org.apache.hudi.spark.sql.parser.{HoodieSqlBaseBaseListener, HoodieSqlBaseLexer, HoodieSqlBaseParser}
+import org.apache.hudi.spark.sql.parser.HoodieSqlBaseParser.{NonReservedContext, QuotedIdentifierContext}
+
 import org.antlr.v4.runtime._
 import org.antlr.v4.runtime.atn.PredictionMode
 import org.antlr.v4.runtime.misc.{Interval, ParseCancellationException}
 import org.antlr.v4.runtime.tree.TerminalNodeImpl
-import org.apache.hudi.spark.sql.parser.HoodieSqlBaseParser.{NonReservedContext, QuotedIdentifierContext}
-import org.apache.hudi.spark.sql.parser.{HoodieSqlBaseBaseListener, HoodieSqlBaseLexer, HoodieSqlBaseParser}
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.parser.{ParseErrorListener, ParseException, ParserInterface}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.trees.Origin
-import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.internal.VariableSubstitution
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.{AnalysisException, SparkSession}
 
 import java.util.Locale
 
 class HoodieSpark3_3ExtendedSqlParser(session: SparkSession, delegate: ParserInterface)
   extends HoodieExtendedParserInterface with Logging {
 
-  private lazy val conf = session.sqlContext.conf
+  private lazy val conf = session.sessionState.conf
   private lazy val builder = new HoodieSpark3_3ExtendedSqlAstBuilder(conf, delegate)
   private val substitutor = new VariableSubstitution
 
@@ -127,7 +128,9 @@ class HoodieSpark3_3ExtendedSqlParser(session: SparkSession, delegate: ParserInt
       normalized.contains("create index") ||
       normalized.contains("drop index") ||
       normalized.contains("show indexes") ||
-      normalized.contains("refresh index")
+      normalized.contains("refresh index") ||
+      normalized.contains(" blob") ||
+      normalized.contains(" vector")
   }
 }
 

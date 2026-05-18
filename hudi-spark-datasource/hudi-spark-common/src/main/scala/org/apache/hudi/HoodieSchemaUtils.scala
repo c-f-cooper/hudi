@@ -19,29 +19,58 @@
 
 package org.apache.hudi
 
-import org.apache.avro.Schema
 import org.apache.hudi.HoodieSparkSqlWriter.{CANONICALIZE_SCHEMA, SQL_MERGE_INTO_WRITES}
-import org.apache.hudi.avro.AvroSchemaUtils.{isCompatibleProjectionOf, isSchemaCompatible, isValidEvolutionOf}
-import org.apache.hudi.avro.HoodieAvroUtils
-import org.apache.hudi.avro.HoodieAvroUtils.removeMetadataFields
-import org.apache.hudi.common.config.HoodieConfig
+import org.apache.hudi.common.config.{HoodieCommonConfig, HoodieConfig, TypedProperties}
 import org.apache.hudi.common.model.HoodieRecord
+import org.apache.hudi.common.schema.{HoodieSchema, HoodieSchemaCompatibility, HoodieSchemaUtils => HoodieCommonSchemaUtils}
 import org.apache.hudi.common.table.{HoodieTableMetaClient, TableSchemaResolver}
+import org.apache.hudi.common.util.ConfigUtils
 import org.apache.hudi.config.HoodieWriteConfig
-import org.apache.hudi.exception.SchemaCompatibilityException
+import org.apache.hudi.exception.{HoodieException, SchemaCompatibilityException}
 import org.apache.hudi.internal.schema.InternalSchema
-import org.apache.hudi.internal.schema.convert.AvroInternalSchemaConverter
+import org.apache.hudi.internal.schema.convert.InternalSchemaConverter
 import org.apache.hudi.internal.schema.utils.AvroSchemaEvolutionUtils
 import org.apache.hudi.internal.schema.utils.AvroSchemaEvolutionUtils.reconcileSchemaRequirements
+
+import org.apache.spark.sql.types.StructField
+import org.apache.spark.sql.types.StructType
 import org.slf4j.LoggerFactory
 
-import scala.collection.JavaConversions.{asScalaBuffer, mapAsJavaMap}
+import java.util.Properties
+
+import scala.collection.JavaConverters._
 
 /**
  * Util methods for Schema evolution in Hudi
  */
 object HoodieSchemaUtils {
   private val log = LoggerFactory.getLogger(getClass)
+
+  /**
+   * Gets a field (including nested fields) from the schema using dot notation.
+   * This method delegates to the consolidated implementation in [[HoodieSchema.getNestedField]].
+   *
+   * Supports nested field access using dot notation. For example:
+   * - "name" - retrieves top-level field
+   * - "user.profile.displayName" - retrieves nested field
+   * - "items.list.element" - retrieves array element schema
+   * - "metadata.key_value.key" - retrieves map key schema
+   * - "metadata.key_value.value" - retrieves map value schema
+   *
+   * @param schema    the Spark StructType to search in
+   * @param fieldName the field name (may contain dots for nested fields)
+   * @return Pair of canonical field name and the StructField
+   * @throws HoodieException if field is not found
+   */
+  def getSchemaForField(schema: StructType, fieldName: String): org.apache.hudi.common.util.collection.Pair[String, StructField] = {
+    val result = HoodieSchemaConversionUtils.convertStructTypeToHoodieSchema(schema, "temp_schema", "")
+      .getNestedField(fieldName)
+      .orElseThrow(() => new HoodieException(s"Failed to find $fieldName in the table schema"))
+    org.apache.hudi.common.util.collection.Pair.of(result.getLeft,
+      StructField(result.getRight.name(),
+        HoodieSchemaConversionUtils.convertHoodieSchemaToDataType(result.getRight.schema()),
+        result.getRight.isNullable))
+  }
 
   /**
    * get latest internalSchema from table
@@ -52,7 +81,19 @@ object HoodieSchemaUtils {
    */
   def getLatestTableInternalSchema(config: HoodieConfig,
                                    tableMetaClient: HoodieTableMetaClient): Option[InternalSchema] = {
-    if (!config.getBooleanOrDefault(DataSourceReadOptions.SCHEMA_EVOLUTION_ENABLED)) {
+    getLatestTableInternalSchema(config.getProps, tableMetaClient)
+  }
+
+  /**
+   * get latest internalSchema from table
+   *
+   * @param props           instance of {@link Properties}
+   * @param tableMetaClient instance of HoodieTableMetaClient
+   * @return Option of InternalSchema. Will always be empty if schema on read is disabled
+   */
+  def getLatestTableInternalSchema(props: Properties,
+                                   tableMetaClient: HoodieTableMetaClient): Option[InternalSchema] = {
+    if (!ConfigUtils.getBooleanWithAltKeys(props, DataSourceReadOptions.SCHEMA_EVOLUTION_ENABLED)) {
       None
     } else {
       try {
@@ -72,127 +113,136 @@ object HoodieSchemaUtils {
    *   <li>Target table's schema (including Hudi's [[InternalSchema]] representation)</li>
    * </ul>
    */
-  def deduceWriterSchema(sourceSchema: Schema,
-                         latestTableSchemaOpt: Option[Schema],
+  def deduceWriterSchema(sourceSchema: HoodieSchema,
+                         latestTableSchemaOpt: Option[HoodieSchema],
                          internalSchemaOpt: Option[InternalSchema],
-                         opts: Map[String, String]): Schema = {
-    val setNullForMissingColumns = opts.getOrDefault(DataSourceWriteOptions.HANDLE_MISSING_COLUMNS_WITH_LOSSLESS_TYPE_PROMOTIONS.key(),
-      DataSourceWriteOptions.HANDLE_MISSING_COLUMNS_WITH_LOSSLESS_TYPE_PROMOTIONS.defaultValue).toBoolean
-    val shouldReconcileSchema = opts(DataSourceWriteOptions.RECONCILE_SCHEMA.key()).toBoolean
-    val shouldValidateSchemasCompatibility = opts.getOrDefault(HoodieWriteConfig.AVRO_SCHEMA_VALIDATE_ENABLE.key,
-      HoodieWriteConfig.AVRO_SCHEMA_VALIDATE_ENABLE.defaultValue).toBoolean
-
+                         opts: Map[String, String]): HoodieSchema = {
     latestTableSchemaOpt match {
-      // In case table schema is empty we're just going to use the source schema as a
-      // writer's schema.
-      case None => AvroInternalSchemaConverter.fixNullOrdering(sourceSchema)
+      // If table schema is empty, then we use the source schema as a writer's schema.
+      case None => InternalSchemaConverter.fixNullOrdering(sourceSchema)
       // Otherwise, we need to make sure we reconcile incoming and latest table schemas
       case Some(latestTableSchemaWithMetaFields) =>
-        // NOTE: Meta-fields will be unconditionally injected by Hudi writing handles, for the sake of
-        //       deducing proper writer schema we're stripping them to make sure we can perform proper
-        //       analysis
-        //add call to fix null ordering to ensure backwards compatibility
-        val latestTableSchema = AvroInternalSchemaConverter.fixNullOrdering(removeMetadataFields(latestTableSchemaWithMetaFields))
+        // NOTE: Meta-fields will be unconditionally injected by Hudi writing handles, for the sake of deducing proper writer schema
+        //       we're stripping them to make sure we can perform proper analysis
+        // add call to fix null ordering to ensure backwards compatibility
+        val latestTableSchema = InternalSchemaConverter.fixNullOrdering(
+          HoodieCommonSchemaUtils.removeMetadataFields(latestTableSchemaWithMetaFields))
         // Before validating whether schemas are compatible, we need to "canonicalize" source's schema
         // relative to the table's one, by doing a (minor) reconciliation of the nullability constraints:
         // for ex, if in incoming schema column A is designated as non-null, but it's designated as nullable
         // in the table's one we want to proceed aligning nullability constraints w/ the table's schema
         // Also, we promote types to the latest table schema if possible.
-        val shouldCanonicalizeSchema = opts.getOrDefault(CANONICALIZE_SCHEMA.key,
-          CANONICALIZE_SCHEMA.defaultValue.toString).toBoolean
-        val mergeIntoWrites = opts.getOrDefault(SQL_MERGE_INTO_WRITES.key(),
-          SQL_MERGE_INTO_WRITES.defaultValue.toString).toBoolean
-
+        val shouldCanonicalizeSchema = opts.getOrElse(CANONICALIZE_SCHEMA.key, CANONICALIZE_SCHEMA.defaultValue.toString).toBoolean
+        val shouldReconcileSchema = opts.getOrElse(DataSourceWriteOptions.RECONCILE_SCHEMA.key(),
+          DataSourceWriteOptions.RECONCILE_SCHEMA.defaultValue().toString).toBoolean
         val canonicalizedSourceSchema = if (shouldCanonicalizeSchema) {
-          canonicalizeSchema(sourceSchema, latestTableSchema, opts)
+          canonicalizeSchema(sourceSchema, latestTableSchema, opts, !shouldReconcileSchema)
         } else {
-          AvroInternalSchemaConverter.fixNullOrdering(sourceSchema)
+          InternalSchemaConverter.fixNullOrdering(sourceSchema)
         }
-
-        val allowAutoEvolutionColumnDrop = opts.getOrDefault(HoodieWriteConfig.SCHEMA_ALLOW_AUTO_EVOLUTION_COLUMN_DROP.key,
-          HoodieWriteConfig.SCHEMA_ALLOW_AUTO_EVOLUTION_COLUMN_DROP.defaultValue).toBoolean
 
         if (shouldReconcileSchema) {
-          internalSchemaOpt match {
-            case Some(internalSchema) =>
-              // Apply schema evolution, by auto-merging write schema and read schema
-              val mergedInternalSchema = AvroSchemaEvolutionUtils.reconcileSchema(canonicalizedSourceSchema, internalSchema)
-              val evolvedSchema = AvroInternalSchemaConverter.convert(mergedInternalSchema, latestTableSchema.getFullName)
-              val shouldRemoveMetaDataFromInternalSchema = sourceSchema.getFields().filter(f => f.name().equalsIgnoreCase(HoodieRecord.RECORD_KEY_METADATA_FIELD)).isEmpty
-              if (shouldRemoveMetaDataFromInternalSchema) HoodieAvroUtils.removeMetadataFields(evolvedSchema) else evolvedSchema
-            case None =>
-              // In case schema reconciliation is enabled we will employ (legacy) reconciliation
-              // strategy to produce target writer's schema (see definition below)
-              val (reconciledSchema, isCompatible) =
-                reconcileSchemasLegacy(latestTableSchema, canonicalizedSourceSchema)
-
-              // NOTE: In some cases we need to relax constraint of incoming dataset's schema to be compatible
-              //       w/ the table's one and allow schemas to diverge. This is required in cases where
-              //       partial updates will be performed (for ex, `MERGE INTO` Spark SQL statement) and as such
-              //       only incoming dataset's projection has to match the table's schema, and not the whole one
-              if (!shouldValidateSchemasCompatibility || isCompatible) {
-                reconciledSchema
-              } else {
-                log.error(
-                  s"""Failed to reconcile incoming batch schema with the table's one.
-                     |Incoming schema ${sourceSchema.toString(true)}
-                     |Incoming schema (canonicalized) ${canonicalizedSourceSchema.toString(true)}
-                     |Table's schema ${latestTableSchema.toString(true)}
-                     |""".stripMargin)
-                throw new SchemaCompatibilityException("Failed to reconcile incoming schema with the table's one")
-              }
-          }
+          deduceWriterSchemaWithReconcile(sourceSchema, canonicalizedSourceSchema, latestTableSchema, internalSchemaOpt, opts)
         } else {
-          // In case reconciliation is disabled, we have to validate that the source's schema
-          // is compatible w/ the table's latest schema, such that we're able to read existing table's
-          // records using [[sourceSchema]].
-          //
-          // NOTE: In some cases we need to relax constraint of incoming dataset's schema to be compatible
-          //       w/ the table's one and allow schemas to diverge. This is required in cases where
-          //       partial updates will be performed (for ex, `MERGE INTO` Spark SQL statement) and as such
-          //       only incoming dataset's projection has to match the table's schema, and not the whole one
-
-          if (mergeIntoWrites) {
-            // if its merge into writes, do not check for projection nor schema compatibility. Writers down the line will
-            // take care of it.
-            canonicalizedSourceSchema
-          } else {
-            if (!shouldValidateSchemasCompatibility) {
-              // if no validation is enabled, check for col drop
-              if (allowAutoEvolutionColumnDrop) {
-                canonicalizedSourceSchema
-              } else {
-                val reconciledSchema = if (setNullForMissingColumns) {
-                  AvroSchemaEvolutionUtils.reconcileSchema(canonicalizedSourceSchema, latestTableSchema)
-                } else {
-                  canonicalizedSourceSchema
-                }
-                if (isValidEvolutionOf(reconciledSchema, latestTableSchema)) {
-                  reconciledSchema
-                } else {
-                  log.error(
-                    s"""Incoming batch schema is not compatible with the table's one.
-                       |Incoming schema ${sourceSchema.toString(true)}
-                       |Incoming schema (canonicalized) ${reconciledSchema.toString(true)}
-                       |Table's schema ${latestTableSchema.toString(true)}
-                       |""".stripMargin)
-                  throw new SchemaCompatibilityException("Incoming batch schema is not compatible with the table's one")
-                }
-              }
-            } else if (isSchemaCompatible(latestTableSchema, canonicalizedSourceSchema, allowAutoEvolutionColumnDrop)) {
-              canonicalizedSourceSchema
-            } else {
-              log.error(
-                s"""Incoming batch schema is not compatible with the table's one.
-                   |Incoming schema ${sourceSchema.toString(true)}
-                   |Incoming schema (canonicalized) ${canonicalizedSourceSchema.toString(true)}
-                   |Table's schema ${latestTableSchema.toString(true)}
-                   |""".stripMargin)
-              throw new SchemaCompatibilityException("Incoming batch schema is not compatible with the table's one")
-            }
-          }
+          deduceWriterSchemaWithoutReconcile(sourceSchema, canonicalizedSourceSchema, latestTableSchema, opts)
         }
     }
+  }
+
+  /**
+   * Deducing with disabled reconciliation.
+   * We have to validate that the source's schema is compatible w/ the table's latest schema,
+   * such that we're able to read existing table's records using [[sourceSchema]].
+   */
+  private def deduceWriterSchemaWithoutReconcile(sourceSchema: HoodieSchema,
+                                                 canonicalizedSourceSchema: HoodieSchema,
+                                                 latestTableSchema: HoodieSchema,
+                                                 opts: Map[String, String]): HoodieSchema = {
+    // NOTE: In some cases we need to relax constraint of incoming dataset's schema to be compatible
+    //       w/ the table's one and allow schemas to diverge. This is required in cases where
+    //       partial updates will be performed (for ex, `MERGE INTO` Spark SQL statement) and as such
+    //       only incoming dataset's projection has to match the table's schema, and not the whole one
+    val mergeIntoWrites = opts.getOrElse(SQL_MERGE_INTO_WRITES.key(), SQL_MERGE_INTO_WRITES.defaultValue.toString).toBoolean
+    val shouldValidateSchemasCompatibility = opts.getOrElse(HoodieWriteConfig.AVRO_SCHEMA_VALIDATE_ENABLE.key,
+      HoodieWriteConfig.AVRO_SCHEMA_VALIDATE_ENABLE.defaultValue).toBoolean
+    val allowAutoEvolutionColumnDrop = opts.getOrElse(HoodieWriteConfig.SCHEMA_ALLOW_AUTO_EVOLUTION_COLUMN_DROP.key,
+      HoodieWriteConfig.SCHEMA_ALLOW_AUTO_EVOLUTION_COLUMN_DROP.defaultValue).toBoolean
+    val setNullForMissingColumns = opts.getOrElse(DataSourceWriteOptions.SET_NULL_FOR_MISSING_COLUMNS.key(),
+      DataSourceWriteOptions.SET_NULL_FOR_MISSING_COLUMNS.defaultValue).toBoolean
+
+    if (!mergeIntoWrites && !shouldValidateSchemasCompatibility && !allowAutoEvolutionColumnDrop) {
+      // Default behaviour
+      val reconciledSchema = if (setNullForMissingColumns) {
+        HoodieSchema.fromAvroSchema(AvroSchemaEvolutionUtils.reconcileSchema(canonicalizedSourceSchema.toAvroSchema(), latestTableSchema.toAvroSchema(), setNullForMissingColumns))
+      } else {
+        canonicalizedSourceSchema
+      }
+      HoodieSchemaCompatibility.checkValidEvolution(reconciledSchema, latestTableSchema)
+      reconciledSchema
+    } else {
+      // If it's merge into writes, we don't check for projection nor schema compatibility. Writers down the line will take care of it.
+      // Or it's not merge into writes, and we don't validate schema, but we allow to drop columns automatically.
+      // Or it's not merge into writes, we validate schema, and schema is compatible.
+      if (shouldValidateSchemasCompatibility) {
+        HoodieSchemaCompatibility.checkSchemaCompatible(latestTableSchema, canonicalizedSourceSchema, true,
+          allowAutoEvolutionColumnDrop, java.util.Collections.emptySet())
+      }
+      canonicalizedSourceSchema
+    }
+  }
+
+  /**
+   * Deducing with enabled reconciliation.
+   * Marked as Deprecated.
+   */
+  private def deduceWriterSchemaWithReconcile(sourceSchema: HoodieSchema,
+                                              canonicalizedSourceSchema: HoodieSchema,
+                                              latestTableSchema: HoodieSchema,
+                                              internalSchemaOpt: Option[InternalSchema],
+                                              opts: Map[String, String]): HoodieSchema = {
+    internalSchemaOpt match {
+      case Some(internalSchema) =>
+        // Apply schema evolution, by auto-merging write schema and read schema
+        val setNullForMissingColumns = opts.getOrElse(HoodieCommonConfig.SET_NULL_FOR_MISSING_COLUMNS.key(),
+          HoodieCommonConfig.SET_NULL_FOR_MISSING_COLUMNS.defaultValue()).toBoolean
+        val mergedInternalSchema = AvroSchemaEvolutionUtils.reconcileSchema(canonicalizedSourceSchema.toAvroSchema(), internalSchema, setNullForMissingColumns)
+        val evolvedSchema = InternalSchemaConverter.convert(mergedInternalSchema, latestTableSchema.getFullName)
+        val shouldRemoveMetaDataFromInternalSchema = sourceSchema.getFields.asScala.filter(f => f.name().equalsIgnoreCase(HoodieRecord.RECORD_KEY_METADATA_FIELD)).isEmpty
+        if (shouldRemoveMetaDataFromInternalSchema) HoodieCommonSchemaUtils.removeMetadataFields(evolvedSchema) else evolvedSchema
+
+      case None =>
+        // In case schema reconciliation is enabled we will employ (legacy) reconciliation
+        // strategy to produce target writer's schema (see definition below)
+        val (reconciledSchema, isCompatible) =
+          reconcileSchemasLegacy(latestTableSchema, canonicalizedSourceSchema)
+
+        // NOTE: In some cases we need to relax constraint of incoming dataset's schema to be compatible
+        //       w/ the table's one and allow schemas to diverge. This is required in cases where
+        //       partial updates will be performed (for ex, `MERGE INTO` Spark SQL statement) and as such
+        //       only incoming dataset's projection has to match the table's schema, and not the whole one
+        val shouldValidateSchemasCompatibility = opts.getOrElse(HoodieWriteConfig.AVRO_SCHEMA_VALIDATE_ENABLE.key, HoodieWriteConfig.AVRO_SCHEMA_VALIDATE_ENABLE.defaultValue).toBoolean
+        if (!shouldValidateSchemasCompatibility || isCompatible) {
+          reconciledSchema
+        } else {
+          log.error(
+            s"""Failed to reconcile incoming batch schema with the table's one.
+               |Incoming schema ${sourceSchema.toString(true)}
+               |Incoming schema (canonicalized) ${canonicalizedSourceSchema.toString(true)}
+               |Table's schema ${latestTableSchema.toString(true)}
+               |""".stripMargin)
+          throw new SchemaCompatibilityException("Failed to reconcile incoming schema with the table's one")
+        }
+    }
+  }
+
+  def deduceWriterSchema(sourceSchema: HoodieSchema,
+                         latestTableSchemaOpt: org.apache.hudi.common.util.Option[HoodieSchema],
+                         internalSchemaOpt: org.apache.hudi.common.util.Option[InternalSchema],
+                         props: TypedProperties): HoodieSchema = {
+    deduceWriterSchema(sourceSchema,
+      HoodieConversionUtils.toScalaOption(latestTableSchemaOpt),
+      HoodieConversionUtils.toScalaOption(internalSchemaOpt),
+      HoodieConversionUtils.fromProperties(props))
   }
 
   /**
@@ -205,12 +255,15 @@ object HoodieSchemaUtils {
    *
    * TODO support casing reconciliation
    */
-  private def canonicalizeSchema(sourceSchema: Schema, latestTableSchema: Schema, opts : Map[String, String]): Schema = {
-    reconcileSchemaRequirements(sourceSchema, latestTableSchema, opts)
+  private def canonicalizeSchema(sourceSchema: HoodieSchema, latestTableSchema: HoodieSchema, opts : Map[String, String],
+                                 shouldReorderColumns: Boolean): HoodieSchema = {
+    HoodieSchema.fromAvroSchema(
+      reconcileSchemaRequirements(sourceSchema.toAvroSchema(), latestTableSchema.toAvroSchema(), shouldReorderColumns)
+    )
   }
 
 
-  private def reconcileSchemasLegacy(tableSchema: Schema, newSchema: Schema): (Schema, Boolean) = {
+  private def reconcileSchemasLegacy(tableSchema: HoodieSchema, newSchema: HoodieSchema): (HoodieSchema, Boolean) = {
     // Legacy reconciliation implements following semantic
     //    - In case new-schema is a "compatible" projection of the existing table's one (projection allowing
     //      permitted type promotions), table's schema would be picked as (reconciled) writer's schema;
@@ -224,14 +277,35 @@ object HoodieSchemaUtils {
     // NOTE: By default Hudi doesn't allow automatic schema evolution to drop the columns from the target
     //       table. However, when schema reconciliation is turned on, we would allow columns to be dropped
     //       in the incoming batch (as these would be reconciled in anyway)
-    if (isCompatibleProjectionOf(tableSchema, newSchema)) {
+    if (HoodieSchemaCompatibility.isCompatibleProjectionOf(tableSchema, newSchema)) {
       // Picking table schema as a writer schema we need to validate that we'd be able to
       // rewrite incoming batch's data (written in new schema) into it
-      (tableSchema, isSchemaCompatible(newSchema, tableSchema))
+      (tableSchema, HoodieSchemaCompatibility.isSchemaCompatible(newSchema, tableSchema))
     } else {
       // Picking new schema as a writer schema we need to validate that we'd be able to
       // rewrite table's data into it
-      (newSchema, isSchemaCompatible(tableSchema, newSchema))
+      (newSchema, HoodieSchemaCompatibility.isSchemaCompatible(tableSchema, newSchema))
+    }
+  }
+
+  /**
+   * Check if the partition schema fields order matches the table schema fields order.
+   *
+   * @param tableSchema      The table schema
+   * @param partitionFields  The partition fields
+   */
+  def checkPartitionSchemaOrder(tableSchema: StructType, partitionFields: Seq[String]): Unit = {
+    val tableSchemaFields = tableSchema.fields.map(_.name)
+    // It is not allowed to specify partition columns when the table schema is not defined.
+    // https://spark.apache.org/docs/latest/sql-error-conditions.html#specify_partition_is_not_allowed
+    if (tableSchemaFields.isEmpty && partitionFields.nonEmpty) {
+      throw new IllegalArgumentException("It is not allowed to specify partition columns when the table schema is not defined.")
+    }
+    // Filter the table schema fields to get the partition field names in order
+    val tableSchemaPartitionFields = tableSchemaFields.filter(partitionFields.contains).toSeq
+    if (tableSchemaPartitionFields != partitionFields) {
+      throw new IllegalArgumentException(s"Partition schema fields order does not match the table schema fields order," +
+        s" tableSchemaFields: $tableSchemaPartitionFields, partitionFields: $partitionFields.")
     }
   }
 }

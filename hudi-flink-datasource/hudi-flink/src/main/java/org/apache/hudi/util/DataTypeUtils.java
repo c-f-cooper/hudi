@@ -18,7 +18,12 @@
 
 package org.apache.hudi.util;
 
+import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.exception.HoodieCatalogException;
+
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.Schema.UnresolvedPhysicalColumn;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -34,12 +39,33 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Utilities for {@link org.apache.flink.table.types.DataType}.
  */
 public class DataTypeUtils {
+
+  public static Map<String, DataType> METADATA_COLUMNS = new LinkedHashMap<String, DataType>() {{
+      put(HoodieRecord.COMMIT_TIME_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.COMMIT_SEQNO_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.RECORD_KEY_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.PARTITION_PATH_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.FILENAME_METADATA_FIELD, DataTypes.STRING());
+    }};
+
+  public static Map<String, DataType> METADATA_COLUMNS_WITH_OPERATION = new LinkedHashMap<String, DataType>() {{
+      put(HoodieRecord.COMMIT_TIME_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.COMMIT_SEQNO_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.RECORD_KEY_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.PARTITION_PATH_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.FILENAME_METADATA_FIELD, DataTypes.STRING());
+      put(HoodieRecord.OPERATION_METADATA_FIELD, DataTypes.STRING());
+    }};
+
   /**
    * Returns whether the given type is TIMESTAMP type.
    */
@@ -61,6 +87,18 @@ public class DataTypeUtils {
   }
 
   /**
+   * Convert the given {@link Schema} into {@link RowType}.
+   */
+  public static RowType toRowType(Schema schema) {
+    List<RowType.RowField> rowFields =
+        schema.getColumns().stream()
+            .filter(col -> col instanceof UnresolvedPhysicalColumn)
+            .map(col -> new RowType.RowField(col.getName(), ((DataType) ((UnresolvedPhysicalColumn) col).getDataType()).getLogicalType()))
+            .collect(Collectors.toList());
+    return new RowType(false, rowFields);
+  }
+
+  /**
    * Returns whether the given type is DATE type.
    */
   public static boolean isDateType(DataType type) {
@@ -72,6 +110,14 @@ public class DataTypeUtils {
    */
   public static boolean isDatetimeType(DataType type) {
     return isTimestampType(type) || isDateType(type);
+  }
+
+  /**
+   * Returns projected field ordinals with given RowType and produced RowType.
+   */
+  public static int[] projectOrdinals(RowType rowType, RowType producedRowType) {
+    List<String> fieldNames = rowType.getFieldNames();
+    return producedRowType.getFieldNames().stream().mapToInt(fieldNames::indexOf).toArray();
   }
 
   /**
@@ -167,4 +213,62 @@ public class DataTypeUtils {
     return DataTypes.ROW(fields.stream().toArray(DataTypes.Field[]::new)).notNull();
   }
 
+  /**
+   * Adds the Hoodie metadata fields to the given row type.
+   */
+  public static RowType addMetadataFields(
+      RowType rowType,
+      boolean withOperationField) {
+    List<RowType.RowField> mergedFields = new ArrayList<>();
+    LogicalType metadataFieldType = DataTypes.STRING().getLogicalType();
+
+    RowType.RowField commitTimeField =
+        new RowType.RowField(HoodieRecord.COMMIT_TIME_METADATA_FIELD, metadataFieldType, "commit time");
+    RowType.RowField commitSeqnoField =
+        new RowType.RowField(HoodieRecord.COMMIT_SEQNO_METADATA_FIELD, metadataFieldType, "commit seqno");
+    RowType.RowField recordKeyField =
+        new RowType.RowField(HoodieRecord.RECORD_KEY_METADATA_FIELD, metadataFieldType, "record key");
+    RowType.RowField partitionPathField =
+        new RowType.RowField(HoodieRecord.PARTITION_PATH_METADATA_FIELD, metadataFieldType, "partition path");
+    RowType.RowField fileNameField =
+        new RowType.RowField(HoodieRecord.FILENAME_METADATA_FIELD, metadataFieldType, "field name");
+
+    mergedFields.add(commitTimeField);
+    mergedFields.add(commitSeqnoField);
+    mergedFields.add(recordKeyField);
+    mergedFields.add(partitionPathField);
+    mergedFields.add(fileNameField);
+
+    if (withOperationField) {
+      RowType.RowField operationField =
+          new RowType.RowField(HoodieRecord.OPERATION_METADATA_FIELD, metadataFieldType, "operation");
+      mergedFields.add(operationField);
+    }
+
+    mergedFields.addAll(rowType.getFields());
+
+    return new RowType(false, mergedFields);
+  }
+
+  /**
+   * Return virtual metadata columns from given Schema.
+   */
+  public static List<String> getMetadataColumns(Schema schema) {
+    return schema.getColumns().stream()
+        .filter(c -> c instanceof Schema.UnresolvedMetadataColumn)
+        .peek(c -> {
+          if (!HoodieRecord.HOODIE_META_COLUMNS_WITH_OPERATION.contains(c.getName())) {
+            throw new HoodieCatalogException(
+                "Hudi catalog only supports VIRTUAL metadata column, valid metadata columns: " + HoodieRecord.HOODIE_META_COLUMNS_WITH_OPERATION);
+          }
+          if (!((Schema.UnresolvedMetadataColumn) c).isVirtual()) {
+            throw new HoodieCatalogException(
+                "Hudi catalog only supports VIRTUAL metadata column, usage: `_hoodie_commit_time STRING METADATA VIRTUAL`.");
+          }
+          if (((Schema.UnresolvedMetadataColumn) c).getMetadataKey() != null) {
+            throw new HoodieCatalogException(
+                "Hudi catalog doesn't support metadata key, usage: `_hoodie_commit_time STRING METADATA VIRTUAL`.");
+          }
+        }).map(Schema.UnresolvedColumn::getName).collect(Collectors.toList());
+  }
 }

@@ -22,14 +22,13 @@ import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.testutils.InProcessTimeGenerator;
+import org.apache.hudi.common.table.checkpoint.Checkpoint;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.utilities.deltastreamer.HoodieDeltaStreamer;
 import org.apache.hudi.utilities.schema.SchemaProvider;
 import org.apache.hudi.utilities.sources.InputBatch;
 import org.apache.hudi.utilities.streamer.StreamSync;
 
-import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 
@@ -79,15 +78,14 @@ public class HoodieDeltaStreamerWrapper extends HoodieDeltaStreamer {
     return upsert(WriteOperationType.UPSERT);
   }
 
-  public Pair<SchemaProvider, Pair<String, JavaRDD<HoodieRecord>>> fetchSource() throws Exception {
+  public Pair<SchemaProvider, Pair<Checkpoint, JavaRDD<HoodieRecord>>> fetchSource() throws Exception {
     StreamSync service = getDeltaSync();
-    service.refreshTimeline();
+    service.initializeMetaClientAndRefreshTimeline();
     HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder()
-        .setConf(new Configuration(service.getFs().getConf()))
+        .setConf(service.getStorage().getConf().newInstance())
         .setBasePath(service.getCfg().targetBasePath)
         .build();
-    String instantTime = InProcessTimeGenerator.createNewInstantTime();
-    InputBatch inputBatch = service.readFromSource(instantTime, metaClient);
+    InputBatch inputBatch = service.readFromSource(metaClient).getLeft();
     return Pair.of(inputBatch.getSchemaProvider(), Pair.of(inputBatch.getCheckpointForNextBatch(), (JavaRDD<HoodieRecord>) inputBatch.getBatch().get()));
   }
 
